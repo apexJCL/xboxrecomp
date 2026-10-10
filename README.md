@@ -100,8 +100,9 @@ Following the [RexGlueSDK](https://github.com/rexglue/rexglue-sdk) pattern (whic
 | **xbox_kernel** | Custom | Xbox kernel → Win32 (170 of the kernel's 371 ordinals routed, 169 with dedicated bridge functions: memory, file I/O, threading, sync, crypto, HAL, EEPROM, SMBus) |
 | **xbox_d3d8** | Custom | D3D8 → D3D11 graphics: **4-stage multi-texture** FFP pipeline, **NV2A register combiner** pixel shaders, **programmable vertex shaders** (NV2A microcode → HLSL), **hardware T&L lighting** (8 lights), **vertex fog**, DrawPrimitiveUP ring buffer, texture unswizzling, 20+ format conversions |
 | **xbox_dsound** | Custom | DirectSound → software mixer (IDirectSound8/IDirectSoundBuffer8) |
-| **xbox_apu** | xemu *(LGPL-2.1+)* | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF, waveOut output) |
+| **xbox_apu** | xemu *(LGPL-2.1+)* | MCPX APU audio (256-voice processor, ADPCM/PCM, envelopes, HRTF). On by default (`RECOMP_AC97_READY`) on x86-64 Windows/Proton (XAudio2) and on macOS/Linux arm64 (SDL2, A64 MMIO decoder); off on x86-64 POSIX |
 | **xbox_nv2a** | xemu *(regs, LGPL-2.1+)* + Custom | NV2A GPU (register handlers, MMIO interception, push buffer parsing, PGRAPH → D3D11 translation) |
+| **NV2A pushbuffer executor** *(in xbox_kernel)* | Custom | One pushbuffer walker (`nv2a_pb_scan.c`) behind a backend seam (`nv2a_pb_state.h`): a CPU rasteriser on every host (vertex programs, combiners, bilinear, threaded rows), **D3D11** on Windows and **Metal** on macOS. Vertex microcode and the combiners each have one decoder (`nv2a_vsh_fields.h`, `nv2a_combiner.h`) shared by the CPU path and both shader generators (HLSL, MSL) |
 | **xbox_input** | Custom | Xbox gamepad → XInput |
 | **xbox_video** | Custom | FMV playback: Media Foundation decode onto a D3D8 texture, plus a window on the guest framebuffer. For titles whose video is a container Windows already decodes, the emulated decoder does not have to work for the video to be watchable — and the title still decides when it plays |
 
@@ -164,7 +165,7 @@ The recompiler output (`tools/recomp`) generates these automatically. The xboxre
 ### Prerequisites
 
 - **Windows 11/10** (D3D11 backend) — or **Linux** (OpenGL backend; `tools/linux/install_deps.sh`)
-- **macOS**: homebrew, docker `tools/macos/setup.sh`
+- **macOS**: homebrew, docker `tools/macos/setup.sh` (Metal backend, or the CPU rasteriser)
 - **Python 3.10+** with `capstone` (`pip install capstone`)
 - **Visual Studio 2022** (MSVC compiler)
 - **CMake 3.20+**
@@ -673,6 +674,12 @@ its own D3D8LTCG. All by [@sp00nznet](https://github.com/sp00nznet).*
 - ISRs and DPCs run at their IRQL and restore it; `KPCR.Irql` is published
   (#148)
 - The DPC queue is locked, and `KDPC.Inserted` is honoured (#155)
+- A game file the dump lacks is named once, `[FILE] missing <guest> ->
+  <host>`, with a summary at exit; repeats of its FAILED line are counted,
+  not printed. `RECOMP_TRACE=missing=all` also lists probes and every
+  attempt, `=0` turns it off. NtOpenFile and IoCreateFile log their failed
+  opens (and, under `all`, their successes), and POSIX returns
+  PATH_NOT_FOUND for a missing directory, as Win32 does
 
 **Audio**
 
@@ -694,9 +701,11 @@ its own D3D8LTCG. All by [@sp00nznet](https://github.com/sp00nznet).*
   reports, near-plane clipping, bilinear filtering, and a threaded
   rasteriser (#152)
 - P8 textures sample through the stage palette (#145)
-- `RECOMP_PB_REPORT_MS` (#146); `RECOMP_FB_DUMP_FLIPS` dumps every flip for
-  recordings (#156)
-- The window title shows the XBE title, FPS and draws (#153)
+- `RECOMP_PB_REPORT_MS` (#146); `RECOMP_FB_DUMP_FLIPS=<n>` (with
+  `RECOMP_FB_DUMP`) dumps the finished frame at every nth flip that drew
+  something, up to 200 frames, for recordings (#156)
+- The window title shows the XBE title (or the name the game sets); FPS and
+  draws are added, once a second, only with `RECOMP_TRACE=title` (#153)
 
 **Held:** #162, the pushbuffer executor from the X-Men Legends split, is a
 draft and overlaps the executor that landed in #152; #128 is closed as split.
@@ -1549,8 +1558,8 @@ one title's WMV decoder as no-op comments.
   chain, without a run per level.
 - `RECOMP_WATCH_VA` — hardware watchpoint on a guest address, generalised from a
   single hardcoded one.
-- `RECOMP_PB_SCAN` / `RECOMP_PB_EXEC` — survey a title's NV2A pushbuffer and
-  execute its surface and clear methods. The survey ranks what is *not*
+- `RECOMP_TRACE=pb_scan` / `RECOMP_PB_EXEC` (on by default; `=0` turns it
+  off) — survey a title's NV2A pushbuffer and execute it. The survey ranks what is *not*
   implemented, so the remaining work is a list rather than a guess.
 - `RECOMP_FB_WINDOW` — a window on the guest framebuffer. Nothing else scans it
   out, so however much of the GPU works, none of it is observable without this.

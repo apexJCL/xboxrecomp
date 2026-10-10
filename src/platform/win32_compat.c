@@ -11,7 +11,9 @@
 #if !defined(_WIN32)
 
 /* Enable memfd_create, MAP_FIXED_NOREPLACE, timegm. Must precede all #includes. */
+#ifndef _GNU_SOURCE
 #define _GNU_SOURCE
+#endif
 /* Darwin: exposes memset_s, its explicit_bzero equivalent. */
 #define __STDC_WANT_LIB_EXT1__ 1
 
@@ -55,6 +57,8 @@ LONG InterlockedIncrement(volatile LONG *p)        { return __atomic_add_fetch(p
 LONG InterlockedDecrement(volatile LONG *p)        { return __atomic_sub_fetch(p, 1, __ATOMIC_SEQ_CST); }
 LONG InterlockedExchange(volatile LONG *p, LONG v) { return __atomic_exchange_n(p, v, __ATOMIC_SEQ_CST); }
 LONG InterlockedExchangeAdd(volatile LONG *p, LONG v) { return __atomic_fetch_add(p, v, __ATOMIC_SEQ_CST); }
+LONG InterlockedAnd(volatile LONG *p, LONG v)      { return __atomic_fetch_and(p, v, __ATOMIC_SEQ_CST); }
+LONG InterlockedOr(volatile LONG *p, LONG v)       { return __atomic_fetch_or(p, v, __ATOMIC_SEQ_CST); }
 
 LONG InterlockedCompareExchange(volatile LONG *p, LONG xchg, LONG cmp)
 {
@@ -377,6 +381,18 @@ const char *w32_handle_path(HANDLE h)
     return (o && o->kind == K_FILE) ? o->file_path : NULL;
 }
 
+void w32_handle_set_path(HANDLE h, const char *host_path)
+{
+    w32_object *o = (w32_object *)h;
+    char *old;
+
+    if (!o || o->kind != K_FILE)
+        return;
+    old = o->file_path;
+    o->file_path = host_path ? strdup(host_path) : NULL;
+    free(old);
+}
+
 BOOL CloseHandle(HANDLE h)
 {
     if (!h || h == PSEUDO_CURRENT_THREAD || h == PSEUDO_CURRENT_PROCESS ||
@@ -691,11 +707,56 @@ BOOL ReleaseMutex(HANDLE h)
 /* Threads                                                               */
 /* ===================================================================== */
 
+/* Win32 gives a new thread the process's CPU mask; pthread_create copies
+ * the creator's. A guest thread pinned to one core (xbox_GuestThreadPin)
+ * would otherwise hand that core to every host thread it creates, the
+ * kernel timer thread from KeSetTimer among them. The mask is taken once,
+ * from the first thread to ask, before any pin. */
+static DWORD_PTR s_process_mask;
+
+static DWORD_PTR process_mask_capture(void)
+{
+    DWORD_PTR mask = 0;
+    if (s_process_mask)
+        return s_process_mask;
+#if defined(__linux__)
+    {
+        cpu_set_t set;
+        int i;
+        if (sched_getaffinity(0, sizeof set, &set) == 0)
+            for (i = 0; i < (int)(8 * sizeof mask) && i < CPU_SETSIZE; i++)
+                if (CPU_ISSET(i, &set))
+                    mask |= (DWORD_PTR)1 << i;
+    }
+#endif
+    if (!mask) {
+        long n = sysconf(_SC_NPROCESSORS_ONLN);
+        if (n < 1) n = 1;
+        if (n >= (long)(8 * sizeof mask)) n = (long)(8 * sizeof mask) - 1;
+        mask = ((DWORD_PTR)1 << n) - 1;
+    }
+    s_process_mask = mask;
+    return mask;
+}
+
 static void *thread_trampoline(void *arg)
 {
     w32_object *o = (w32_object *)arg;
     t_self_obj = o;
     t_tid      = o->tid;
+
+#if defined(__linux__)
+    /* The process mask, not the creator's: see process_mask_capture. */
+    if (s_process_mask) {
+        cpu_set_t set;
+        int i;
+        CPU_ZERO(&set);
+        for (i = 0; i < (int)(8 * sizeof s_process_mask) && i < CPU_SETSIZE; i++)
+            if (s_process_mask & ((DWORD_PTR)1 << i))
+                CPU_SET(i, &set);
+        pthread_setaffinity_np(pthread_self(), sizeof set, &set);
+    }
+#endif
 
     /* CREATE_SUSPENDED gate */
     pthread_mutex_lock(&o->lock);
@@ -786,13 +847,22 @@ DWORD ResumeThread(HANDLE h)
 
 DWORD SuspendThread(HANDLE h)
 {
-    /* True mid-run suspension is not supported on POSIX; only the
-     * CREATE_SUSPENDED start gate is. Track the count for ResumeThread. */
+    /* POSIX cannot stop another thread at an arbitrary point, so suspending
+     * one only counts, for ResumeThread. A thread suspending *itself* is a
+     * different matter: it is at a known point, and it parks on the same gate
+     * CREATE_SUSPENDED uses until a ResumeThread brings the count to zero.
+     * Worker pools idle that way; returning at once turned one title's into a
+     * suspend/check spin of millions of calls a second. */
+    if (h == PSEUDO_CURRENT_THREAD) h = GetCurrentThread();
     w32_object *o = (w32_object *)h;
-    if (!o || o->kind != K_THREAD) return (DWORD)-1;
+    if (!o || o == (w32_object *)PSEUDO_CURRENT_THREAD || o->kind != K_THREAD)
+        return (DWORD)-1;
     pthread_mutex_lock(&o->lock);
     DWORD prev = (DWORD)o->suspend_count;
     o->suspend_count++;
+    if (o == t_self_obj)
+        while (o->suspend_count > 0)
+            pthread_cond_wait(&o->gate, &o->lock);
     pthread_mutex_unlock(&o->lock);
     return prev;
 }
@@ -822,6 +892,48 @@ int GetThreadPriority(HANDLE h)
 {
     w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
     return (o && o->kind == K_THREAD) ? o->priority : THREAD_PRIORITY_NORMAL;
+}
+
+DWORD_PTR SetThreadAffinityMask(HANDLE h, DWORD_PTR mask)
+{
+    w32_object *o = (h == PSEUDO_CURRENT_THREAD) ? t_self_obj : (w32_object *)h;
+    pthread_t th = (o && o->kind == K_THREAD) ? o->thread : pthread_self();
+    (void)th;
+    if (!mask)
+        return 0;
+    process_mask_capture();   /* before this thread's mask shrinks */
+#if defined(__linux__)
+    {
+        DWORD_PTR prev = 0;
+        cpu_set_t set;
+        int i;
+        if (pthread_getaffinity_np(th, sizeof set, &set) == 0)
+            for (i = 0; i < (int)(8 * sizeof prev) && i < CPU_SETSIZE; i++)
+                if (CPU_ISSET(i, &set))
+                    prev |= (DWORD_PTR)1 << i;
+        CPU_ZERO(&set);
+        for (i = 0; i < (int)(8 * sizeof mask) && i < CPU_SETSIZE; i++)
+            if (mask & ((DWORD_PTR)1 << i))
+                CPU_SET(i, &set);
+        if (pthread_setaffinity_np(th, sizeof set, &set) != 0)
+            return 0;
+        return prev ? prev : mask;
+    }
+#else
+    return 0;   /* no thread affinity on this host */
+#endif
+}
+
+BOOL GetProcessAffinityMask(HANDLE process, DWORD_PTR *process_mask,
+                            DWORD_PTR *system_mask)
+{
+    /* The process's mask, captured before any thread shrank its own:
+     * sched_getaffinity(0) would answer for the calling thread. */
+    DWORD_PTR mask = process_mask_capture();
+    (void)process;
+    if (process_mask) *process_mask = mask;
+    if (system_mask)  *system_mask  = mask;
+    return TRUE;
 }
 
 VOID SwitchToThread(void) { sched_yield(); }
@@ -1058,18 +1170,42 @@ SIZE_T HeapSize(HANDLE heap, DWORD flags, LPCVOID mem)
 /* Virtual memory                                                        */
 /* ===================================================================== */
 
+/* The guest's PAGE_EXECUTE* requests map without PROT_EXEC. Static
+ * recompilation never runs guest bytes: the title's code is host code in the
+ * executable, and nothing here generates code at run time. Asking for exec
+ * only costs: Apple silicon refuses a writable+executable mapping without
+ * MAP_JIT (macOS and iOS alike), so a guest PAGE_EXECUTE_READWRITE used to
+ * come back NULL. The read/write sense is kept; on x86 an executable page is
+ * always readable, so PAGE_EXECUTE alone is read-only. Logged once. */
+static void exec_dropped(DWORD protect)
+{
+    static int said;
+    if (!__atomic_exchange_n(&said, 1, __ATOMIC_RELAXED))
+        fprintf(stderr, "[win32_compat] guest asked for executable memory "
+                "(protect 0x%02X); mapped without execute, since recompiled "
+                "code never runs guest pages (logged once)\n",
+                (unsigned)(protect & 0xFF));
+}
+
 static int prot_from_page(DWORD protect)
 {
     switch (protect & 0xFF) {
     case PAGE_NOACCESS:          return PROT_NONE;
     case PAGE_READONLY:          return PROT_READ;
     case PAGE_READWRITE:         return PROT_READ | PROT_WRITE;
-    case PAGE_EXECUTE:           return PROT_EXEC;
-    case PAGE_EXECUTE_READ:      return PROT_READ | PROT_EXEC;
-    case PAGE_EXECUTE_READWRITE: return PROT_READ | PROT_WRITE | PROT_EXEC;
+    case PAGE_EXECUTE:
+    case PAGE_EXECUTE_READ:      exec_dropped(protect); return PROT_READ;
+    case PAGE_EXECUTE_READWRITE: exec_dropped(protect); return PROT_READ | PROT_WRITE;
     default:                     return PROT_READ | PROT_WRITE;
     }
 }
+
+/* Length registry, defined with the view helpers below. Win32 frees by address
+ * alone -- UnmapViewOfFile takes no length and VirtualFree(MEM_RELEASE) is
+ * documented to take size 0 -- so the length has to be recoverable here or
+ * munmap cannot be called at all. */
+void view_register(void *addr, size_t len);
+size_t view_take(const void *addr);
 
 #if defined(__APPLE__)
 /* Darwin has no MAP_FIXED_NOREPLACE, and the two mmap options are both wrong
@@ -1581,6 +1717,22 @@ int view_lookup(const void *addr, void **base_out, size_t *len_out)
     return found;
 }
 
+/* Start of the lowest registered view above addr, or 0 when there is none.
+ * VirtualQuery's answer for memory the shim does not own: the free run it
+ * reports ends where the next mapping it knows of begins. */
+static uintptr_t view_next_above(const void *addr)
+{
+    uintptr_t next = 0;
+    pthread_mutex_lock(&s_views_lock);
+    for (int i = 0; i < 512; i++) {
+        uintptr_t lo = (uintptr_t)s_views[i].addr;
+        if (lo > (uintptr_t)addr && (!next || lo < next))
+            next = lo;
+    }
+    pthread_mutex_unlock(&s_views_lock);
+    return next;
+}
+
 size_t view_take(const void *addr)
 {
     size_t len = 0;
@@ -1597,10 +1749,12 @@ static int anon_map_fd(const char *name)
 {
 #if defined(__APPLE__)
     static volatile LONG map_counter = 0;
+    /* The pid keeps two instances apart: with a bare counter, both open
+     * "/xbox_map_1" and the second O_EXCL loses. macOS caps the name at 31. */
     char shm_name[32];
     LONG seq = InterlockedIncrement(&map_counter);
     const char *base = name ? name : "xbox_map";
-    snprintf(shm_name, sizeof(shm_name), "/%s_%ld", base, seq);
+    snprintf(shm_name, sizeof(shm_name), "/%.12s_%d_%ld", base, (int)getpid(), seq);
     int fd = shm_open(shm_name, O_CREAT | O_RDWR | O_EXCL, 0600);
     if (fd >= 0) shm_unlink(shm_name);
     return fd;
@@ -1728,10 +1882,17 @@ SIZE_T VirtualQuery(LPCVOID address, PMEMORY_BASIC_INFORMATION buffer, SIZE_T le
     size_t len  = 0;
 
     if (!view_lookup(address, &base, &len)) {
-        /* Not ours. Report it free rather than inventing a committed page. */
+        /* Not ours. Report it free rather than inventing a committed page,
+         * up to the next mapping the shim knows of (or the end of the address
+         * space). Win32 callers walk free memory region by region; a size of
+         * 0 never moved them on (upstream guest_vmem's scan spun forever).
+         * Mappings made outside the shim are invisible here, so a caller that
+         * then reserves at a fixed address can still be refused. */
+        uintptr_t next = view_next_above(address);
         buffer->BaseAddress    = (PVOID)address;
         buffer->AllocationBase = NULL;
-        buffer->RegionSize     = 0;
+        buffer->RegionSize     = next ? next - (uintptr_t)address
+                                      : UINTPTR_MAX - (uintptr_t)address + 1;
         buffer->State          = MEM_FREE;
         buffer->Protect        = PAGE_NOACCESS;
         buffer->Type           = 0;
