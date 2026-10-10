@@ -15,12 +15,15 @@
  * Off unless RECOMP_FB_WINDOW is set.
  */
 #include <stdint.h>
+#include "recomp_env.h"
 
 #if defined(_WIN32)
 #include <windows.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "video_player.h"   /* the xbox_FramebufferWindow* prototypes */
+#include "window_title.h"
 
 extern ptrdiff_t xbox_GetMemoryOffset(void);
 
@@ -48,7 +51,7 @@ void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch)
      * whichever surface is being drawn into. A black window cannot distinguish
      * "the read path is broken" from "the title rendered black", and pointing
      * it at memory known to have content settles that. */
-    const char *pin = getenv("RECOMP_FB_VA");
+    const char *pin = recomp_env(RENV_FB_VA);
 
     s_fb_va = pin ? (uint32_t)strtoul(pin, NULL, 0) : fb_va;
     if (pitch)
@@ -64,7 +67,7 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
 
     if (!s_fb_running || !fb_va || !pitch)
         return;
-    if (getenv("RECOMP_FB_VA"))
+    if (recomp_env(RENV_FB_VA))
         return;                       /* pinned: leave the old path alone */
     next = (s_present_idx == 0) ? 1 : 0;
     if (!s_present[next]) {
@@ -98,46 +101,41 @@ void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch)
     InterlockedExchange(&s_present_idx, next);
 }
 
-/* Which keys are down, for the pad stand-in in src/input.
+/* Which keys are down, for the pad stand-in in src/input: this window
+ * records them in the shared key table (src/input/keyboard.c).
  *
  * GetAsyncKeyState looked like the cheaper way to ask and does not work
  * here: it reads a state Wine keeps for the X server, and a guest process
  * drawing through GDI never sees it change. The window that has the focus
  * is the thing that receives the keys, so that is what has to remember
- * them.
- *
- * Reading this needs no lock. Each entry is written only by the window
- * thread and read only by the USB thread, one byte at a time, and a press
- * seen a frame late is indistinguishable from one made a frame later. */
-static volatile unsigned char s_key_down[256];
+ * them. Declared rather than included, as src/input does for this side. */
+extern void xbox_InputKeySet(int vk, int down);
+extern void xbox_InputKeysClear(void);
 
-/* Title bar, the way ps3recomp's window shows it. Written by the flip,
- * read once a second by the window thread; a torn read shows one stale
- * number for a second, which nobody can tell apart from a real one. */
-static wchar_t       s_title[48] = L"Xbox Recomp";
+/* Title bar (window_title.h): the game's name; with RECOMP_TRACE=title also
+ * FPS and draws, the way ps3recomp's window shows them. The counts are
+ * written by the flip and read once a second by the window thread; a torn
+ * read shows one stale number for a second, which nobody can tell apart
+ * from a real one. The certificate's name is kept as UTF-8, like the SDL
+ * window's, so both format the same text. */
+static char          s_xbe_title[128];
 static volatile LONG s_flips;
 static volatile LONG s_frame_draws;
+static volatile LONG s_name_gen;
 
 void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars)
 {
-    int i;
-    for (i = 0; i < max_chars && i < 47 && name[i]; i++)
-        s_title[i] = (wchar_t)name[i];
-    if (i)
-        s_title[i] = 0;
+    char buf[sizeof s_xbe_title];
+    if (xbox_title_utf16_to_utf8(buf, sizeof buf, name, max_chars)) {
+        memcpy(s_xbe_title, buf, strlen(buf) + 1);
+        InterlockedIncrement(&s_name_gen);
+    }
 }
 
 void xbox_FramebufferWindowFrameStats(uint32_t draws)
 {
     InterlockedIncrement(&s_flips);
     InterlockedExchange(&s_frame_draws, (LONG)draws);
-}
-
-int xbox_FramebufferKeyDown(int vk)
-{
-    if ((unsigned)vk > 255)
-        return 0;
-    return s_key_down[vk] != 0;
 }
 
 static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
@@ -150,8 +148,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_KEYDOWN:
     case WM_SYSKEYDOWN:
-        if ((unsigned)w < 256)
-            s_key_down[w] = 1;
+        xbox_InputKeySet((int)w, 1);
         /* RECOMP_KEY_TRACE: each key as it arrives, edge-triggered.
          *
          * The obvious diagnostic -- sampling which keys are held, once a
@@ -160,7 +157,7 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
          * one time in ten. That ambiguity is expensive when the only way
          * to test is to ask someone to press a key and describe what
          * happened. This answers "did it arrive" on its own. */
-        if (getenv("RECOMP_KEY_TRACE")) {
+        if (recomp_env(RENV_KEY_TRACE)) {
             static unsigned n;
             if (n++ < 40) {
                 fprintf(stderr, "  [KEY] down vk=0x%02X\n", (unsigned)w);
@@ -172,13 +169,12 @@ static LRESULT CALLBACK fb_wndproc(HWND h, UINT m, WPARAM w, LPARAM l)
 
     case WM_KEYUP:
     case WM_SYSKEYUP:
-        if ((unsigned)w < 256)
-            s_key_down[w] = 0;
+        xbox_InputKeySet((int)w, 0);
         return m == WM_SYSKEYUP ? DefWindowProcA(h, m, w, l) : 0;
 
     /* Alt-tabbing away with a key held would leave it held for ever. */
     case WM_KILLFOCUS:
-        memset((void *)s_key_down, 0, sizeof s_key_down);
+        xbox_InputKeysClear();
         return 0;
     }
     return DefWindowProcA(h, m, w, l);
@@ -256,8 +252,52 @@ int xbox_FramebufferDumpBmp(const char *path)
     return 0;
 }
 
+extern void xbox_log_thread_role(const char *role, uint32_t routine);
+
+/* A title's own name for the window; once set it wins over the XBE
+ * certificate's name in the title bar below. */
+static char          s_title[128] = "Xbox Recomp";
+static volatile LONG s_host_title_set;
+
+void xbox_HostWindowSetTitle(const char *title)
+{
+    if (!title || !title[0])
+        return;
+    snprintf(s_title, sizeof(s_title), "%s", title);
+    InterlockedExchange(&s_host_title_set, 1);
+    /* The window threads pick the new name up on their next pass. */
+    InterlockedIncrement(&s_name_gen);
+}
+
+/* The title bar text, for a window that keeps it current: this file's, and
+ * the D3D11 backend's own, which the flip counts and the name reach only
+ * through here. Returns 1, with the text in tb (n wide chars), when the
+ * window should write it: once a second with RECOMP_TRACE=title, otherwise
+ * only when the name has changed since c's last write. */
+int xbox_FramebufferWindowTitleText(wchar_t *tb, int n, struct xbox_title_clock *c)
+{
+    static int stats = -1;
+    char u8[192];
+    double fps;
+    const char *name;
+
+    if (stats < 0)
+        stats = recomp_env_on(RENV_TITLE_STATS);
+    if (n < 1 || !xbox_title_due(c, stats, GetTickCount64(),
+                                 (uint32_t)s_flips, (unsigned)s_name_gen, &fps))
+        return 0;
+    name = s_host_title_set ? s_title : s_xbe_title[0] ? s_xbe_title : s_title;
+    xbox_title_format(u8, sizeof u8, name, stats, fps, 1,
+                      (uint32_t)s_frame_draws);
+    if (!MultiByteToWideChar(CP_UTF8, 0, u8, -1, tb, n))
+        tb[0] = 0;
+    tb[n - 1] = 0;
+    return 1;
+}
+
 static DWORD WINAPI fb_thread(LPVOID unused)
 {
+    xbox_log_thread_role("fb-present", 0);
     HWND hwnd;
     HDC hdc;
     BITMAPINFO bi;
@@ -276,7 +316,7 @@ static DWORD WINAPI fb_thread(LPVOID unused)
     }
     r.left = 0; r.top = 0; r.right = (LONG)s_fb_width; r.bottom = (LONG)s_fb_height;
     AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
-    hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", "Xbox Recomp - Framebuffer",
+    hwnd = CreateWindowExA(0, "XboxRecompFramebuffer", s_title,
                            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
                            CW_USEDEFAULT, CW_USEDEFAULT,
                            r.right - r.left, r.bottom - r.top,
@@ -338,8 +378,8 @@ static DWORD WINAPI fb_thread(LPVOID unused)
              * double buffering those are different buffers, and measuring
              * progress from the executor's dump reports a blank screen while
              * the window is showing the title's logo. Ask the window. */
-            const char *dump = getenv("RECOMP_FB_DUMP");
-            const char *every = getenv("RECOMP_FB_WINDOW_DUMP_EVERY");
+            const char *dump = recomp_env(RENV_FB_DUMP);
+            const char *every = recomp_env(RENV_FB_WINDOW_DUMP_EVERY);
             static int frames;
             int period = every ? atoi(every) : 0;
             frames++;
@@ -351,19 +391,10 @@ static DWORD WINAPI fb_thread(LPVOID unused)
             }
         }
         {
-            static DWORD t0;
-            static LONG f0;
-            DWORD now = GetTickCount();
-            if (now - t0 >= 1000) {
-                LONG f = s_flips;
-                wchar_t tb[128];
-                _snwprintf(tb, 127, L"%ls | FPS: %.1f | draws: %ld", s_title,
-                           t0 ? (f - f0) * 1000.0 / (now - t0) : 0.0,
-                           (long)s_frame_draws);
-                tb[127] = 0;
+            static struct xbox_title_clock tc;
+            wchar_t tb[192];
+            if (xbox_FramebufferWindowTitleText(tb, 192, &tc))
                 SetWindowTextW(hwnd, tb);
-                t0 = now; f0 = f;
-            }
         }
         Sleep(16);
     }
@@ -379,7 +410,7 @@ void xbox_FramebufferWindowStart(void)
 {
     HANDLE th;
 
-    if (!getenv("RECOMP_FB_WINDOW"))
+    if (!recomp_env(RENV_FB_WINDOW))
         return;
     if (InterlockedCompareExchange(&s_fb_running, 1, 0) != 0)
         return;
@@ -391,10 +422,11 @@ void xbox_FramebufferWindowStart(void)
 }
 
 #else
+/* Not built on POSIX (see CMakeLists.txt): fb_present_sdl.c is the window
+ * there. Kept so the file still compiles anywhere on its own. */
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowPresent(uint32_t fb_va, uint32_t pitch) { (void)fb_va; (void)pitch; }
 void xbox_FramebufferWindowStart(void) {}
-int xbox_FramebufferKeyDown(int vk) { (void)vk; return 0; }
 void xbox_FramebufferWindowSetTitle(const uint16_t *n, int m) { (void)n; (void)m; }
 void xbox_FramebufferWindowFrameStats(uint32_t draws) { (void)draws; }
 #endif

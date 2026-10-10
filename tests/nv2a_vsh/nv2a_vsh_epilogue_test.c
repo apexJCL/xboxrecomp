@@ -6,8 +6,14 @@
  *
  * The rcc is paired with a MAC op that writes no temp, and must still land
  * in R1; sent to the instruction's temp field instead, R1.x stayed 0 and
- * every vertex came out at c[59]. */
-#include "nv2a_vsh_interp.h"
+ * every vertex came out at c[59].
+ *
+ * Upstream's tests/nv2a_vsh/nv2a_vsh_test.c (sp00nznet/xboxrecomp), ported
+ * from nv2a_vsh_interp's stateful API (set_instruction / set_constant /
+ * run) to nv2a_vsh_cpu's stateless one (program, constants and inputs
+ * passed to nv2a_vsh_run). The program and the expected result are the
+ * same. */
+#include "nv2a_vsh_cpu.h"
 #include <math.h>
 #include <stdio.h>
 
@@ -25,10 +31,12 @@ static void src(uint32_t w[4], int which, int mux, int reg, int swz)
 
 int main(void)
 {
-    uint32_t i0[4] = {0}, i1[4] = {0}, i2[4] = {0};
-    const float c58[4] = {320, -240, 1000, 0}, c59[4] = {320, 240, 0, 0};
+    static uint32_t prog[NV2A_VSH_SLOTS][4];
+    static float c[NV2A_VSH_CONSTANTS][4];
     float in[NV2A_VSH_INPUTS][4] = {{0}};
-    Nv2aVshOutput o;
+    uint32_t *i0 = prog[0], *i1 = prog[1], *i2 = prog[2];
+    const float *pos;
+    Nv2aVshOut o;
 
     /* mov o[0].xyzw, v0 */
     i0[1] = (1u << 21);                         /* MAC mov, input v0 */
@@ -45,22 +53,22 @@ int main(void)
     src(i2, 0, T, 12, XYZW); src(i2, 1, T, 1, XXXX); src(i2, 2, C, 0, XYZW);
     i2[3] |= (0xEu << 12) | (1u << 11) | 1u;
 
-    nv2a_vsh_set_instruction(0, i0);
-    nv2a_vsh_set_instruction(1, i1);
-    nv2a_vsh_set_instruction(2, i2);
-    nv2a_vsh_set_constant(58, c58);
-    nv2a_vsh_set_constant(59, c59);
+    c[58][0] = 320; c[58][1] = -240; c[58][2] = 1000; c[58][3] = 0;
+    c[59][0] = 320; c[59][1] = 240;  c[59][2] = 0;    c[59][3] = 0;
 
     in[0][0] = 1.0f; in[0][1] = 0.5f; in[0][2] = 0.25f; in[0][3] = 2.0f;
-    if (!nv2a_vsh_run((const float (*)[4])in, &o)) {
+    nv2a_vsh_run((const uint32_t (*)[4])prog, 0, c, 0,
+                 (const float (*)[4])in, &o);
+    if (!o.ok) {
         puts("FAIL: program did not run");
         return 1;
     }
+    pos = o.o[NV2A_VSH_O_POS];
     /* x = 1*320/2 + 320, y = 0.5*-240/2 + 240, z = 0.25*1000/2, w kept */
-    if (fabsf(o.pos[0] - 480) > 1e-3f || fabsf(o.pos[1] - 180) > 1e-3f
-        || fabsf(o.pos[2] - 125) > 1e-3f || o.pos[3] != 2.0f) {
+    if (fabsf(pos[0] - 480) > 1e-3f || fabsf(pos[1] - 180) > 1e-3f
+        || fabsf(pos[2] - 125) > 1e-3f || pos[3] != 2.0f) {
         printf("FAIL: pos %g %g %g %g, want 480 180 125 2\n",
-               o.pos[0], o.pos[1], o.pos[2], o.pos[3]);
+               pos[0], pos[1], pos[2], pos[3]);
         return 1;
     }
     puts("ok");

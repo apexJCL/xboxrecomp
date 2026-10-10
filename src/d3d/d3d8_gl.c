@@ -976,6 +976,9 @@ static HRESULT __stdcall d3d_CreateDevice(IDirect3D8 *s, UINT adapter, DWORD dev
     if (!pp || !pPP) return D3DERR_INVALIDCALL;
 
     /* Initialise SDL video + GL 3.3 core context. */
+    /* Video pulls in SDL events; dev_Present ignores SDL_QUIT, so keep
+     * SIGINT/SIGTERM at their process defaults. */
+    SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1");
     if (!SDL_WasInit(SDL_INIT_VIDEO)) SDL_InitSubSystem(SDL_INIT_VIDEO);
 
     g.backbuf_w = (int)pPP->BackBufferWidth;

@@ -10,6 +10,7 @@
 #ifndef XBOXRECOMP_VIDEO_PLAYER_H
 #define XBOXRECOMP_VIDEO_PLAYER_H
 
+#include <stddef.h>   /* wchar_t */
 #include <stdint.h>
 
 /* Initialize/shutdown Media Foundation (call once at app start/end) */
@@ -58,17 +59,34 @@ int  video_dump_frame_bmp(const char *path);
 
 /* Show the guest framebuffer in its own window (RECOMP_FB_WINDOW). Whatever
  * the title renders into guest RAM appears there; nothing else scans it out. */
-/* Non-zero while that virtual key is held in the framebuffer window. Always
- * zero when there is no window, which is the right answer: with nothing to
- * focus there is nothing to type into. */
-int xbox_FramebufferKeyDown(int vk);
-
 void xbox_FramebufferWindowStart(void);
 void xbox_FramebufferWindowSet(uint32_t fb_va, uint32_t pitch);
 int  xbox_FramebufferDumpBmp(const char *path);
-/* Title bar: "<XBE title> | FPS: n | draws: n". The name is the certificate's
- * UTF-16 title (40 chars max); the stats come from each flip. */
+/* Title bar: the game's name (window_title.h). The name is the certificate's
+ * UTF-16 title (40 chars max), unless the title set its own with
+ * xbox_HostWindowSetTitle. RECOMP_TRACE=title appends " | FPS: n | draws: n",
+ * refreshed once a second from each flip's stats. */
 void xbox_FramebufferWindowSetTitle(const uint16_t *name, int max_chars);
 void xbox_FramebufferWindowFrameStats(uint32_t draws);
+#if defined(_WIN32)
+/* That title bar text, for a Win32 window that keeps it current (the D3D11
+ * backend's): fills tb (n wide chars) and returns 1 when the window should
+ * write it -- when the name changes, or once a second with
+ * RECOMP_TRACE=title. *c is the window's own, zeroed to start. */
+struct xbox_title_clock;
+int xbox_FramebufferWindowTitleText(wchar_t *tb, int n, struct xbox_title_clock *c);
+#endif
+
+/* The host window's title. The title sets it, before the window opens or at
+ * any time after; unset, it is the certificate's name, or "Xbox Recomp"
+ * before there is one. */
+void xbox_HostWindowSetTitle(const char *title);
+
+#if !defined(_WIN32)
+/* POSIX: the process main thread runs the window's event loop and guest_main
+ * runs on a thread of its own (fb_present_sdl.c). Returns guest_main's exit
+ * code. */
+int xbox_HostWindowMain(int (*guest_main)(void));
+#endif
 
 #endif /* BURNOUT3_VIDEO_PLAYER_H */
