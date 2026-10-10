@@ -18,6 +18,7 @@
  */
 
 #include "kernel.h"
+#include "recomp_env.h"
 #include "xbox_memory_layout.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -406,7 +407,7 @@ void xbox_kernel_init(void)
     g_log_file = fopen("xbox_kernel.log", "w");
 
     /* Set log level from environment variable if present */
-    const char* log_env = getenv("XBOX_LOG_LEVEL");
+    const char* log_env = recomp_env(RENV_LOG_LEVEL);
     if (log_env) {
         g_log_level = atoi(log_env);
         if (g_log_level < XBOX_LOG_ERROR) g_log_level = XBOX_LOG_ERROR;

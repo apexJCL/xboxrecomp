@@ -161,6 +161,14 @@ Z:\cache.dat                 → <save_dir>\cache\cache.dat
 xbox_path_init("Burnout 3 Takedown", "saves");
 ```
 
+`save_dir` defaults to `$XDG_DATA_HOME/xboxrecomp` (POSIX) or
+`%LOCALAPPDATA%\xboxrecomp` (Windows). The title's own saves,
+`\Device\Harddisk0\Partition1\UDATA` and `...\TDATA` (where XAPI maps U: and T:),
+go to `<save_dir>/UDATA` and `<save_dir>/TDATA`. `RECOMP_SAVE_DIR=<dir>` moves
+just those two under `<dir>` (created if missing; absolute, and under Wine a
+DOS path such as `Z:\home\me\run\save`), so a scripted run can start from an
+empty save without touching the rest of the save dir.
+
 ## Threading
 
 Xbox threads use `PsCreateSystemThreadEx` with NT-style parameters. We create Win32 threads with a wrapper that sets up the register context:

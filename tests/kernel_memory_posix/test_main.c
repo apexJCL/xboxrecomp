@@ -166,6 +166,27 @@ int main(void)
               "probing before it writes is always told yes");
     }
 
+    /* 3b. A free address reports how far the free run goes: up to the next
+     * mapping the shim made, so a Win32-style walk over free memory moves on
+     * (it used to be RegionSize 0, and guest_vmem's scan spun forever). */
+    {
+        MEMORY_BASIC_INFORMATION mbi;
+        SIZE_T want = 64 * 1024;
+        LPVOID p = VirtualAlloc(NULL, want, MEM_COMMIT | MEM_RESERVE,
+                                PAGE_READWRITE);
+        check(p != NULL, "VirtualAlloc returns a pointer (free-run check)", NULL);
+        if (p) {
+            uint8_t *below = (uint8_t *)p - 0x10000;
+            memset(&mbi, 0, sizeof mbi);
+            VirtualQuery(below, &mbi, sizeof mbi);
+            check(mbi.State == MEM_FREE && mbi.RegionSize != 0
+                      && (uintptr_t)below + mbi.RegionSize <= (uintptr_t)p,
+                  "VirtualQuery sizes a free run, ending at the next mapping",
+                  "RegionSize 0 for free memory: a region walk never advances");
+            VirtualFree(p, 0, MEM_RELEASE);
+        }
+    }
+
     /*
      * 6. MmGetPhysicalAddress must translate.
      *
@@ -205,6 +226,34 @@ int main(void)
                      "0x%08X gave 0x%08llX, the bridge gives 0x%08X",
                      cases[i].in, (unsigned long long)got, cases[i].want);
             check((uint32_t)got == cases[i].want, what, detail);
+        }
+    }
+
+    /*
+     * 7. A guest asking for executable memory gets usable memory.
+     *
+     * PAGE_EXECUTE_READWRITE became PROT_READ|PROT_WRITE|PROT_EXEC, which
+     * Apple silicon refuses without MAP_JIT, so the title's allocation came
+     * back NULL on every Mac. Recompiled code never runs guest pages, so the
+     * shim maps it read-write; PAGE_EXECUTE_READ stays read-only.
+     */
+    {
+        SIZE_T sz = 64 * 1024;
+        PVOID base = NULL;
+        NTSTATUS st = xbox_NtAllocateVirtualMemory(&base, 0, &sz,
+                                                   MEM_COMMIT | MEM_RESERVE,
+                                                   PAGE_EXECUTE_READWRITE);
+        check(st == 0 && base != NULL,
+              "NtAllocateVirtualMemory(PAGE_EXECUTE_READWRITE) maps",
+              "refused: the shim still asks the host for PROT_EXEC");
+        if (st == 0 && base) {
+            memset(base, 0x5A, sz);
+            check(((unsigned char *)base)[sz - 1] == 0x5A,
+                  "executable guest memory is writable", NULL);
+            DWORD old;
+            check(VirtualProtect(base, sz, PAGE_EXECUTE_READ, &old) != 0,
+                  "VirtualProtect(PAGE_EXECUTE_READ) succeeds", NULL);
+            VirtualFree(base, 0, MEM_RELEASE);
         }
     }
 
