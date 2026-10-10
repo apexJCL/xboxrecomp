@@ -27,6 +27,15 @@ uint64_t mcpx_apu_mmio_read(MCPXAPUState *d, uint64_t addr, unsigned int size);
 /* MMIO write to APU register space (addr is offset from 0xFE800000). */
 void mcpx_apu_mmio_write(MCPXAPUState *d, uint64_t addr, uint64_t val, unsigned int size);
 
+/* RECOMP_APU_FAULT_BENCH: time n trapped reads of PIO_FREE through the page
+ * fault + VEH + decoder path; prints one line, returns us per access (0 if
+ * not run). Windows x86-64 only (apu_mmio_hook.c). */
+double apu_hook_fault_bench(unsigned n);
+
+/* RECOMP_APU_TRACE: start the periodic access-rate reporter (no-op when the
+ * variable is unset, or off Windows). */
+void apu_hook_trace_start(void);
+
 /* Play a 440Hz test tone through the APU pipeline to verify audio output.
  * Directly programs a voice without going through DirectSound. */
 void mcpx_apu_play_test_tone(MCPXAPUState *d);

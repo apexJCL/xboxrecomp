@@ -380,6 +380,11 @@ typedef struct MCPXAPUVoiceFilter {
     uint16_t voice;
     float resample_buf[NUM_SAMPLES_PER_FRAME * 2];
     SRC_STATE *resampler;
+    /* Linear-interpolation resampler state (voice_resample): the two source
+     * samples the output sits between, the output's position in [0,1)
+     * between them, and whether they have been fetched yet. */
+    float rs_last[2], rs_next[2], rs_pos;
+    int   rs_have;
     sv_filter svf[2];
     HrtfFilter hrtf;
 } MCPXAPUVoiceFilter;
@@ -526,8 +531,29 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d);
 void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
 void mcpx_apu_dsp_ack_poll(MCPXAPUState *d);
 
+/* Monitor (host output): call after each 32-sample frame; on the last frame
+ * of an EP period it adds the software mixer and test tone to frame_buf and
+ * hands those 256 samples to the device. */
+void mcpx_apu_monitor_frame(MCPXAPUState *d);
+
+/* Frame-thread pacing at an EP-period boundary: 0 = render the next period
+ * now, else microseconds to wait before asking again. See apu_core.c. */
+int64_t mcpx_apu_pace_step(MCPXAPUState *d, int64_t now_us);
+
 /* Debug globals */
 extern MCPXAPUState *g_state;
 extern struct McpxApuDebug g_dbg, g_dbg_cache;
 extern int g_dbg_voice_monitor;
 extern uint64_t g_dbg_muted_voices[4];
+
+/* RECOMP_APU_TRACE: idle-voice traps against interrupt deliveries. Traps are
+ * counted under the APU lock, holder_delivered by the gate holder, the rest
+ * by the frame thread. */
+typedef struct {
+    unsigned traps, delivered, held_frames, forced;
+    unsigned posted;            /* found the gate held: left for its holder */
+    unsigned holder_delivered;  /* run by the gate holder at a safe point */
+    unsigned se_frames;         /* VP/DSP frames run (se_frame), cumulative */
+    unsigned fe_trapped_frames; /* frames that found FECTL trapped */
+} ApuIrqStats;
+extern ApuIrqStats apu_irq_stats;

@@ -1,11 +1,13 @@
 /*
  * MCPX APU MMIO Hook - VEH instruction decoder for APU register access
  *
- * Reuses the same x86-64 instruction decoder pattern as nv2a_mmio_hook.c
- * but routes reads/writes through the MCPX APU register handlers.
+ * Decodes the faulting instruction with the shared trapped-MMIO decoder
+ * (src/platform/mmio_decode.h) and routes reads/writes through the MCPX APU
+ * register handlers.
  */
 
 #include "apu.h"
+#include "recomp_env.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
@@ -20,6 +22,7 @@ MCPXAPUState *g_apu_state = NULL;
  * now the whole body is Windows-only so apu_emu links on Debian. */
 #if defined(_WIN32)
 #include <windows.h>
+#include "../platform/mmio_decode.h"
 
 /* APU MMIO base in Xbox VA space */
 #define APU_MMIO_BASE  0xFE800000u
@@ -32,215 +35,53 @@ static int g_apu_mmio_read_count = 0;
 static int g_apu_mmio_write_count = 0;
 static int g_apu_mmio_decode_fail = 0;
 
+/* The value the decoder last handed the model, so the RECOMP_APU_TRACE
+ * histogram can show what was written (a read-back of a PIO method offset
+ * does not return it). Racy across faulting threads; diagnostic only. */
+static volatile uint32_t s_last_wval;
+
 /* ============================================================
- * x86-64 register access helpers (same as NV2A hook)
+ * Instruction decoding: the shared trapped-MMIO decoder
+ * (src/platform/mmio_decode.h, covered by tests/mmio_decode), with the
+ * APU register model behind it.
  * ============================================================ */
 
-static uint64_t *ctx_reg64(PCONTEXT ctx, int reg)
+/* The model's registers are 32-bit and its read/write ignore the size, so an
+ * 8-byte access (the decoder emits size 8 for REX.W) is two 4-byte accesses
+ * here; handing it over whole dropped the high dword on a store and returned
+ * zero for it on a load. The POSIX arm64 hook below splits the same way. */
+static uint64_t apu_mmio_rd(void *dev, uint32_t off, int size)
 {
-    switch (reg & 0xF) {
-    case 0:  return (uint64_t*)&ctx->Rax;
-    case 1:  return (uint64_t*)&ctx->Rcx;
-    case 2:  return (uint64_t*)&ctx->Rdx;
-    case 3:  return (uint64_t*)&ctx->Rbx;
-    case 4:  return (uint64_t*)&ctx->Rsp;
-    case 5:  return (uint64_t*)&ctx->Rbp;
-    case 6:  return (uint64_t*)&ctx->Rsi;
-    case 7:  return (uint64_t*)&ctx->Rdi;
-    case 8:  return (uint64_t*)&ctx->R8;
-    case 9:  return (uint64_t*)&ctx->R9;
-    case 10: return (uint64_t*)&ctx->R10;
-    case 11: return (uint64_t*)&ctx->R11;
-    case 12: return (uint64_t*)&ctx->R12;
-    case 13: return (uint64_t*)&ctx->R13;
-    case 14: return (uint64_t*)&ctx->R14;
-    case 15: return (uint64_t*)&ctx->R15;
-    default: return NULL;
+    g_apu_mmio_read_count++;
+    if (size == 8) {
+        uint64_t lo = mcpx_apu_mmio_read((MCPXAPUState *)dev, off, 4);
+        uint64_t hi = mcpx_apu_mmio_read((MCPXAPUState *)dev, off + 4, 4);
+        return lo | (hi << 32);
     }
+    return mcpx_apu_mmio_read((MCPXAPUState *)dev, off, (unsigned)size);
 }
 
-static int decode_modrm_len(const uint8_t *ip, int has_rex_b)
+static void apu_mmio_wr(void *dev, uint32_t off, uint64_t v, int size)
 {
-    uint8_t modrm = *ip;
-    int mod = (modrm >> 6) & 3;
-    int rm = (modrm & 7) | (has_rex_b ? 8 : 0);
-    int len = 1;
-
-    if (mod == 3) return 1;
-    if ((rm & 7) == 4) len += 1; /* SIB */
-    if (mod == 0 && (rm & 7) == 5) len += 4; /* disp32 */
-    else if (mod == 1) len += 1;
-    else if (mod == 2) len += 4;
-    return len;
+    g_apu_mmio_write_count++;
+    s_last_wval = (uint32_t)v;
+    if (size == 8) {
+        mcpx_apu_mmio_write((MCPXAPUState *)dev, off, (uint32_t)v, 4);
+        mcpx_apu_mmio_write((MCPXAPUState *)dev, off + 4, (uint32_t)(v >> 32), 4);
+        return;
+    }
+    mcpx_apu_mmio_write((MCPXAPUState *)dev, off, v, (unsigned)size);
 }
-
-/* ============================================================
- * Instruction decoder for APU MMIO access
- * ============================================================ */
 
 static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_write)
 {
     const uint8_t *ip = (const uint8_t *)ctx->Rip;
+
+    (void)is_write;
     if (!g_apu_state) return false;
-
-    int prefix_len = 0;
-    int has_66 = 0;
-    int rex = 0, has_rex = 0;
-
-    while (1) {
-        uint8_t b = ip[prefix_len];
-        if (b == 0x66) { has_66 = 1; prefix_len++; }
-        else if (b == 0xF2 || b == 0xF3) { prefix_len++; }
-        else if (b >= 0x40 && b <= 0x4F) { rex = b; has_rex = 1; prefix_len++; }
-        else break;
-    }
-
-    int rex_w = has_rex && (rex & 0x08);
-    int rex_r = has_rex && (rex & 0x04);
-    int rex_b = has_rex && (rex & 0x01);
-
-    const uint8_t *opcode = ip + prefix_len;
-    int access_size = 4;
-    if (has_66) access_size = 2;
-    if (rex_w) access_size = 8;
-
-    /* MOV r/m, r (write: 88/89) */
-    if (opcode[0] == 0x89 || opcode[0] == 0x88) {
-        if (opcode[0] == 0x88) access_size = 1;
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t val = *ctx_reg64(ctx, reg);
-        mcpx_apu_mmio_write(g_apu_state, mmio_offset, val, access_size);
-        ctx->Rip += prefix_len + 1 + modrm_len;
-        g_apu_mmio_write_count++;
+    if (mmio_emulate(ctx, mmio_offset, g_apu_state, apu_mmio_rd, apu_mmio_wr))
         return true;
-    }
 
-    /* MOV r/m, imm32 (write: C7 /0) */
-    if (opcode[0] == 0xC7) {
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        uint32_t imm = *(uint32_t *)(opcode + 1 + modrm_len);
-        mcpx_apu_mmio_write(g_apu_state, mmio_offset, imm, access_size);
-        ctx->Rip += prefix_len + 1 + modrm_len + 4;
-        g_apu_mmio_write_count++;
-        return true;
-    }
-
-    /* MOV r/m8, imm8 (write: C6 /0) */
-    if (opcode[0] == 0xC6) {
-        access_size = 1;
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        uint8_t imm = *(opcode + 1 + modrm_len);
-        mcpx_apu_mmio_write(g_apu_state, mmio_offset, imm, 1);
-        ctx->Rip += prefix_len + 1 + modrm_len + 1;
-        g_apu_mmio_write_count++;
-        return true;
-    }
-
-    /* MOV r, r/m (read: 8A/8B) */
-    if (opcode[0] == 0x8B || opcode[0] == 0x8A) {
-        if (opcode[0] == 0x8A) access_size = 1;
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size);
-        uint64_t *dst = ctx_reg64(ctx, reg);
-        if (access_size == 1) *dst = (*dst & ~0xFFULL) | (val & 0xFF);
-        else if (access_size == 2) *dst = (*dst & ~0xFFFFULL) | (val & 0xFFFF);
-        else if (access_size == 4) *dst = val & 0xFFFFFFFF;
-        else *dst = val;
-        ctx->Rip += prefix_len + 1 + modrm_len;
-        g_apu_mmio_read_count++;
-        return true;
-    }
-
-    /* MOVZX r32, r/m8 (0F B6) */
-    if (opcode[0] == 0x0F && opcode[1] == 0xB6) {
-        access_size = 1;
-        int modrm_len = decode_modrm_len(opcode + 2, rex_b);
-        int reg = ((opcode[2] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, 1);
-        *ctx_reg64(ctx, reg) = val & 0xFF;
-        ctx->Rip += prefix_len + 2 + modrm_len;
-        g_apu_mmio_read_count++;
-        return true;
-    }
-
-    /* MOVZX r32, r/m16 (0F B7) */
-    if (opcode[0] == 0x0F && opcode[1] == 0xB7) {
-        access_size = 2;
-        int modrm_len = decode_modrm_len(opcode + 2, rex_b);
-        int reg = ((opcode[2] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, 2);
-        *ctx_reg64(ctx, reg) = val & 0xFFFF;
-        ctx->Rip += prefix_len + 2 + modrm_len;
-        g_apu_mmio_read_count++;
-        return true;
-    }
-
-    /* TEST r/m, r (84/85) - read */
-    if (opcode[0] == 0x85 || opcode[0] == 0x84) {
-        if (opcode[0] == 0x84) access_size = 1;
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t mem_val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size);
-        uint64_t reg_val = *ctx_reg64(ctx, reg);
-        uint64_t result = mem_val & reg_val;
-        ctx->EFlags &= ~(0x0001 | 0x0040 | 0x0080 | 0x0800);
-        if (result == 0) ctx->EFlags |= 0x0040;
-        if (result & (1ULL << (access_size * 8 - 1))) ctx->EFlags |= 0x0080;
-        ctx->Rip += prefix_len + 1 + modrm_len;
-        g_apu_mmio_read_count++;
-        return true;
-    }
-
-    /* CMP r/m, r (38/39) */
-    if (opcode[0] == 0x39 || opcode[0] == 0x38) {
-        if (opcode[0] == 0x38) access_size = 1;
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t mem_val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size);
-        uint64_t reg_val = *ctx_reg64(ctx, reg);
-        if (access_size <= 4) {
-            mem_val &= (1ULL << (access_size * 8)) - 1;
-            reg_val &= (1ULL << (access_size * 8)) - 1;
-        }
-        uint64_t result = mem_val - reg_val;
-        ctx->EFlags &= ~(0x0001 | 0x0040 | 0x0080 | 0x0800);
-        if (result == 0) ctx->EFlags |= 0x0040;
-        if (mem_val < reg_val) ctx->EFlags |= 0x0001;
-        if (result & (1ULL << (access_size * 8 - 1))) ctx->EFlags |= 0x0080;
-        ctx->Rip += prefix_len + 1 + modrm_len;
-        g_apu_mmio_read_count++;
-        return true;
-    }
-
-    /* OR r/m, r (08/09) */
-    if (opcode[0] == 0x09 || opcode[0] == 0x08) {
-        if (opcode[0] == 0x08) access_size = 1;
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t mem_val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size);
-        uint64_t reg_val = *ctx_reg64(ctx, reg);
-        mcpx_apu_mmio_write(g_apu_state, mmio_offset, mem_val | reg_val, access_size);
-        ctx->Rip += prefix_len + 1 + modrm_len;
-        g_apu_mmio_write_count++;
-        return true;
-    }
-
-    /* AND r/m, r (20/21) */
-    if (opcode[0] == 0x21 || opcode[0] == 0x20) {
-        if (opcode[0] == 0x20) access_size = 1;
-        int modrm_len = decode_modrm_len(opcode + 1, rex_b);
-        int reg = ((opcode[1] >> 3) & 7) | (rex_r ? 8 : 0);
-        uint64_t mem_val = mcpx_apu_mmio_read(g_apu_state, mmio_offset, access_size);
-        uint64_t reg_val = *ctx_reg64(ctx, reg);
-        mcpx_apu_mmio_write(g_apu_state, mmio_offset, mem_val & reg_val, access_size);
-        ctx->Rip += prefix_len + 1 + modrm_len;
-        g_apu_mmio_write_count++;
-        return true;
-    }
-
-    /* Unrecognized */
     g_apu_mmio_decode_fail++;
     if (g_apu_mmio_decode_fail <= 20) {
         fprintf(stderr, "[APU] MMIO decode fail at RIP=%p offset=0x%X: %02X %02X %02X %02X %02X %02X\n",
@@ -254,23 +95,132 @@ static bool apu_decode_and_handle(PCONTEXT ctx, uint32_t mmio_offset, int is_wri
  * Public API (called from VEH in main.c)
  * ============================================================ */
 
+/* RECOMP_APU_TRACE statistics.
+ *
+ * The 400-line trace shows the first accesses only, and the decoder's own
+ * counters were never printed, so neither the steady-state rate nor which
+ * GP/EP registers a title writes could be read from a log. With the trace on,
+ * every access is tallied per dword offset and direction, and a reporter
+ * thread prints a stats line every 10 s and the per-offset table every 30 s
+ * (periodic, because a watchdog exit or a SIGINT never reaches atexit):
+ *
+ *   [APUMMIO-STATS] t=..s reads=N (+n/s) writes=N (+n/s) fails=N handler=..us
+ *   [APUMMIO-HIST] 0xOFFSET r=N w=N lastw=VALUE
+ *
+ * handler is the time spent inside the decoder and model per access; the
+ * exception round trip around it is not visible from here (see
+ * apu_hook_fault_bench). */
+#define APU_HIST_SLOTS (APU_MMIO_SIZE / 4)
+static int s_trace = -1;               /* looked up once, not per access */
+static volatile LONG s_hist_r[APU_HIST_SLOTS], s_hist_w[APU_HIST_SLOTS];
+static volatile uint32_t s_hist_lastw[APU_HIST_SLOTS];
+static volatile LONG64 s_tot_r, s_tot_w, s_handler_ticks;
+static volatile LONG s_reporter_started;
+/* Set by apu_hook_fault_bench (apu_fault_bench.c) while it runs. */
+volatile LONG g_apu_hook_bench_active;
+static LARGE_INTEGER s_qpf;
+
+static void apu_trace_report(int with_table, double t)
+{
+    static LONG64 prev_r, prev_w;
+    static double prev_t;
+    LONG64 r = s_tot_r, w = s_tot_w, ticks = s_handler_ticks;
+    double dt = t - prev_t > 0 ? t - prev_t : 1;
+    fprintf(stderr, "[APUMMIO-STATS] t=%.1fs reads=%lld (+%.0f/s) writes=%lld"
+            " (+%.0f/s) fails=%d handler=%.2fus/access\n", t,
+            (long long)r, (r - prev_r) / dt, (long long)w, (w - prev_w) / dt,
+            g_apu_mmio_decode_fail,
+            (r + w) ? (double)ticks * 1e6 / (double)s_qpf.QuadPart / (double)(r + w)
+                    : 0.0);
+    prev_r = r; prev_w = w; prev_t = t;
+    if (with_table) {
+        for (uint32_t i = 0; i < APU_HIST_SLOTS; i++)
+            if (s_hist_r[i] || s_hist_w[i])
+                fprintf(stderr, "[APUMMIO-HIST] 0x%05X r=%ld w=%ld lastw=%08X\n",
+                        i * 4, (long)s_hist_r[i], (long)s_hist_w[i],
+                        s_hist_lastw[i]);
+    }
+    fflush(stderr);
+}
+
+static DWORD WINAPI apu_trace_reporter(LPVOID unused)
+{
+    LARGE_INTEGER t0, now;
+    unsigned k = 0;
+    (void)unused;
+    QueryPerformanceCounter(&t0);
+    for (;;) {
+        Sleep(10000);
+        QueryPerformanceCounter(&now);
+        apu_trace_report(++k % 3 == 0,
+                         (double)(now.QuadPart - t0.QuadPart) / (double)s_qpf.QuadPart);
+    }
+    return 0;
+}
+
+static int apu_trace_on(void)
+{
+    if (s_trace < 0) {
+        s_trace = recomp_env(RENV_APU_TRACE) != NULL;
+        QueryPerformanceFrequency(&s_qpf);
+    }
+    return s_trace;
+}
+
+/* Start the RECOMP_APU_TRACE reporter (every 10 s). Called once from
+ * mcpx_apu_init_standalone, not from the fault handler: creating a thread
+ * inside a vectored exception handler takes the loader lock. */
+void apu_hook_trace_start(void)
+{
+    if (!apu_trace_on())
+        return;
+    if (!InterlockedExchange(&s_reporter_started, 1)) {
+        HANDLE h = CreateThread(NULL, 0, apu_trace_reporter, NULL, 0, NULL);
+        if (h)
+            CloseHandle(h);
+    }
+}
+
 bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
                           uint32_t fault_xbox_va, int is_write)
 {
     uint32_t mmio_offset = fault_xbox_va - APU_MMIO_BASE;
-    bool ok = apu_decode_and_handle(ctx, mmio_offset, is_write);
+    LARGE_INTEGER a, b;
+    int trace = apu_trace_on() && !g_apu_hook_bench_active;
 
+    (void)fault_addr;
+    if (trace)
+        QueryPerformanceCounter(&a);
+    bool ok = apu_decode_and_handle(ctx, mmio_offset, is_write);
+    if (!trace)
+        return ok;
+    QueryPerformanceCounter(&b);
+    InterlockedExchangeAdd64(&s_handler_ticks, b.QuadPart - a.QuadPart);
+
+    if (mmio_offset < APU_MMIO_SIZE) {
+        uint32_t slot = mmio_offset >> 2;
+        if (is_write) {
+            InterlockedIncrement64(&s_tot_w);
+            InterlockedIncrement(&s_hist_w[slot]);
+            s_hist_lastw[slot] = s_last_wval;
+        } else {
+            InterlockedIncrement64(&s_tot_r);
+            InterlockedIncrement(&s_hist_r[slot]);
+        }
+    }
     /* What the title actually asks the APU for. The DSPs are stubbed here, so
      * a title that waits on one waits forever, and the only way to work out
      * what it is waiting for is to see the register traffic that precedes the
      * wait. */
-    if (getenv("RECOMP_APU_TRACE")) {
+    {
         static unsigned n;
         if (n++ < 400) {
             /* The value as well as the offset: finding which register carries
              * the command-block address means recognising the address when it
-             * goes past, and an offset alone never shows it. */
-            uint64_t v = g_apu_state
+             * goes past, and an offset alone never shows it. A write shows the
+             * value written; a read, what the model returned. */
+            uint64_t v = is_write ? s_last_wval
+                       : g_apu_state
                        ? mcpx_apu_mmio_read(g_apu_state, mmio_offset, 4) : 0;
             fprintf(stderr, "  [APUMMIO] %s 0x%05X = %08X%s\n",
                     is_write ? "write" : "read ", mmio_offset,
@@ -281,3 +231,147 @@ bool apu_hook_handle_mmio(PCONTEXT ctx, uintptr_t fault_addr,
 }
 
 #endif /* _WIN32 */
+
+#if !defined(_WIN32) && defined(__aarch64__)
+/* POSIX arm64: the same hook over sigaction + ucontext, with the A64 decoder
+ * (src/platform/mmio_decode_a64.h). The fault handler in the game target's
+ * main.c calls apu_hook_handle_mmio_posix before it reports a crash. */
+#include <pthread.h>
+#include <time.h>
+#include <string.h>
+#include <signal.h>
+#include "../platform/mmio_decode_a64.h"
+
+#define APU_MMIO_SIZE  0x00080000u
+
+static uint64_t s_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+
+static int s_trace = -1;
+static volatile uint64_t s_tot_r, s_tot_w, s_handler_ns;
+static volatile uint32_t s_hist_r[APU_MMIO_SIZE / 4], s_hist_w[APU_MMIO_SIZE / 4];
+static volatile uint32_t s_hist_lastw[APU_MMIO_SIZE / 4];
+static int g_apu_mmio_decode_fail;
+static volatile uint32_t s_last_wval;
+volatile int g_apu_hook_bench_active;
+
+/* The model's registers are 32-bit and its read/write ignore the size, so an
+ * 8-byte access (ldr/str x, a d register, each half of a q register) is two
+ * 4-byte accesses here; handing it over whole would drop the high dword. */
+static uint64_t apu_mmio_rd(void *dev, uint32_t off, int size)
+{
+    if (size == 8) {
+        uint64_t lo = mcpx_apu_mmio_read((MCPXAPUState *)dev, off, 4);
+        uint64_t hi = mcpx_apu_mmio_read((MCPXAPUState *)dev, off + 4, 4);
+        return lo | (hi << 32);
+    }
+    return mcpx_apu_mmio_read((MCPXAPUState *)dev, off, (unsigned)size);
+}
+
+static void apu_mmio_wr(void *dev, uint32_t off, uint64_t v, int size)
+{
+    s_last_wval = (uint32_t)v;
+    if (size == 8) {
+        mcpx_apu_mmio_write((MCPXAPUState *)dev, off, (uint32_t)v, 4);
+        mcpx_apu_mmio_write((MCPXAPUState *)dev, off + 4, (uint32_t)(v >> 32), 4);
+        return;
+    }
+    mcpx_apu_mmio_write((MCPXAPUState *)dev, off, v, (unsigned)size);
+}
+
+static void *apu_trace_reporter(void *unused)
+{
+    uint64_t t0 = s_now_ns(), prev_r = 0, prev_w = 0;
+    unsigned k = 0;
+    (void)unused;
+    for (;;) {
+        struct timespec ts = { 10, 0 };
+        uint64_t r, w, ns, now;
+        nanosleep(&ts, NULL);
+        r = s_tot_r; w = s_tot_w; ns = s_handler_ns; now = s_now_ns();
+        fprintf(stderr, "[APUMMIO-STATS] t=%.1fs reads=%llu (+%.0f/s) writes=%llu"
+                " (+%.0f/s) fails=%d handler=%.2fus/access\n",
+                (now - t0) / 1e9, (unsigned long long)r, (r - prev_r) / 10.0,
+                (unsigned long long)w, (w - prev_w) / 10.0, g_apu_mmio_decode_fail,
+                (r + w) ? (double)ns / 1e3 / (double)(r + w) : 0.0);
+        prev_r = r; prev_w = w;
+        if (++k % 3 == 0) {
+            for (uint32_t i = 0; i < APU_MMIO_SIZE / 4; i++)
+                if (s_hist_r[i] || s_hist_w[i])
+                    fprintf(stderr, "[APUMMIO-HIST] 0x%05X r=%u w=%u lastw=%08X\n",
+                            i * 4, s_hist_r[i], s_hist_w[i], s_hist_lastw[i]);
+        }
+        fflush(stderr);
+    }
+    return NULL;
+}
+
+void apu_hook_trace_start(void)
+{
+    static int started;
+    pthread_t th;
+    if (s_trace < 0)
+        s_trace = recomp_env_on(RENV_APU_TRACE);
+    if (!s_trace || started)
+        return;
+    started = 1;
+    if (pthread_create(&th, NULL, apu_trace_reporter, NULL) == 0)
+        pthread_detach(th);
+}
+
+/* Service one trapped APU access from a SIGBUS/SIGSEGV handler. ucv is the
+ * handler's ucontext; is_write is advisory (the decoder reads the opcode).
+ * Returns true when the access was emulated and pc advanced. */
+bool apu_hook_handle_mmio_posix(void *ucv, uintptr_t fault_addr,
+                                uint32_t fault_xbox_va, int is_write)
+{
+    ucontext_t *uc = (ucontext_t *)ucv;
+    uint32_t off = fault_xbox_va - 0xFE800000u;
+    uint64_t a = 0;
+    int trace, ok;
+
+    (void)fault_addr; (void)is_write;
+    if (!g_apu_state || off >= APU_MMIO_SIZE)
+        return false;
+    if (s_trace < 0)
+        s_trace = recomp_env_on(RENV_APU_TRACE);
+    trace = s_trace && !g_apu_hook_bench_active;
+    if (trace)
+        a = s_now_ns();
+    ok = mmio_emulate_a64(uc, off, g_apu_state, apu_mmio_rd, apu_mmio_wr);
+    if (!ok) {
+        g_apu_mmio_decode_fail++;
+        if (g_apu_mmio_decode_fail <= 20)
+            fprintf(stderr, "[APU] MMIO decode fail at PC=%p insn=%08X offset=0x%X\n",
+                    (void *)(uintptr_t)A64_CTX_PC(uc),
+                    *(const uint32_t *)(uintptr_t)A64_CTX_PC(uc), off);
+        return false;
+    }
+    if (!trace)
+        return true;
+    s_handler_ns += s_now_ns() - a;
+    {
+        /* Direction from the opcode: bit 22 clear is a store for the
+         * single-register forms; LDP/STP carry L in bit 22 as well. */
+        uint32_t insn = *(const uint32_t *)(uintptr_t)(A64_CTX_PC(uc) - 4);
+        int w = !((insn >> 22) & 1);
+        uint32_t slot = off >> 2;
+        if (w) { s_tot_w++; s_hist_w[slot]++; s_hist_lastw[slot] = s_last_wval; }
+        else   { s_tot_r++; s_hist_r[slot]++; }
+        {
+            static unsigned n;
+            if (n++ < 400)
+                fprintf(stderr, "  [APUMMIO] %s 0x%05X = %08X\n", w ? "write" : "read ",
+                        off, w ? s_last_wval
+                               : (uint32_t)mcpx_apu_mmio_read(g_apu_state, off, 4));
+        }
+    }
+    return true;
+}
+#elif !defined(_WIN32)
+void apu_hook_trace_start(void) {}
+#endif

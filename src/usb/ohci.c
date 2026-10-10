@@ -7,7 +7,9 @@
  * that decides how the rest gets built.
  */
 #include "ohci.h"
+#include "recomp_env.h"
 #include "../platform/mmio_decode.h"
+#include "../platform/mmio_decode_a64.h"
 #include "../kernel/xbox_memory_layout.h"
 #include "../kernel/kernel.h"
 #include "usb_gamepad.h"
@@ -16,6 +18,16 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
+
+/* Where the registers can be trapped. They are answered by faulting on the
+ * aperture and decoding the instruction that touched it: the x86-64 decoder
+ * under a Win32 VEH, or the A64 decoder under a POSIX SIGBUS/SIGSEGV
+ * handler. A host with neither leaves the model off (see xbox_OhciInit). */
+#if defined(_WIN32)
+#  define OHCI_TRAP_WIN32 1
+#elif defined(__aarch64__)
+#  define OHCI_TRAP_POSIX_A64 1
+#endif
 
 /* The runtime maps guest memory at a fixed host offset. */
 extern ptrdiff_t xbox_GetMemoryOffset(void);
@@ -495,11 +507,25 @@ static int guest_ok(uint32_t va, uint32_t bytes)
  * never hands out contiguous memory that overlaps the image, so an address
  * inside it is the image. Sending that one to the window delivered the
  * descriptor where the driver never looked, and it reset the port and asked
- * again, forever. */
+ * again, forever.
+ *
+ * The image therefore comes first. The contiguous allocator here does hand
+ * out physical numbers inside the image's range (its window is separate
+ * storage, so nothing collides there), and asking its page map first, as
+ * mcpx_apu_phys (apu_core.c) does, sent 0x0041A904 to the window again:
+ * Burnout 3's boot allocates 0x803E7000..0x805E7000 before XPP enumerates,
+ * so page 0x41A is "contiguous", and enumeration retried the descriptor for
+ * ever with the pad never attached. Outside the image the page map is asked
+ * next: a page the first-fit allocator handed out -- or the reserved page 0,
+ * where XPP keeps its private arena -- is the window; then the high-water
+ * mark, for a page that was contiguous memory once and has since been
+ * freed. */
 static uint32_t bus_resolve(uint32_t addr)
 {
     if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
         return addr;
+    if (addr && addr < (64u << 20) && xbox_ContiguousPageMap()[addr >> 12])
+        return OHCI_CONTIG_BASE + addr;
     if (addr && addr < xbox_ContiguousAllocatedBytes())
         return OHCI_CONTIG_BASE + addr;
     return addr;
@@ -793,7 +819,7 @@ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
         unsigned long now;
         total += (unsigned)completed;
         if (stats < 0)
-            stats = getenv("RECOMP_USB_STATS") != NULL;
+            stats = recomp_env(RENV_USB_STATS) != NULL;
         now = (unsigned long)GetTickCount();
         if (stats && now - last >= 5000) {
             uint32_t seen[8] = {0};
@@ -854,13 +880,12 @@ static int ohci_run_periodic_list(OhciController *hc, uint32_t *done_head)
  * Returns what the routine returned: an ISR that does not claim the interrupt
  * returns FALSE, and that is worth seeing rather than assuming.
  */
-static int ohci_call_isr(OhciController *hc)
+static int ohci_isr_call(int index)
 {
     uint32_t kinterrupt = xbox_GetConnectedInterrupt(OHCI_VECTOR);
     uint32_t routine, context;
     recomp_func_t fn;
     uint8_t *mem;
-    int slot;
 
     if (!kinterrupt)
         return -1;                      /* nothing connected yet            */
@@ -874,11 +899,34 @@ static int ohci_call_isr(OhciController *hc)
     fn = recomp_lookup(routine);
     if (!fn) {
         fprintf(stderr, "  [OHCI%d] ISR 0x%08X has no translation\n",
-                hc->index, routine);
+                index, routine);
         fflush(stderr);
         return -1;
     }
 
+    g_esp -= 4; *(uint32_t *)(mem + g_esp) = context;      /* arg 2 */
+    g_esp -= 4; *(uint32_t *)(mem + g_esp) = kinterrupt;   /* arg 1 */
+    g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0xDEADBEEFu;  /* return address */
+
+    if (xbox_ProfOn()) {
+        void *prev = xbox_ProfBegin(XBOX_PROF_ISR_OHCI, routine);
+        int _irql = xbox_IrqlEnterInterrupt(16);
+        long long t0 = xbox_ProfNowUs();
+        fn();
+        xbox_ProfEnd(prev, xbox_ProfNowUs() - t0);
+        xbox_IrqlLeaveInterrupt(_irql);
+    } else {
+        int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql);
+    }
+    return (int)(g_eax & 1u);
+}
+
+static int ohci_call_isr(OhciController *hc)
+{
+    int slot, claimed;
+
+    if (!xbox_GetConnectedInterrupt(OHCI_VECTOR))
+        return -1;
     /* One slice for the life of the raise. Sixteen exist and this takes one
      * only while the routine runs, so a title using them for its own workers
      * is not starved by a controller that interrupts. */
@@ -888,18 +936,21 @@ static int ohci_call_isr(OhciController *hc)
         fflush(stderr);
         return -1;
     }
-
     g_esp = XBOX_WORKER_STACK_TOP(slot);
     g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
-
-    g_esp -= 4; *(uint32_t *)(mem + g_esp) = context;      /* arg 2 */
-    g_esp -= 4; *(uint32_t *)(mem + g_esp) = kinterrupt;   /* arg 1 */
-    g_esp -= 4; *(uint32_t *)(mem + g_esp) = 0xDEADBEEFu;  /* return address */
-
-    { int _irql = xbox_IrqlEnterInterrupt(16); fn(); xbox_IrqlLeaveInterrupt(_irql); }
-
+    claimed = ohci_isr_call(hc->index);
     xbox_worker_stack_free(slot);
-    return (int)(g_eax & 1u);
+    return claimed;
+}
+
+/* The gate holder's run of a posted USB interrupt (kernel_hal.c has put it
+ * on a worker stack). The status bits were set by the controller thread;
+ * if the driver has cleared them since, the ISR declines. */
+static volatile int s_posting_hc;       /* the controller that posted, for logs */
+
+static void ohci_isr_on_holder(void)
+{
+    ohci_isr_call(s_posting_hc);
 }
 
 /* Set the status bits and, if the driver has unmasked them, call the ISR.
@@ -998,6 +1049,7 @@ static void ohci_reset(OhciController *hc, uint32_t base, int index)
  */
 static DWORD WINAPI ohci_thread(LPVOID unused)
 {
+    xbox_log_thread_role("ohci", 0);
     /* This thread calls recompiled code, so it needs what any thread running
      * recompiled code needs: its own TIB. The guest register set is already
      * thread-local and the ISR gets a worker stack, but fs:[0] is the SEH
@@ -1011,7 +1063,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
     uint32_t last_status = 0;
     unsigned repeats = 0;
     unsigned held_off = 0;
-    int      held_off_warned = 0, held_off_forced = 0;
+    int      held_off_warned = 0, held_off_forced = 0, gated = 0;
     unsigned last_ack = 0;
     unsigned first_port = 0, settle = 0;
 
@@ -1056,7 +1108,7 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
              * XAPI assigns it, and a title that reads "player 1" looks at slot
              * 0. RECOMP_USB_PORT picks it (0..1 on this controller) so the
              * mapping can be found by measurement rather than assumed. */
-            const char *pspec = getenv("RECOMP_USB_PORT");
+            const char *pspec = recomp_env(RENV_USB_PORT);
             unsigned port = pspec ? (unsigned)atoi(pspec) : 0u;
             if (port >= s_ndp) port = s_ndp - 1u;
             hc->reg[(HcRhPortStatus1 + port * 4) / 4] |= PORT_CCS | PORT_CSC;
@@ -1184,7 +1236,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
         if (!status)
             continue;
 
-        /* Bounded, because the mask is a model and not the hardware.
+        /* (irq_safe_points=0 only, below.) Bounded, because the mask is a
+         * model and not the hardware.
          *
          * The depth is a count of raise/lower pairs across every thread, and
          * one unmatched raise anywhere leaves the gate shut for the rest of
@@ -1194,23 +1247,44 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
          * asserted anyway. The common case still holds the ISR out of the
          * guest's critical section; the pathological case costs a delay
          * instead of the device. */
-        if (xbox_IrqlBlocksInterrupts() && ++held_off <= OHCI_IRQ_HOLDOFF) {
-            if (!held_off_warned) {
-                held_off_warned = 1;
-                fprintf(stderr, "  [OHCI%d] irq held off by guest IRQL "
-                        "(depth %d, status=0x%02X)\n",
-                        hc->index, xbox_IrqlRaisedCount(), status);
+        /* The one-CPU gate, as the APU model takes it: when free, no thread
+         * at DISPATCH_LEVEL, DPC or KeSynchronizeExecution routine runs
+         * beside the ISR; when held, the interrupt is posted to the holder
+         * (xbox_IrqPost) and this pass goes on. The line stays up, so the
+         * next pass posts again (coalesced) until the ISR has run. */
+        xbox_IrqSetHandler(XBOX_IRQ_OHCI, ohci_isr_on_holder);
+        s_posting_hc = hc->index;
+        if (xbox_IrqSafePointsOn()) {
+            int how = xbox_IrqPost(XBOX_IRQ_OHCI);
+            if (how == XBOX_IRQ_POSTED)
+                continue;               /* a post is not a delivery */
+            gated = (how == XBOX_IRQ_GATED);
+            if (!gated)
+                xbox_IrqNoteUngated(XBOX_IRQ_OHCI);
+        } else {
+            /* irq_safe_points=0: the old bounded hold-off, then beside the
+             * holder. */
+            gated = xbox_DispatchGateTryEnter();
+            if (!gated && ++held_off <= OHCI_IRQ_HOLDOFF) {
+                if (!held_off_warned) {
+                    held_off_warned = 1;
+                    fprintf(stderr, "  [OHCI%d] irq held off by guest IRQL "
+                            "(depth %d, status=0x%02X)\n",
+                            hc->index, xbox_IrqlRaisedCount(), status);
+                    fflush(stderr);
+                }
+                continue;
+            }
+            if (held_off > OHCI_IRQ_HOLDOFF && !held_off_forced) {
+                held_off_forced = 1;
+                fprintf(stderr, "  [OHCI%d] guest IRQL never dropped (depth %d); "
+                        "delivering anyway\n", hc->index, xbox_IrqlRaisedCount());
                 fflush(stderr);
             }
-            continue;
+            if (!gated)
+                xbox_IrqNoteUngated(XBOX_IRQ_OHCI);
+            held_off = 0;
         }
-        if (held_off > OHCI_IRQ_HOLDOFF && !held_off_forced) {
-            held_off_forced = 1;
-            fprintf(stderr, "  [OHCI%d] guest IRQL never dropped (depth %d); "
-                    "delivering anyway\n", hc->index, xbox_IrqlRaisedCount());
-            fflush(stderr);
-        }
-        held_off = 0;
 
         /* A stuck source is one the handler never clears. Repeating the
          * same status value is not that.
@@ -1231,6 +1305,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
                                 "with no acknowledgement; stopping\n",
                         hc->index, status);
                 fflush(stderr);
+                if (gated)
+                    xbox_DispatchGateLeave();
                 break;
             }
         } else {
@@ -1239,6 +1315,8 @@ static DWORD WINAPI ohci_thread(LPVOID unused)
             repeats     = 0;
         }
         ohci_raise(hc, status);
+        if (gated)
+            xbox_DispatchGateLeave();
     }
     return 0;
 }
@@ -1254,16 +1332,16 @@ void xbox_OhciInit(void)
     /* Opt-in. Without a descriptor list walker behind it a driver that finds
      * a port has nothing to enumerate, so this must not change how a title
      * behaves until the rest of it exists. */
-    if (!getenv("RECOMP_USB"))
+    if (!recomp_env(RENV_USB))
         return;
 
     s_enabled = 1;
-    s_trace   = getenv("RECOMP_USB_TRACE") != NULL;
+    s_trace   = recomp_env(RENV_USB_TRACE) != NULL;
     {
-        const char *hcspec = getenv("RECOMP_USB_HC");
-        const char *ndpspec = getenv("RECOMP_USB_NDP");
+        const char *hcspec = recomp_env(RENV_USB_HC);
+        const char *ndpspec = recomp_env(RENV_USB_NDP);
         s_device_hc = (hcspec && atoi(hcspec) == 1) ? 1 : 0;
-        const char *padspec = getenv("RECOMP_USB_PADS");
+        const char *padspec = recomp_env(RENV_USB_PADS);
         if (ndpspec) {
             int n = atoi(ndpspec);
             if (n >= 1 && n <= 4) s_ndp = (unsigned)n;
@@ -1275,13 +1353,26 @@ void xbox_OhciInit(void)
         if ((unsigned)s_npads > s_ndp)
             s_ndp = (unsigned)s_npads;      /* a port for every pad */
     }
+#if !defined(OHCI_TRAP_WIN32) && !defined(OHCI_TRAP_POSIX_A64)
+    /* No decoder for this host's instructions, so a trapped access could not
+     * be answered. Leave the aperture as plain memory -- the title then sees
+     * no controller, exactly as with RECOMP_USB unset -- and say so. */
+    s_enabled = 0;
+    fprintf(stderr, "  OHCI: no trapped-MMIO decoder for this host; "
+                    "USB controllers disabled\n");
+    fflush(stderr);
+    return;
+#endif
+
     ohci_reset(&s_hc[0], XBOX_OHCI0_BASE, 0);
     ohci_reset(&s_hc[1], XBOX_OHCI1_BASE, 1);
 
-#if defined(_WIN32)
     /* The registers have to fault to be answered. The MCPX aperture is mapped
      * as plain committed memory, so both blocks are made inaccessible here and
-     * the title's VEH routes the faults back to xbox_OhciHandleMmio.
+     * the title's fault handler (a VEH on Windows, a SIGBUS/SIGSEGV handler on
+     * POSIX) routes the faults back to xbox_OhciHandleMmio. On a host whose
+     * page is larger than a block (16 KB on macOS arm64) the protection covers
+     * the whole page; nothing else lives in it.
      *
      * A failed protect switches the model off rather than leaving it half on:
      * a controller whose registers read as zero out of RAM is exactly the
@@ -1302,25 +1393,23 @@ void xbox_OhciInit(void)
                                 &old_protect)) {
                 s_enabled = 0;
                 fprintf(stderr, "  OHCI: cannot trap 0x%08X (error %lu); "
-                                "disabled\n", s_hc[i].base, GetLastError());
+                                "disabled\n", s_hc[i].base,
+                                (unsigned long)GetLastError());
                 return;
             }
         }
     }
-#endif
 
     fprintf(stderr, "  OHCI: two controllers at 0x%08X and 0x%08X, "
                     "%d ports each, one device on HC0 port 1\n",
             XBOX_OHCI0_BASE, XBOX_OHCI1_BASE, OHCI_PORTS);
     fflush(stderr);
 
-#if defined(_WIN32)
     {
         HANDLE th = CreateThread(NULL, 0, ohci_thread, NULL, 0, NULL);
         if (th)
             CloseHandle(th);
     }
-#endif
 }
 
 static OhciController *hc_for(uint32_t va)
@@ -1340,9 +1429,46 @@ int xbox_OhciOwnsAddress(uint32_t xbox_va)
     return hc_for(xbox_va) != NULL;
 }
 
+#if defined(OHCI_TRAP_POSIX_A64)
+/* The A64 decoder hands over 8-byte accesses (ldr/str x, a d register) whole;
+ * the registers are 32-bit, so an 8-byte access is two of them. */
+static uint64_t ohci_read_a64(void *dev, uint32_t off, int size)
+{
+    if (size == 8)
+        return ohci_read(dev, off, 4) | (ohci_read(dev, off + 4, 4) << 32);
+    return ohci_read(dev, off, size);
+}
+
+static void ohci_write_a64(void *dev, uint32_t off, uint64_t val, int size)
+{
+    if (size == 8) {
+        ohci_write(dev, off, (uint32_t)val, 4);
+        ohci_write(dev, off + 4, val >> 32, 4);
+        return;
+    }
+    ohci_write(dev, off, val, size);
+}
+#endif
+
 int xbox_OhciHandleMmio(void *ctx, uint32_t xbox_va)
 {
-#if defined(_WIN32)
+#if defined(OHCI_TRAP_POSIX_A64)
+    ucontext_t *uc = (ucontext_t *)ctx;
+    OhciController *hc = hc_for(xbox_va);
+    int ok;
+
+    if (!hc)
+        return 0;
+    ok = mmio_emulate_a64(uc, xbox_va - hc->base, hc,
+                          ohci_read_a64, ohci_write_a64);
+    if (!ok && hc->decode_fail++ < 20) {
+        fprintf(stderr, "  [OHCI%d] undecoded access at +0x%03X: insn %08X\n",
+                hc->index, xbox_va - hc->base,
+                *(const uint32_t *)(uintptr_t)A64_CTX_PC(uc));
+        fflush(stderr);
+    }
+    return ok;
+#elif defined(OHCI_TRAP_WIN32)
     OhciController *hc = hc_for(xbox_va);
     int ok;
 

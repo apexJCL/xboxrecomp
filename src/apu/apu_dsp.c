@@ -23,6 +23,7 @@
  */
 
 #include "apu_state.h"
+#include "recomp_env.h"
 #include "fpconv.h"
 
 #include <stdlib.h>
@@ -40,30 +41,47 @@
  * RECOMP_APU_DSP_ACK=<addr>[,<addr>...] clears those guest dwords once per APU
  * frame, which is what "the command completed" looks like to the title.
  *
+ * RECOMP_APU_DSP_ACK=auto finds the doorbell from what the title programs.
+ * The XDK DSOUND GP program takes its commands through the first page of
+ * the GP's scratch space: a 2 KB command FIFO, then a header whose dword at
+ * +0x810 is the doorbell the host writes and the DSP program clears (the
+ * DSOUND submit of every XDK title seen spins on <block>+0x810). The
+ * scratch pages are what NV_PAPU_GPSADDR's scatter-gather table maps -- 8
+ * bytes an entry, the physical page in the first dword, as xemu's apu.c
+ * scratch_rw walks it -- so the doorbell is SGE[0] + 0x810 wherever the
+ * contiguous allocator put the block. A fixed address moves with allocation
+ * order (reserving physical page 0 moved one title's by a page); this does
+ * not. Wreckless fits too: its doorbell 0x014F8810 is
+ * the first page of the scratch its GPSADDR table (0x01504000) maps, not
+ * the table itself, which is where the earlier note here looked.
+ *
  * ponytail: this is a handshake acknowledgement, not a DSP. It says every
  * command succeeded instantly and computes nothing, so anything whose *result*
  * the title reads back will still be wrong. The real fix is DSP56300 emulation
  * in the GP/EP; this exists so audio init stops blocking everything behind it.
- *
- * The address is not derivable from the APU registers: GPSADDR/GPFADDR/
- * EPSADDR/EPFADDR point at the DSP's own scratch and frame memory, while the
- * command block is a DirectSound heap allocation. On Wreckless the registers
- * read 0x01504000 / 0x014EC000 / 0x0151C000 / 0x014F0000 and the doorbell is at
- * 0x014F8810 -- inside none of them. So it has to be observed: run with
- * RECOMP_WATCHDOG_SECS and the spin shows up as ebx plus the poll offset.
  */
 #define APU_DSP_ACK_MAX 8
+#define GP_DOORBELL_OFFSET 0x810u
 static uint32_t s_dsp_ack[APU_DSP_ACK_MAX];
 static int s_dsp_ack_count = -1;
+static int s_dsp_ack_auto;                /* =auto: derive from GPSADDR */
+static uint32_t s_dsp_ack_auto_sge;       /* the GPSADDR it was derived from */
+static uint32_t *s_dsp_ack_auto_slot;     /* host address of the doorbell */
 
 static void dsp_ack_init(void)
 {
-    const char *spec = getenv("RECOMP_APU_DSP_ACK");
+    const char *spec = recomp_env(RENV_APU_DSP_ACK);
     char buf[256], *p, *end;
 
     s_dsp_ack_count = 0;
     if (!spec || !*spec)
         return;
+    if (!strcmp(spec, "auto")) {
+        s_dsp_ack_auto = 1;
+        fprintf(stderr, "[APU] DSP doorbell ack: auto (GP scratch page 0"
+                        " + 0x%X, from GPSADDR)\n", GP_DOORBELL_OFFSET);
+        return;
+    }
     strncpy(buf, spec, sizeof buf - 1);
     buf[sizeof buf - 1] = 0;
     for (p = buf; *p && s_dsp_ack_count < APU_DSP_ACK_MAX; ) {
@@ -88,10 +106,32 @@ static int mcpx_apu_mixdown_all(void)
 {
     static int on = -1;
     if (on < 0) {
-        const char *e = getenv("RECOMP_APU_MIXDOWN_ALL");
+        const char *e = recomp_env(RENV_APU_MIXDOWN_ALL);
         on = (e && *e) ? (atoi(e) != 0) : 1;
     }
     return on;
+}
+
+/* The doorbell for =auto: SGE[0] of the GP scratch table + 0x810, resolved
+ * once GPSADDR is programmed and the table's first entry names a page, and
+ * again whenever the title reprograms GPSADDR. NULL until then. */
+static uint32_t *dsp_ack_auto_slot(MCPXAPUState *d)
+{
+    uint32_t sge = qatomic_read(&d->regs[NV_PAPU_GPSADDR]), page;
+
+    if (!sge)
+        return NULL;
+    if (sge == s_dsp_ack_auto_sge)
+        return s_dsp_ack_auto_slot;
+    page = *(const uint32_t *)mcpx_apu_phys(sge);
+    if (!page || (page & 0xFFF))
+        return NULL;                       /* table not filled in yet */
+    s_dsp_ack_auto_sge = sge;
+    s_dsp_ack_auto_slot = (uint32_t *)(mcpx_apu_phys(page) + GP_DOORBELL_OFFSET);
+    fprintf(stderr, "[APU] DSP doorbell: GP scratch SGE table 0x%08X maps page"
+                    " 0x%08X (%s); doorbell at physical 0x%08X\n",
+            sge, page, mcpx_apu_phys_class(page), page + GP_DOORBELL_OFFSET);
+    return s_dsp_ack_auto_slot;
 }
 
 void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
@@ -102,6 +142,16 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
         dsp_ack_init();
     if (!d->ram_ptr)
         return;
+    if (s_dsp_ack_auto) {
+        uint32_t *slot = dsp_ack_auto_slot(d);
+        if (slot && *slot) {
+            static int shown;
+            if (shown++ < 3)
+                fprintf(stderr, "[APU] DSP doorbell (auto): command 0x%08X"
+                                " acknowledged\n", *slot);
+            *slot = 0;
+        }
+    }
     for (i = 0; i < s_dsp_ack_count; i++) {
         uint32_t *slot = (uint32_t *)(d->ram_ptr + s_dsp_ack[i]);
         if (*slot) {
