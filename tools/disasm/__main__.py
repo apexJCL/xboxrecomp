@@ -86,6 +86,33 @@ def main():
              "into each other.",
     )
 
+    parser.add_argument(
+        "--data-ptr-probe",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Instructions a code pointer read out of a data section may be "
+             "walked before it must reach a ret or tail jmp to count as a "
+             "function (default 64). A long walk through junk finds a jmp "
+             "eventually, so keep it short.",
+    )
+    parser.add_argument(
+        "--data-ptr-table-probe",
+        type=int,
+        default=None,
+        metavar="N",
+        help="The longer walk allowed when the pointer sits in a table beside "
+             "a known function start and at a boundary (default 512).",
+    )
+    parser.add_argument(
+        "--data-ptr-min-neighbours",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Known function starts a table word needs beside it for the "
+             "longer walk (default 1).",
+    )
+
     args = parser.parse_args()
 
     try:
@@ -113,6 +140,9 @@ def main():
             extra_sections=extra,
             seed_functions=seed_funcs,
             observed_seeds=observed,
+            data_ptr_probe_insns=args.data_ptr_probe,
+            data_ptr_table_probe_insns=args.data_ptr_table_probe,
+            data_ptr_min_neighbours=args.data_ptr_min_neighbours,
         )
         success = disassembler.run()
         sys.exit(0 if success else 1)

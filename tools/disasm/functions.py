@@ -67,12 +67,32 @@ class FunctionDetector:
     until the next function or a terminal instruction.
     """
 
+    # Instruction budgets for probing a code pointer read out of a data
+    # section; see _pass_data_ptr_targets. The defaults; a run overrides
+    # them through the constructor (tools.disasm --data-ptr-probe,
+    # --data-ptr-table-probe, --data-ptr-min-neighbours).
+    DATA_PTR_PROBE_INSNS = 64
+    DATA_PTR_TABLE_PROBE_INSNS = 512
+    DATA_PTR_MIN_NEIGHBOURS = 1
+
     def __init__(self, engine: DisasmEngine, image: BinaryImage,
-                 xrefs: XRefTracker, labels: LabelManager):
+                 xrefs: XRefTracker, labels: LabelManager,
+                 data_ptr_probe_insns: Optional[int] = None,
+                 data_ptr_table_probe_insns: Optional[int] = None,
+                 data_ptr_min_neighbours: Optional[int] = None):
         self.engine = engine
         self.image = image
         self.xrefs = xrefs
         self.labels = labels
+        self.data_ptr_probe_insns = (
+            self.DATA_PTR_PROBE_INSNS if data_ptr_probe_insns is None
+            else data_ptr_probe_insns)
+        self.data_ptr_table_probe_insns = (
+            self.DATA_PTR_TABLE_PROBE_INSNS if data_ptr_table_probe_insns is None
+            else data_ptr_table_probe_insns)
+        self.data_ptr_min_neighbours = (
+            self.DATA_PTR_MIN_NEIGHBOURS if data_ptr_min_neighbours is None
+            else data_ptr_min_neighbours)
 
         # Candidate function starts: address -> (confidence, method)
         self._candidates: Dict[int, Tuple[float, str]] = {}
@@ -146,6 +166,11 @@ class FunctionDetector:
             self.functions.clear()
             self._build_functions(sections)
 
+        # A function that begins immediately after an embedded switch table.
+        if self._pass_jump_table_followers(sections):
+            self.functions.clear()
+            self._build_functions(sections)
+
         # A function that begins immediately after a ret, with no padding.
         if self._pass_gap_prologues(sections):
             self.functions.clear()
@@ -160,12 +185,260 @@ class FunctionDetector:
         # Seeds that landed inside a function rather than on its start.
         self._pass_seed_aliases()
 
+        # Branches that leave an alias, or jump into the middle of another
+        # function, need an entry at the place they land.
+        self._pass_branch_alias_closure()
+
         self._build_alias_entries()
 
         # Populate call graph
         self._build_call_graph()
 
         return len(self.functions)
+
+    # MSVC's alignment fillers: int3, nop, `mov edi, edi`, and `lea r, [r]`
+    # in its 3-, 4-, 6- and 7-byte encodings.
+    _PADDING = (bytes.fromhex("8da42400000000"), bytes.fromhex("8d9b00000000"),
+                bytes.fromhex("8d642400"), bytes.fromhex("8d4900"),
+                bytes.fromhex("8bff"), b"\xcc", b"\x90")
+
+    def _skip_padding(self, addr: int, limit: int = 16) -> int:
+        """First address at or after `addr` that is not alignment padding.
+
+        Reads bytes rather than decoded instructions: after a table the
+        sweep's decode is often out of phase, and an instruction that starts
+        inside the table can swallow the padding."""
+        data = self.image.read_bytes_at_va(addr, limit + 7) or b""
+        off = 0
+        while off < limit:
+            for pad in self._PADDING:
+                # `mov edi, edi` is also the first instruction of a hot-patch
+                # function. As table padding it fills exactly two bytes up to
+                # a dword boundary, so it only sits 2 bytes past one. A
+                # function start is aligned, so the two never coincide.
+                if pad == b"\x8b\xff" and (addr + off) % 4 != 2:
+                    continue
+                if data.startswith(pad, off):
+                    off += len(pad)
+                    break
+            else:
+                break
+        return addr + off
+
+    # Frame setups that end an index-table walk early: `push ebp; mov ebp,
+    # esp`, with or without the hot-patch pad in front.
+    _FRAME_STARTS = (bytes.fromhex("558bec"), bytes.fromhex("8bff558bec"))
+
+    def _index_table_end(self, addr: int, arms: int) -> Optional[int]:
+        """End of the byte index table at `addr` feeding `arms` dword entries,
+        or None when it cannot be sized safely.
+
+        The bound check in front of the load gives the length exactly; see
+        engine.index_table_length. Without it, the entries are known only to
+        be below `arms`, and the first byte that is not marks the end. That is
+        safe only when no opcode that starts a function is below `arms`. For a
+        switch of 16 arms or fewer it is: such bytes are `add` and `or`. For a
+        larger one a walk can run into the next function. A 96-arm switch
+        walks over `push ebp` (0x55) and starts the function one byte late,
+        without its frame. So a large walk also stops at a frame setup or a
+        known start, and otherwise is trusted only when padding or another
+        dword table follows it.
+        """
+        data = self.image.read_bytes_at_va(addr, 1024) or b""
+        length = self.engine.index_table_length(addr)
+        if length is not None:
+            if length == 0 or length > len(data):
+                return None
+            if any(b >= arms for b in data[:length]):
+                return None                 # not the table the bound guards
+            return addr + length
+        off = 0
+        stopped = False
+        while off < len(data) and data[off] < arms:
+            if arms > 0x0F and off and (
+                    any(data.startswith(f, off) for f in self._FRAME_STARTS)
+                    or addr + off in self._candidates):
+                stopped = True
+                break
+            off += 1
+        if off == 0:
+            return None
+        end = addr + off
+        if arms <= 0x0F or stopped:
+            return end
+        if self._skip_padding(end) != end:
+            return end
+        if end % 4 == 0 and (end in self.engine.jump_tables
+                             or self.engine.is_jump_table_ref(end)):
+            return end
+        return None
+
+    def _past_switch_data(self, addr: int, arms: int) -> Optional[int]:
+        """Skip the padding and switch tables that follow a measured table.
+
+        The tables of several switches in one function sit together after
+        its last ret. Each dword table may have a byte index table after it,
+        and padding goes between them. Some dword tables have fewer than 3
+        entries, so resync_jump_tables did not measure them, but a
+        `jmp [reg*4 + disp]` still names them. Returns the first address past
+        all of that, or None when the bytes cannot be sized.
+        """
+        for _ in range(16):
+            addr = self._skip_padding(addr)
+            if addr in self.engine.jump_tables:
+                end = self.engine.jump_tables[addr]
+                arms = (end - addr) // 4
+                addr = end
+                continue
+            if self.engine.is_jump_table_ref(addr):
+                section = self.image.get_section_at_va(addr)
+                if section is None:
+                    return None
+                lo = section.virtual_addr
+                hi = lo + section.virtual_size
+                arms = 0
+                while arms < 512:
+                    value = self.image.read_u32_at_va(addr + arms * 4)
+                    if value is None or not (lo <= value < hi):
+                        break
+                    arms += 1
+                if arms == 0:
+                    return None
+                addr += arms * 4
+                continue
+            data = self.image.read_bytes_at_va(addr, 2) or b""
+            # An index table: one a load names, or two bytes below `arms`
+            # when nothing does. Those are a table even when no instruction
+            # names them: a switch whose lowest case is not 0 folds
+            # the bias into the displacement, so the reference points a few
+            # bytes before the table instead of at it.
+            #
+            # Only for a small switch, though: a byte below `arms` has to be
+            # implausible as the start of a function, and 0x0F and 0x33
+            # (`movzx`, `xor eax, eax`) are not.
+            if addr in self.engine.byte_tables or (
+                    arms <= 0x0F and len(data) >= 2
+                    and data[0] < arms and data[1] < arms):
+                end = self._index_table_end(addr, arms)
+                if end is None:
+                    return None
+                addr = end
+                continue
+            return addr
+        return None
+
+    def _pads_into_jump_table(self, addr: int) -> bool:
+        """Is `addr` padding that runs straight into a measured switch table?"""
+        tables = self.engine.jump_tables
+        if not tables:
+            return False
+        after = self._skip_padding(addr)
+        return after != addr and after in tables
+
+    def _tail_calls_known_function(self, addr: int) -> bool:
+        """Does the straight-line body at `addr` end in a direct jmp to the
+        exact start of a function already built?"""
+        target = self.engine.probe_tail_call(addr)
+        return (target is not None and target != addr
+                and target in self.functions)
+
+    def _follows_a_boundary(self, addr: int) -> bool:
+        """Does a ret, an unconditional jmp or int3 padding end exactly at
+        `addr`? Those are the places the previous function can stop."""
+        for back in range(1, 16):
+            insn = self.engine.instructions.get(addr - back)
+            if insn is None or insn.end_address != addr:
+                continue
+            if insn.is_ret or (insn.is_jump and not insn.is_cond_jump):
+                return True
+            if insn.mnemonic.lower() == "int3":
+                return True
+        return False
+
+    def _pass_jump_table_followers(self, sections: List[SectionInfo]) -> bool:
+        """A function that starts right after an embedded switch table.
+
+        MSVC parks a function's jump table after its last ret, aligned with
+        int3 or `mov edi, edi`, and the linker packs the next function straight
+        after the table. Nothing marks that start. _pass_cc_boundaries wants
+        a ret or jmp in front of an int3 run, and finds a table instead;
+        _pass_gap_prologues looks only after a ret. A function whose address
+        is only ever stored into a callback slot is reached by no call or jmp
+        either. A frameless callback packed after a four-entry table is that
+        shape, and it needed a hand seed before this pass.
+
+        The address is the first byte past the table and anything packed
+        after it: padding, further dword tables, and byte index tables. It
+        becomes a start when it is in a gap, is not a switch arm, and decodes
+        to a terminator, the same test a realigned call target gets. The gap
+        is the important test. A table in the middle of a function is followed
+        by more of that function, and that function's body already covers the
+        address. The data is the main risk: index tables decode as `add` and
+        reach a `retf` soon enough. They are stepped over or refused, never
+        probed.
+
+        On one title this finds 37 starts. 35 were reachable before only as
+        aliases inside a false function that _pass_gap_prologues had started
+        on the `mov edi, edi` in front of a table.
+
+        Returns whether anything was added, so the caller can rebuild.
+        """
+        if not self.engine.jump_tables:
+            return False
+        bounds = sorted((f.start, f.end) for f in self.functions.values())
+        starts = [b[0] for b in bounds]
+        code_ranges = [(sec.virtual_addr, sec.virtual_addr + sec.virtual_size)
+                       for sec in sections]
+
+        def in_a_gap(addr: int) -> bool:
+            i = bisect.bisect_right(starts, addr) - 1
+            return not (i >= 0 and addr < bounds[i][1])
+
+        # A switch arm is code of the function that dispatches to it, and
+        # MSVC's memcpy keeps arms straight after a table. A start there
+        # clamps the function it belongs to, so arms are never followers.
+        arms = set()
+        for tbl in self.engine.jump_tables:
+            arms.update(self.engine.jump_table_entries(tbl))
+
+        found = 0
+        for tbl, end in sorted(self.engine.jump_tables.items()):
+            addr = self._past_switch_data(end, (end - tbl) // 4)
+            if addr is None or addr in arms:
+                continue
+            # Opcodes 0x00-0x0E are `add`, `or` and segment pushes. No function
+            # starts with one, but every index table does, because its bytes
+            # are small arm numbers. This catches the ones the walk above could
+            # not size.
+            first = self.image.read_bytes_at_va(addr, 1)
+            if not first or first[0] < 0x0F:
+                continue
+            if addr in self._candidates or addr in self.functions:
+                continue
+            if not any(lo <= addr < hi for lo, hi in code_ranges):
+                continue
+            if not in_a_gap(addr):
+                continue
+            # The sweep may have decoded the tables as code and run across
+            # this address. A decode that starts inside the tables says
+            # nothing. One that starts before them does, as it does for an
+            # immediate.
+            covering = self.engine.instruction_covering(addr)
+            if (covering is not None and covering.address < tbl
+                    and not self.engine.probes_as_prologue(addr)):
+                continue
+            if not self.engine.probes_as_function_body(addr):
+                continue
+            if addr not in self.engine.instructions \
+                    and not self.engine.decode_at(addr):
+                continue
+            self._add_candidate(addr, config.CONFIDENCE_CC_BOUNDARY,
+                                "jump_table_follower")
+            found += 1
+
+        if found:
+            print(f"  {found} function(s) found right after a switch table")
+        return found > 0
 
     def _pass_gap_prologues(self, sections: List[SectionInfo]) -> bool:
         """A function that starts right after a ret, with no padding between.
@@ -212,6 +485,13 @@ class FunctionDetector:
                 continue
             if not in_a_gap(nxt):
                 continue                    # an out-of-line tail, not a start
+            # `mov edi, edi` is also what MSVC pads with to align a switch
+            # table parked after the ret. Taking it for a hot-patch prologue
+            # starts a function on the padding, and _find_function_end then
+            # steps over the table and swallows whatever follows it: such a
+            # false start ate the frameless callback packed after the table.
+            if self._pads_into_jump_table(nxt):
+                continue
             # A prologue, or a whole small function.
             #
             # MSVC packs runs of constant-returning accessors -- "mov eax,
@@ -573,8 +853,18 @@ class FunctionDetector:
             # dispatches through the vtable and is gone. Those are taken by
             # address and passed around as values, so an immediate is exactly
             # how they show up.
+            #
+            # ...or a body that ends by tail-jumping to the exact start of a
+            # known function. "return f(...)" compiles to that, and so does
+            # every C++ EH handler thunk, `mov eax, <FuncInfo>; jmp
+            # __CxxFrameHandler`, whose address the function's SEH prologue
+            # pushes as an immediate. A stray jmp decoded out of data almost
+            # never lands precisely on a function start, so the destination is
+            # the corroboration the missing ret would have been. One title lost
+            # three such thunks and a frameless 79-byte callback this way.
             if not (self.engine.probes_as_returning_body(target)
-                    or self.engine.probes_as_vcall_thunk(target)):
+                    or self.engine.probes_as_vcall_thunk(target)
+                    or self._tail_calls_known_function(target)):
                 continue
             if target not in self.engine.instructions:
                 if not self.engine.decode_at(target):
@@ -697,6 +987,8 @@ class FunctionDetector:
         # nowhere else. Excluding them left those constructors with no body at
         # all, and _initterm silently skipped every one.
         targets = set()
+        # Where each target was read, for the table-context test below.
+        seen_at: Dict[int, List[Tuple[bytes, int]]] = {}
         for sec in self.image.sections:
             if sec.name in code_names:
                 continue                    # scan data, not code
@@ -707,6 +999,31 @@ class FunctionDetector:
                 value = int.from_bytes(data[off:off + 4], "little")
                 if in_code_section(value):
                     targets.add(value)
+                    seen_at.setdefault(value, []).append((data, off))
+
+        def known_neighbours(target: int) -> int:
+            """Known function starts beside `target` in its own table.
+
+            Walks out from each place the target was stored, through the
+            contiguous run of code pointers it sits in, up to four entries
+            each way."""
+            best = 0
+            for data, off in seen_at.get(target, ()):
+                n = 0
+                for step in (-4, 4):
+                    pos = off + step
+                    for _ in range(4):
+                        if not (0 <= pos <= len(data) - 4):
+                            break
+                        value = int.from_bytes(data[pos:pos + 4], "little")
+                        if not in_code_section(value):
+                            break
+                        if value in self.functions and value not in \
+                                self._alias_entries:
+                            n += 1
+                        pos += step
+                best = max(best, n)
+            return best
 
         # Alias entries, not candidates.
         #
@@ -763,8 +1080,29 @@ class FunctionDetector:
                 first = self.engine.instructions[target]
                 if first.mnemonic.lower() in ("int3", "nop"):
                     continue
+                # The walk is capped because a data word is weak evidence and
+                # a long walk through junk eventually finds a jmp. The short
+                # budget is enough for most functions, but not all: a long
+                # straight-line function can need 67 instructions to reach
+                # its first ret. Raising the cap for everyone is not the
+                # answer: at twice the budget one title gained 87 aliases,
+                # and nearly all of them were runs of odd addresses in
+                # zero-filled data that happened to fall in a code section.
+                #
+                # So the longer walk needs two more pieces of evidence. First,
+                # the word sits beside a known function start in its own
+                # table. Second, the address is where a function could start:
+                # straight after a ret, a tail jmp or int3 padding. A real
+                # callback has both, a neighbour in .data and a ret in front
+                # of it. Junk that falls in a code section has neither.
+                # The budgets are the detector's data_ptr_* parameters
+                # (tools.disasm --data-ptr-probe and friends).
+                budget = self.data_ptr_probe_insns
+                if (known_neighbours(target) >= self.data_ptr_min_neighbours
+                        and self._follows_a_boundary(target)):
+                    budget = self.data_ptr_table_probe_insns
                 if not self.engine.probes_as_function_body(target,
-                                                           max_insns=64):
+                                                           max_insns=budget):
                     continue
                 i = bisect.bisect_right(starts, target)
                 sec = self.image.get_section_at_va(target)
@@ -868,6 +1206,87 @@ class FunctionDetector:
         if added:
             print("  conditional-branch orphans recovered as alias entries")
         return added
+
+    def _pass_branch_alias_closure(self, max_rounds: int = 16) -> int:
+        """
+        Give every direct branch that leaves its lifted body somewhere to land.
+
+        The translator lifts each function and each alias as its own C body,
+        covering [start, end). A jmp or jcc whose target is outside that range
+        becomes a tail call to sub_<target>. When nothing starts there, the
+        call goes to an unresolved stub, and the stub behaves like a `ret` that
+        the guest never executed. The native call chain unwinds while the guest
+        stack does not: the frame the function built is leaked, and ebx, esi
+        and edi come back holding whatever was in the frame.
+
+        The passes above miss two shapes:
+
+        - A jcc into the middle of another function. The tail-jump pass only
+          looks at unconditional jumps, and the orphan pass only looks at
+          gaps.
+        - Any branch from an alias body. The other passes test "leaves its
+          function" against the primary bodies. An alias starts partway into
+          its primary, so a branch back to a label before the alias start
+          looks intra-function to them. It still leaves the alias's own
+          lifted body.
+
+        A function split at a lone int3 (a switch default that lands on a CC
+        boundary) can have both: the two halves and their aliases branch into
+        each other's interiors, and every such target was a stub. In one title
+        the common path left its frame on the guest stack and returned a
+        zeroed register, so its caller re-walked a tree from a stale pointer
+        until the native stack overflowed.
+
+        Each target found here becomes an alias that runs to the end of the
+        function it lands in, as the tail-jump pass does. New aliases can
+        branch out in turn, so this repeats until nothing new turns up.
+        Targets in gaps are left to the orphan pass, which probes them first.
+        """
+        bodies = sorted((f.start, f.end) for f in self.functions.values())
+        starts = [b[0] for b in bodies]
+        if not bodies:
+            return 0
+
+        def containing_end(addr: int):
+            j = bisect.bisect_right(starts, addr) - 1
+            if j >= 0 and bodies[j][0] < addr < bodies[j][1]:
+                return bodies[j][1]
+            return None
+
+        ranges = list(bodies) + list(self._alias_entries.items())
+        scanned = set()
+        total = 0
+        for _round in range(max_rounds):
+            new = {}
+            for lo, hi in ranges:
+                if (lo, hi) in scanned:
+                    continue
+                scanned.add((lo, hi))
+                for insn in self.engine.get_instructions_in_range(lo, hi):
+                    if not (insn.is_jump or insn.is_cond_jump):
+                        continue
+                    target = insn.jump_target
+                    if target is None or lo <= target < hi:
+                        continue
+                    if (target in self.functions
+                            or target in self._alias_entries
+                            or target in new):
+                        continue
+                    if target not in self.engine.instructions:
+                        continue
+                    end = containing_end(target)
+                    if end is None:
+                        continue
+                    new[target] = end
+            if not new:
+                break
+            self._alias_entries.update(new)
+            total += len(new)
+            ranges = list(new.items())
+        if total:
+            print(f"  {total} branch target(s) inside other bodies "
+                  f"recovered as alias entries")
+        return total
 
     def _build_alias_entries(self) -> None:
         """

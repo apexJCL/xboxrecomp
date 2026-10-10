@@ -95,6 +95,12 @@ class DisasmEngine:
         # recorded during the sweep.
         self.jump_tables: Dict[int, int] = {}
         self._jt_candidates: Set[int] = set()
+        # Byte-sized tables read through an index, `movzx eax, byte ptr
+        # [eax + disp]`. MSVC's two-level switch maps a sparse case value to a
+        # dense arm number this way and parks the byte table straight after
+        # the dword table it feeds. disp -> addresses of the reads, so that
+        # index_table_length() can find the bound check in front of one.
+        self.byte_tables: Dict[int, List[int]] = {}
         # Indexed-jump displacement -> the (start, end) of each instruction
         # that dispatches through it, and -> the table start it resolves to
         # when the displacement is not the table's first slot.
@@ -151,6 +157,19 @@ class DisasmEngine:
                         self._jt_candidates.add(disp)
                         self._jt_sites.setdefault(disp, []).append(
                             (insn.address, insn.end_address))
+
+            # Only the widening loads. `cmp byte ptr [esi + disp], 0` reads a
+            # byte field of a static struct, not an index table.
+            if mnemonic in ("movzx", "movsx") and len(operands) == 2:
+                src = operands[1]
+                if (src.type == CS_OP_MEM and src.size == 1
+                        and (src.mem.index != 0 or src.mem.base != 0)):
+                    disp = src.mem.disp & 0xFFFFFFFF
+                    if self.image.base_address <= disp < (
+                            self.image.base_address
+                            + self.image.image_size):
+                        self.byte_tables.setdefault(disp, []).append(
+                            insn.address)
 
             # Check for memory references in non-branch instructions
             if not (insn.is_call or insn.is_branch) and insn.memory_ref is None:
@@ -336,6 +355,49 @@ class DisasmEngine:
 
         return resynced
 
+    def index_table_length(self, table: int) -> Optional[int]:
+        """Entries in the byte index table at `table`, read from the bound
+        check in front of a load from it, or None when there is none.
+
+        MSVC guards the load with the switch range:
+
+            cmp  eax, N
+            ja   default
+            movzx eax, byte ptr [eax + table]
+            jmp  dword ptr [eax*4 + arms]
+
+        so the index is 0..N and the table holds N + 1 bytes.
+        """
+        for site in self.byte_tables.get(table, ()):
+            ja = self._instruction_ending_at(site)
+            if ja is None or ja.mnemonic.lower() not in ("ja", "jae"):
+                continue
+            cmp = self._instruction_ending_at(ja.address)
+            if cmp is None or cmp.mnemonic.lower() != "cmp":
+                continue
+            _, _, imm = cmp.op_str.replace(" ", "").partition(",")
+            try:
+                bound = int(imm, 0)
+            except ValueError:
+                continue
+            if bound < 0:
+                continue
+            return bound + 1 if ja.mnemonic.lower() == "ja" else bound
+        return None
+
+    def _instruction_ending_at(self, addr: int) -> Optional[Instruction]:
+        for back in range(1, 16):
+            insn = self.instructions.get(addr - back)
+            if insn is not None and insn.end_address == addr:
+                return insn
+        return None
+
+    def is_jump_table_ref(self, addr: int) -> bool:
+        """Does some `jmp [reg*4 + disp]` name `addr` as its table, measured
+        or not? resync_jump_tables skips tables shorter than min_entries, but
+        they are still tables."""
+        return addr in self._jt_candidates
+
     def jump_table_entries(self, tbl: int) -> List[int]:
         """Code pointers held by a resynced jump table, or [] if unknown."""
         tbl = self._jt_base.get(tbl, tbl)
@@ -461,9 +523,38 @@ class DisasmEngine:
         function has them. So is a switch dispatch through a table that
         resync_jump_tables has measured: the probe continues in its arms.
         """
+        return self._probe_straight_line(addr, max_insns) == ("ret", None)
+
+    def probe_tail_call(self, addr: int,
+                        max_insns: int = 64) -> Optional[int]:
+        """
+        Where the body at `addr` tail-jumps, when the walk
+        probes_as_returning_body makes ends in a direct `jmp` out of the window
+        rather than a ret. None otherwise.
+
+        The tail jump on its own is not evidence -- data disassembles into a
+        stray `jmp` readily -- so this only reports the destination. A caller
+        that finds it is the exact start of a known function has a body that
+        ends in "return f(...)", which is how MSVC emits frameless wrappers and
+        the `mov eax, <FuncInfo>; jmp __CxxFrameHandler` handler thunks.
+        """
+        kind, target = self._probe_straight_line(addr, max_insns)
+        return target if kind == "tail" else None
+
+    def _probe_straight_line(self, addr: int, max_insns: int):
+        """Shared walk for the two probes above.
+
+        Returns ("ret", None), ("tail", target) for a direct jmp that leaves
+        the window or goes backwards, or (None, None) for anything else.
+
+        A walk that crossed int3 never counts as a tail call: it started in
+        alignment padding and ran into the function after it. Burnout 3 has
+        an immediate naming the last int3 before a function that tail-jumps.
+        """
+        crossed_padding = False
         section = self.image.get_section_at_va(addr)
         if section is None or not section.executable:
-            return False
+            return None, None
         count = 0
         resume = addr
         # One pass per straight-line segment. A segment ends at a ret (yes),
@@ -477,15 +568,17 @@ class DisasmEngine:
         while resume is not None and count < max_insns:
             data = self.image.read_bytes_at_va(resume, (max_insns - count) * 8)
             if not data:
-                return False
+                return None, None
             limit = resume + len(data)
             start = resume
             resume = None
             for decoded in self._cs.disasm(data, start):
                 count += 1
                 mnemonic = decoded.mnemonic.lower()
+                if mnemonic == "int3":
+                    crossed_padding = True
                 if mnemonic in config.RET_MNEMONICS:
-                    return True
+                    return "ret", None
                 if mnemonic in config.JMP_MNEMONICS:
                     # An unconditional jump forward, still inside the window
                     # being probed, is ordinary control flow -- MSVC emits it
@@ -500,24 +593,26 @@ class DisasmEngine:
                     try:
                         ops = decoded.operands
                     except Exception:
-                        return False
+                        return None, None
                     if not ops:
-                        return False
+                        return None, None
                     if ops[0].type == CS_OP_MEM and ops[0].mem.index != 0:
                         arm = self._first_arm_after(
                             ops[0].mem.disp & 0xFFFFFFFF, decoded.address)
                         if arm is None:
-                            return False
+                            return None, None
                         resume = arm
                         break
                     if ops[0].type != CS_OP_IMM:
-                        return False
+                        return None, None
                     target = ops[0].imm & 0xFFFFFFFF
                     if not (decoded.address < target < limit):
-                        return False
+                        if crossed_padding:
+                            return None, None
+                        return "tail", target
                 if count >= max_insns:
-                    return False
-        return False
+                    return None, None
+        return None, None
 
     def _first_arm_after(self, table: int, site: int) -> Optional[int]:
         """The lowest entry of a measured jump table that lies past `site`,

@@ -39,7 +39,10 @@ class Disassembler:
                  force: bool = False,
                  extra_sections: Optional[list] = None,
                  seed_functions: Optional[list] = None,
-                 observed_seeds: Optional[set] = None):
+                 observed_seeds: Optional[set] = None,
+                 data_ptr_probe_insns: Optional[int] = None,
+                 data_ptr_table_probe_insns: Optional[int] = None,
+                 data_ptr_min_neighbours: Optional[int] = None):
         self.xbe_path = xbe_path
         self.analysis_json = analysis_json
         self.output_dir = output_dir or config.DEFAULT_OUTPUT_DIR
@@ -52,6 +55,11 @@ class Disassembler:
         # Seeds a run actually reached (see _load_seed_functions). They are
         # not guesses, so the mid-instruction guard below does not apply.
         self.observed_seeds = observed_seeds or set()
+        # FunctionDetector's data-pointer probe budgets; None keeps its
+        # defaults.
+        self.data_ptr_probe_insns = data_ptr_probe_insns
+        self.data_ptr_table_probe_insns = data_ptr_table_probe_insns
+        self.data_ptr_min_neighbours = data_ptr_min_neighbours
 
         # Components (initialized during run)
         self.image: Optional[BinaryImage] = None
@@ -172,7 +180,10 @@ class Disassembler:
         if self.verbose:
             print("\nPhase 5: Detecting functions...")
         self.func_detector = FunctionDetector(
-            self.engine, self.image, self.xrefs, self.labels)
+            self.engine, self.image, self.xrefs, self.labels,
+            data_ptr_probe_insns=self.data_ptr_probe_insns,
+            data_ptr_table_probe_insns=self.data_ptr_table_probe_insns,
+            data_ptr_min_neighbours=self.data_ptr_min_neighbours)
 
         # Add seed functions from vtable scanner or other sources
         if self.seed_functions:

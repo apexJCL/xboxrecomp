@@ -65,8 +65,8 @@ class FpuReverseFormTest(unittest.TestCase):
     def test_transcendentals_emit_statements_rather_than_comments(self):
         for mnemonic, expected in (
             ("fpatan", "atan2(fp_st1(), fp_top())"),
-            ("fsin", "sin(fp_top())"),
-            ("fcos", "cos(fp_top())"),
+            ("fsin", "recomp_x87_fsin(&fp_top(), &g_fp_cc)"),
+            ("fcos", "recomp_x87_fcos(&fp_top(), &g_fp_cc)"),
             ("frndint", "recomp_frndint(fp_top(), g_fp_control_word)"),
             ("fyl2x", "log2(fp_top())"),
         ):
@@ -76,8 +76,10 @@ class FpuReverseFormTest(unittest.TestCase):
                 self.assertNotIn("/* FPU:", lifted[0])
 
     def test_fptan_pushes_the_implicit_one(self):
-        """FPTAN leaves tan(x) and then 1.0 on the stack."""
-        self.assertIn("fp_push(1.0);", _lift("fptan", "", [])[0])
+        """FPTAN leaves tan(x) and then 1.0 on the stack. The 1.0 comes from
+        the helper (it is the NaN for an inf/NaN operand); tests/x87_trig
+        checks the value."""
+        self.assertIn("fp_push(_p);", _lift("fptan", "", [])[0])
 
 
 if __name__ == "__main__":

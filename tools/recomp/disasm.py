@@ -88,6 +88,11 @@ class Operand:
     # Xbox -- it is how a title reaches the TIB -- but dropping the prefix put
     # fs:[0] at linear address 0, which is also where a null pointer lands.
     mem_seg: str = None
+    # For expr: a C expression already formatted at mem_size, and the source
+    # instruction it stands for (the comment the snapshot keeps). Only
+    # normalise_zero_test makes one: the AND of a `test`.
+    expr: Optional[str] = None
+    expr_src: Optional[str] = None
 
 
 @dataclass
