@@ -1095,6 +1095,10 @@ void xbox_log(int level, const char* subsystem, const char* fmt, ...);
 #define XBOX_LOG_THUNK   "THUNK"
 #define XBOX_LOG_PATH    "PATH"
 
+/* cpuid for lifted code (kernel_hal.c): the Xbox's Pentium III. Also declared
+ * in templates/runtime/recomp_types.h for generated code. */
+void xbox_Cpuid(uint32_t leaf, uint32_t subleaf, uint32_t out[4]);
+
 #ifdef __cplusplus
 }
 #endif
