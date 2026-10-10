@@ -2173,7 +2173,16 @@ static int transform_vertex(uint32_t index, Nv2aVshOutput *out)
 
     for (a = 0; a < NV2A_VSH_INPUTS; a++)
         fetch_attr(&s_gpu.attr[a], index, in[a]);   /* absent: 0,0,0,1 */
-    return nv2a_vsh_run((const float (*)[4])in, out);
+    if (!nv2a_vsh_run((const float (*)[4])in, out))
+        return 0;
+    /* oPos.w == 0 comes from a program that never divided by w: x, y and z
+     * are already surface units. The hardware draws such a vertex (xemu
+     * clamps w away from zero, in front of the eye), but raster_xf_clipped
+     * would count it behind the eye. w = 1 draws it at the same place and
+     * keeps 1/w finite. -0 stays behind the eye and is clipped, as on xemu. */
+    if (out->pos[3] == 0.0f && !signbit(out->pos[3]))
+        out->pos[3] = 1.0f;
+    return 1;
 }
 
 static void raster_batch_program(void)
