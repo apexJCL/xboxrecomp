@@ -1415,6 +1415,29 @@ class FunctionTranslator:
                 instructions[1].mnemonic == "mov" and
                 instructions[1].op_str == "ebp, esp")
 
+    def _func_has_offset_frame(self, instructions):
+        """Check for MSVC's offset frame: push ebp; lea ebp, [esp +/- N].
+
+        MSVC biases ebp into a large frame so more locals fit in a signed
+        8-bit displacement: "push ebp; lea ebp, [esp-0x70]; sub esp, 0x274;
+        ... add ebp, 0x70; leave". The frame is as real as a classic one, and
+        it has to be published across calls for the same reasons -- most
+        sharply for setjmp, which saves g_seh_ebp into the jmp_buf. Left
+        unpublished, that slot held the caller's frame, so the longjmp resumed
+        with the wrong ebp and the "add ebp, N; leave" epilogue returned with
+        esp moved. One case is libjpeg's error recovery in D3DX's JPEG
+        loader: a texture that is not a JPEG longjmps out, the loader returns
+        0x90 bytes high, and the caller pops ebx = 0xFFFFFFFF and spins
+        forever counting a mip chain that never meets it.
+        """
+        if len(instructions) < 2:
+            return False
+        return (instructions[0].mnemonic == "push" and
+                instructions[0].op_str == "ebp" and
+                instructions[1].mnemonic == "lea" and
+                instructions[1].op_str.replace(" ", "").startswith(
+                    ("ebp,[esp+", "ebp,[esp-")))
+
     def _func_owns_a_frame(self, instructions):
         """True when the function has a frame, however it got one.
 
@@ -1433,6 +1456,8 @@ class FunctionTranslator:
         a pointer.
         """
         if self._func_has_prologue(instructions):
+            return True
+        if self._func_has_offset_frame(instructions):
             return True
         seh_prologs = _seh_prologs_of(self.lifter)
         if not seh_prologs:
@@ -3187,11 +3212,40 @@ class BatchTranslator:
             stub_lines.append(
                 " * esp off by N on every call. */")
             stub_lines.append("")
+            # A stub skips whatever code really lives at its address, so one
+            # reached at runtime is a likely cause of a silent stall or a wrong
+            # result far downstream. RECOMP_STUB_LOG=1 names each stub the
+            # first time it runs, with the return address on the guest stack
+            # (for a tail jump, that is the caller's caller). Off by default:
+            # the check is one cached getenv per stub per process.
+            stub_lines += [
+                "#include <stdio.h>",
+                "#include <stdlib.h>",
+                "",
+                "static int recomp_stub_log_on(void)",
+                "{",
+                "    static int on = -1;",
+                "    if (on < 0) {",
+                '        const char *e = getenv("RECOMP_STUB_LOG");',
+                "        on = e && *e && *e != '0';",
+                "    }",
+                "    return on;",
+                "}",
+                "",
+                "#define RECOMP_STUB_HIT(va) do { static int _seen; \\",
+                "    if (!_seen && recomp_stub_log_on()) { _seen = 1; \\",
+                '        fprintf(stderr, "[STUB] unresolved 0x%08X reached, " \\',
+                '                "return 0x%08X esp 0x%08X\\n", (unsigned)(va), \\',
+                "                (unsigned)MEM32(g_esp), (unsigned)g_esp); \\",
+                "        fflush(stderr); } } while (0)",
+                "",
+            ]
             for addr in sorted(unresolved):
                 popped = self.translator._stub_ret_bytes(addr)
                 note = (f"ret {popped}" if popped else "not detected")
                 stub_lines.append(
-                    f"void {unresolved[addr]}(void) {{ g_esp += {4 + popped}; "
+                    f"void {unresolved[addr]}(void) {{ "
+                    f"RECOMP_STUB_HIT(0x{addr:08X}u); g_esp += {4 + popped}; "
                     f"/* 0x{addr:08X}: {note} */ }}"
                 )
             stub_lines.append("")
