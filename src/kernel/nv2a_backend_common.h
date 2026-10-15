@@ -1034,6 +1034,8 @@ enum nv2a_present_surface {
 
 struct nv2a_host_opts {
     unsigned render_scale;      /* 0 or 1 = guest size; 2..4 */
+    unsigned aniso;             /* 0 = stock; 2..16: anisotropic filtering
+                                 * on mipmapped textures */
     int      present_filter;    /* enum nv2a_present_filter */
     int      fullscreen;        /* borderless desktop fullscreen at start */
     unsigned pack_off;          /* NV2A_PACK_OFF_* bits: 0 = every kind on */

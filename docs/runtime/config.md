@@ -154,6 +154,7 @@ the stock settings, `present.pacing = "spin"` included.
 | Key | Type | Values | Default | Env override |
 |---|---|---|---|---|
 | `render.scale` | int | internal resolution factor: 1, 2, 3, ... | `1` | `RECOMP_RENDER_SCALE` |
+| `render.aniso` | int | anisotropic filtering on mipmapped textures: `0` (off), `2`..`16` | `0` | `RECOMP_RENDER_ANISO` |
 | `display.aspect` | string | `"4:3"` only for now (`"16:9"`, `"16:10"`, `"21:9"` are reported as not implemented, and 4:3 is used) | `"4:3"` | `RECOMP_DISPLAY_ASPECT` |
 | `present.filter` | string | `"nearest"`, `"linear"`, `"integer"` | `"nearest"` | `RECOMP_PRESENT_FILTER` |
 | `present.fullscreen` | bool | borderless fullscreen at start | `false` | `RECOMP_PRESENT_FULLSCREEN` |
@@ -185,7 +186,7 @@ libraries never link the layer: without it the options are all zero, which
 is stock. One line shows the values in force:
 
 ```
-[ENHANCE] render.scale=2 present.filter=integer present.fullscreen=0 present.pacing=sleep present.surface=window(auto) (display.aspect=4:3)
+[ENHANCE] render.scale=2 render.aniso=0 present.filter=integer present.fullscreen=0 present.pacing=sleep present.surface=window(auto) (display.aspect=4:3)
 ```
 
 A change while the game runs (the in-game menu) goes through
@@ -228,6 +229,14 @@ presenters read them at start.
   - D3D11 `d3d11_dump` frames of a scaled run are the render target at host
     size (1280x960 at 2x). Golden frames are compared at the stock size
     only, and a golden run pins `RECOMP_RENDER_SCALE=1`.
+- **`render.aniso = N`** (2..16; 0 or 1 is off, the stock filtering;
+  outside 0..16 it is clamped, with a line). D3D11 samples a texture
+  anisotropically when it has mip levels, its minification filters and it
+  is not a cube map: the world's surfaces, sharp at grazing angles. A
+  texture without mips is left alone, since those are render targets read
+  back (bloom, blur and composite passes), linear-format movie frames and
+  lookup tables: screen-aligned or data, and they shimmer under it. Read at
+  start; the CPU and Metal backends ignore it for now.
 - **`present.filter`.** `nearest` is the stock letterbox. `linear` is the
   same letterbox with bilinear filtering. `integer` shows the frame at the
   largest whole multiple that fits, centred on black; a frame larger than

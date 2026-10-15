@@ -70,7 +70,7 @@ int xbox_enhance_init(const char *root, const char *title)
 {
     struct nv2a_host_opts o;
     const char *aspect;
-    long long scale;
+    long long scale, aniso;
     int rc, pacing, surface;
     char surface_txt[48];
 
@@ -85,6 +85,15 @@ int xbox_enhance_init(const char *root, const char *title)
         scale = c;
     }
     o.render_scale = (unsigned)scale;
+    /* Anisotropic filtering: 0 or 1 off (stock), else 2..16. */
+    aniso = enhance_cfg_int("render.aniso", 0);
+    if (aniso < 0 || aniso > 16) {
+        long long c = aniso < 0 ? 0 : 16;
+        fprintf(stderr, LOGP "render.aniso=%lld out of range 0..16; using %lld\n",
+                aniso, c);
+        aniso = c;
+    }
+    o.aniso = aniso < 2 ? 0 : (unsigned)aniso;
     /* Indexes match enum nv2a_present_filter. */
     o.present_filter = enhance_cfg_choice("present.filter", s_filters, NV2A_PRESENT_NEAREST);
     o.fullscreen = enhance_cfg_bool("present.fullscreen", 0);
@@ -130,8 +139,9 @@ int xbox_enhance_init(const char *root, const char *title)
         o.pack_off |= NV2A_PACK_OFF_TEXT;
 
     nv2a_host_opts_set(&o);
-    fprintf(stderr, LOGP "render.scale=%u present.filter=%s present.fullscreen=%d"
-            " present.pacing=%s present.surface=%s (display.aspect=%s)\n", o.render_scale,
+    fprintf(stderr, LOGP "render.scale=%u render.aniso=%u present.filter=%s"
+            " present.fullscreen=%d present.pacing=%s present.surface=%s"
+            " (display.aspect=%s)\n", o.render_scale, o.aniso,
             s_filters[o.present_filter], o.fullscreen, s_pacing[pacing], surface_txt, aspect);
     load_tex_pack(&o);
     enhance_input_init();

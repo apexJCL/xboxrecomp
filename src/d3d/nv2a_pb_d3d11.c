@@ -1863,6 +1863,7 @@ static ID3D11SamplerState *sampler(const Stage *t)
     D3D11_SAMPLER_DESC sd;
     uint32_t u = t->addr_u & 0xF, v = t->addr_v & 0xF;
     int mn, mg, mip, i;
+    unsigned an;
     uint64_t key;
     ID3D11SamplerState *st = NULL;
 
@@ -1871,8 +1872,14 @@ static ID3D11SamplerState *sampler(const Stage *t)
     mn = !point && filter_linear(t->filter, 0);
     mg = !point && filter_linear(t->filter, 1);
     mip = t->levels > 1 ? filter_mip(t->filter) : 0;
+    /* render.aniso: anisotropic filtering, on mipmapped textures that
+     * filter -- the world's surfaces, seen at an angle. Not on a texture
+     * without mips (render targets read back: bloom, blur; linear-format
+     * movie frames and lookup tables), which are screen-aligned or data and
+     * shimmer under it, nor on a cube map. */
+    an = !point && mip && mn && !t->cube ? nv2a_host_opts()->aniso : 0;
     key = u | v << 4 | (uint64_t)mn << 8 | (uint64_t)mg << 9
-        | (uint64_t)mip << 10;
+        | (uint64_t)mip << 10 | (uint64_t)an << 35;
     if (mip)
         key |= (uint64_t)(t->filter & 0x1FFFu) << 12
              | (uint64_t)t->lod_min << 25 | (uint64_t)t->lod_max << 29;
@@ -1887,6 +1894,10 @@ static ID3D11SamplerState *sampler(const Stage *t)
     memset(&sd, 0, sizeof sd);
     sd.Filter = (D3D11_FILTER)((mn ? 0x10 : 0) | (mg ? 0x4 : 0)
                                | (mip == 2 ? 0x1 : 0));
+    if (an) {
+        sd.Filter = D3D11_FILTER_ANISOTROPIC;
+        sd.MaxAnisotropy = an;
+    }
     sd.AddressU = address_mode(u);
     sd.AddressV = address_mode(v);
     sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;

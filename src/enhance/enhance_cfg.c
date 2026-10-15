@@ -47,6 +47,7 @@ static void bind_builtins(void)
     s_builtin_bound = 1;
 #ifdef RECOMP_ENV_HAVE_ENHANCE_KEYS
     enhance_cfg_bind_env("render.scale", RENV_RENDER_SCALE);
+    enhance_cfg_bind_env("render.aniso", RENV_RENDER_ANISO);
     enhance_cfg_bind_env("display.aspect", RENV_DISPLAY_ASPECT);
     enhance_cfg_bind_env("present.filter", RENV_PRESENT_FILTER);
     enhance_cfg_bind_env("present.fullscreen", RENV_PRESENT_FULLSCREEN);
