@@ -92,6 +92,7 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
          "    float4 c0[8]; float4 c1[8]; float4 fc0; float4 fc1; float4 fog_color;\n"
          "    float alpha_ref; uint alpha_func; uint alpha_test_enable; uint fog_enable;\n"
          "    uint4 alpha_only; float4 tex_scale[4]; uint4 tex_mode;\n"
+         "    float4 bump[4]; float4 bumpls[4];\n"
          "};\n");
 
     /* ---- Input: a prefix of d3d8_vsh.c's VS_OUT ---- */
@@ -136,6 +137,24 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
         }
         if (m == NV2A_TEXMODE_3D || m == NV2A_TEXMODE_CUBEMAP) {
             EMIT("    x%d = tex%d.Sample(samp%d, i.tc%d.xyz);\n", 8 + i, i, i, i);
+        } else if (state->bump_on && (m == NV2A_TEXMODE_BUMPENVMAP
+                                      || m == NV2A_TEXMODE_BUMPENVMAP_LUM)) {
+            /* The input stage's blue and green are du and dv as signed
+             * bytes (xemu's sign3, over 128): textures arrive as unsigned
+             * BGRA8, so the byte is taken back to two's complement. The
+             * offset is added in the coordinate's own units, before
+             * tex_scale (texels for a linear-format texture). */
+            int in = state->tex_input[i];
+            EMIT("    {\n");
+            EMIT("        float2 ds = round(x%d.bg * 255.0);\n", 8 + in);
+            EMIT("        ds = (ds >= 128.0 ? ds - 256.0 : ds) / 128.0;\n");
+            EMIT("        ds = float2(dot(ds, bump[%d].xw), dot(ds, bump[%d].yz));\n", i, i);
+            EMIT("        x%d = tex%d.Sample(samp%d, (i.tc%d.xy + ds) * tex_scale[%d].xy);\n",
+                 8 + i, i, i, i, i);
+            if (m == NV2A_TEXMODE_BUMPENVMAP_LUM)   /* luminance: unsigned red */
+                EMIT("        x%d.rgb *= x%d.r * bumpls[%d].x + bumpls[%d].y;\n",
+                     8 + i, 8 + in, i, i);
+            EMIT("    }\n");
         } else {
             EMIT("    {\n");
             EMIT("        float2 uv = i.tc%d.xy;\n", i);

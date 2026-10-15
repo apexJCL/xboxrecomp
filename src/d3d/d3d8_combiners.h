@@ -71,6 +71,8 @@ typedef struct NV2APSConstants {
     UINT  alpha_only[NV2A_MAX_TEXTURES];     /* A8 sampling uses white RGB */
     float tex_scale[NV2A_MAX_TEXTURES][4];  /* xy: texcoord multiplier */
     UINT  tex_mode[NV2A_MAX_TEXTURES];         /* NV2ATextureMode per stage */
+    float bump[NV2A_MAX_TEXTURES][4];       /* BUMPENVMAP matrix (nv2a_ps_consts) */
+    float bumpls[NV2A_MAX_TEXTURES][4];     /* x: luminance scale, y: offset */
 } NV2APSConstants;
 
 /* ================================================================

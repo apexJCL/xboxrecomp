@@ -177,6 +177,8 @@ PS_ABI_SAME(fog_enable, fog_enable);
 PS_ABI_SAME(alpha_only, alpha_only);
 PS_ABI_SAME(tex_scale, tex_scale);
 PS_ABI_SAME(tex_mode, tex_mode);
+PS_ABI_SAME(bump, bump);
+PS_ABI_SAME(bumpls, bumpls);
 _Static_assert(sizeof(PsConsts) == sizeof(NV2APSConstants),
                "PsConsts and NV2APSConstants differ in size");
 #undef PS_ABI_SAME
@@ -186,6 +188,7 @@ _Static_assert(sizeof(PsConsts) == sizeof(NV2APSConstants),
     "    float4 c0[8]; float4 c1[8]; float4 fc0; float4 fc1; float4 fog_color;\n" \
     "    float alpha_ref; uint alpha_func; uint alpha_test_enable; uint fog_enable;\n" \
     "    uint4 alpha_only; float4 tex_scale[4]; uint4 tex_mode;\n" \
+    "    float4 bump[4]; float4 bumpls[4];\n" \
     "};\n"
 
 static uint64_t s_presents, s_clears, s_draws, s_draws_skipped;
@@ -2284,25 +2287,34 @@ static ID3D11PixelShader *setup_pixel(void)
         NV2ACombinerState st;
         ID3D11PixelShader *ps;
         uint32_t modes = 0;
+        uint32_t inputs = 0;
         for (n = 0; n < 4; n++) {
             /* Only 2D textures are bound: other sampling modes read 2D at
-             * (s, t), as the CPU path does. */
+             * (s, t), as the CPU path does -- but BUMPENVMAP(_LUMINANCE),
+             * which reads 2D at (s, t) moved by an earlier stage's texel,
+             * from stage 1 on. */
             uint32_t m = (uint32_t)s_stage[n].mode;
             if (s_stage[n].raw_mode == 5)
                 m = 5;      /* CLIPPLANE reads 0, not NONE's (0, 0, 0, 1) */
-            else if (m && m != 4) m = 1;
+            else if ((m == 6 || m == 7) && n > 0) {
+                /* OTHER_STAGE_INPUT: stage 1 reads stage 0; 2 and 3 name
+                 * theirs, an earlier one. */
+                uint32_t in = n == 1 ? 0
+                            : (v->other_stage_input >> (n == 2 ? 16 : 20)) & 0xF;
+                inputs |= (in < n ? in : n - 1) << (4 * n);
+            } else if (m && m != 4) m = 1;
             modes |= m << (5 * n);
         }
         /* The registers and modes that make the state: the same as the last
          * batch's give the same state and so the same shader. */
         static struct {
-            uint32_t r[37];
+            uint32_t r[38];
             int      key_ok, ps_ok;   /* s_last_rc is r's state; ps is its shader */
             ID3D11PixelShader *ps;
             RcEntry *e;
             uint64_t compiles;
         } memo;
-        uint32_t key[37];
+        uint32_t key[38];
         int hit;
         memcpy(key, v->rc_cicw, 32);
         memcpy(key + 8, v->rc_aicw, 32);
@@ -2314,6 +2326,7 @@ static ID3D11PixelShader *setup_pixel(void)
         key[35] = modes;
         /* render.scale changes at run time: each scale class has its own text */
         key[36] = nv2a_host_render_scale() > 1;
+        key[37] = inputs;
         hit = memo_on() && memo.key_ok && !memcmp(memo.r, key, sizeof key);
         if (!hit) {
             d3d8_combiners_from_regs(v->rc_cicw, v->rc_aicw, v->rc_cocw,
@@ -2321,6 +2334,9 @@ static ID3D11PixelShader *setup_pixel(void)
                                      v->rc_fcw1, modes, &st);
             st.fog_input = 1;   /* FOG.a is the interpolated vertex fog factor */
             st.rect_snap = (int)key[36];   /* nv2a_snap_uv; in rc_hash via st */
+            for (n = 0; n < 4; n++)
+                st.tex_input[n] = (int)((inputs >> (4 * n)) & 0xF);
+            st.bump_on = 1;
             s_last_rc = st;
             memcpy(memo.r, key, sizeof key);
             memo.key_ok = 1;

@@ -505,6 +505,10 @@ struct nv2a_stage {
     int      valid;
     int      on;        /* CONTROL0 enable as used (never-set stage 0 counts on) */
     int      mode;      /* 0 none, 1 2D, 4 pass-through, other: sampled as 2D */
+    /* SET_TEXTURE_SET_BUMP_ENV_MAT (0x1B28..0x1B34), as stored: the four
+     * registers hold 00, 01, 11, 10 (see nv2a_ps_consts.bump); then
+     * BUMP_ENV_SCALE (0x1B38) and BUMP_ENV_OFFSET (0x1B3C). */
+    float    bump[4], bump_scale, bump_offset;
     int      raw_mode;  /* the shader program's mode before the gating */
 };
 
@@ -881,6 +885,12 @@ struct nv2a_ps_consts {
     float    tex_scale[4][4];   /* xy: texcoord multiplier (1/size for linear);
                                  * z: nv2a_rect_snap_scale, 0 for none */
     uint32_t tex_mode[4];       /* stage texture-shader mode, 0 = none */
+    /* BUMPENVMAP stages: the bump matrix as the registers hold it -- 00,
+     * 01, 11, 10, not the 00 01 10 11 their order suggests (xemu reads them
+     * that way): du' = dot(dudv, bump.xw), dv' = dot(dudv, bump.yz) -- and
+     * BUMPENVMAP_LUMINANCE's scale (x) and offset (y). */
+    float    bump[4][4];
+    float    bumpls[4][4];
 };
 
 /* tex_scale[n].z for stage t at render scale `scale`: the scale when the

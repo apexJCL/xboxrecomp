@@ -128,7 +128,8 @@ _Static_assert(offsetof(struct nv2a_vp_consts, u) == 48, "nv2a_vp_consts.u moved
 
 /* PsConsts (MSL): float4 c0[8], c1[8], fc0, fc1, fog_color; uint4 atest
  * (x alpha_ref as float bits, y alpha_func, z alpha_test_enable, w fog_enable);
- * uint4 alpha_only; float4 tex_scale[4]; uint4 tex_mode. */
+ * uint4 alpha_only; float4 tex_scale[4]; uint4 tex_mode; float4 bump[4];
+ * float4 bumpls[4] (BUMPENVMAP; read by the D3D11 generator only, so far). */
 #define PS_AT(m, off) \
     _Static_assert(offsetof(struct nv2a_ps_consts, m) == (off), "nv2a_ps_consts." #m " moved")
 PS_AT(c0, 0);
@@ -143,8 +144,10 @@ PS_AT(fog_enable, 316);
 PS_AT(alpha_only, 320);
 PS_AT(tex_scale, 336);
 PS_AT(tex_mode, 400);
+PS_AT(bump, 416);
+PS_AT(bumpls, 480);
 #undef PS_AT
-_Static_assert(sizeof(struct nv2a_ps_consts) == 416, "nv2a_ps_consts size changed");
+_Static_assert(sizeof(struct nv2a_ps_consts) == 544, "nv2a_ps_consts size changed");
 
 /* The MSL PsConsts: the shared constants plus Metal's own trailing float4
  * tex_bias (per stage mip LOD bias, passed to sample() as bias()). Kept out
@@ -153,7 +156,7 @@ typedef struct {
     struct nv2a_ps_consts b;
     float tex_bias[4];
 } MsPsConsts;
-_Static_assert(offsetof(MsPsConsts, tex_bias) == 416 && sizeof(MsPsConsts) == 432,
+_Static_assert(offsetof(MsPsConsts, tex_bias) == 544 && sizeof(MsPsConsts) == 560,
                "MsPsConsts.tex_bias moved");
 _Static_assert(sizeof(float) == 4 && sizeof(uint32_t) == 4, "alpha_ref is read as uint bits");
 

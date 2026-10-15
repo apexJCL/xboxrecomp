@@ -215,6 +215,9 @@ void nv2a_stage_decode(int n, const uint32_t *r, const uint8_t *set,
         mode = n == 0 ? 1 : 0;
     t->raw_mode = mode;
     t->on = on;
+    memcpy(t->bump, &r[0x28 / 4], sizeof t->bump);
+    memcpy(&t->bump_scale, &r[0x38 / 4], 4);
+    memcpy(&t->bump_offset, &r[0x3C / 4], 4);
     /* PASSTHRU and CLIPPLANE have no texture to be valid: they stay. The
      * GPU backends drop CLIPPLANE to 0 themselves (no per-pixel kill yet). */
     if (mode != 4 && mode != 5 && (!on || !t->valid))
@@ -347,6 +350,9 @@ void nv2a_ps_consts_fill(const struct nv2a_pb_vsh *v,
         pc->tex_scale[n][0] = scaled || !t->width ? 1.0f : 1.0f / (float)t->width;
         pc->tex_scale[n][1] = scaled || !t->height ? 1.0f : 1.0f / (float)t->height;
         pc->tex_scale[n][2] = (float)nv2a_rect_snap_scale(t, nv2a_host_render_scale());
+        memcpy(pc->bump[n], t->bump, sizeof pc->bump[n]);
+        pc->bumpls[n][0] = t->bump_scale;
+        pc->bumpls[n][1] = t->bump_offset;
     }
     for (n = 0; n < 8; n++) {
         nv2a_argb_to_float4(v->rc_f0[n], pc->c0[n]);

@@ -185,6 +185,10 @@ struct nv2a_pb_vsh {
     uint32_t rc_cicw[8], rc_aicw[8], rc_cocw[8], rc_aocw[8];
     uint32_t rc_f0[8], rc_f1[8], rc_ctl, rc_fcw0, rc_fcw1, rc_sf[2];
     uint32_t shader_prog, fog_color;
+    uint32_t other_stage_input;         /* SET_SHADER_OTHER_STAGE_INPUT: the stage
+                                         * a dependent read (BUMPENVMAP, ...)
+                                         * takes its input from: stage 2 in
+                                         * bits 16-19, stage 3 in 20-23 */
     uint32_t clip_plane_mode;           /* SET_SHADER_CLIP_PLANE_MODE: per stage
                                          * and component, kill at >= 0 (1) or < 0 */
     int      rc_set, shader_set, fog_enable, atest_enable;

@@ -26,8 +26,8 @@
 #define NPROG 400
 #define NCOMB 400
 #define NCASE (2 * NPROG + NCOMB)
-#define EXPECTED_HASH 0xc4c327cfu      /* all cases, one FNV-1a */
-#define EXPECTED_CHARS 7360460u        /* re-recorded: screen-space snap to 1/16 pixel */
+#define EXPECTED_HASH 0x1175d806u      /* all cases, one FNV-1a */
+#define EXPECTED_CHARS 7375660u        /* re-recorded: BUMPENVMAP constants in the cbuffer */
 
 #include "expected.h"   /* s_expect[NCASE], or HLSL_NO_EXPECT */
 
