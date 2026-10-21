@@ -348,6 +348,26 @@ int main(int argc, char **argv)
               "a decommitted page comes back zeroed, its neighbours kept", d);
     }
 
+    /* 8. A block too big for either side of the low reserve (15-16 MB) is
+     * placed from the top down, as the console kernel places it. TDEOD asks
+     * for 50 MB at boot; the largest run above the reserve is about 48 MB,
+     * so it was refused and the title panicked. The low pages stay free. */
+    if (!ext) {
+        const uint32_t MB = 1024u * 1024u;
+        uint32_t big = xbox_ContiguousAlloc(50 * MB, 4096), lo;
+
+        snprintf(d, sizeof d, "got 0x%08X", big);
+        check(big != 0, "a 50 MB contiguous block is granted", d);
+        lo = xbox_ContiguousAllocEx(0x1000, 4096, 0, 0x00FFFFFFu);
+        snprintf(d, sizeof d, "big 0x%08X, low 0x%08X", big, lo);
+        check(lo != 0 && (!big || lo + 0x1000 <= big || lo >= big + 50 * MB),
+              "beside it, a low request still fits", d);
+        if (lo)
+            xbox_ContiguousFree(lo);
+        if (big)
+            xbox_ContiguousFree(big);
+    }
+
     /* 6. Contiguous memory can be given back. */
     if (!ext) {
         uint32_t c1 = xbox_ContiguousAlloc(0x20000, 4096);
