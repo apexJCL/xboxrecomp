@@ -813,6 +813,14 @@ static DWORD WINAPI bridge_thread_main(LPVOID param)
             BRIDGE_MEM32(tib + 0x28) = s->obj_va;
             if (bridge_layout_tls(s->obj_va, top, s->tls_size))
                 g_esp = ((top - s->tls_size) & ~0xFu) - 16;
+        } else if (tib && s->obj_va) {
+            /* No TLS of its own, but its own id: fs:[0x28] still names this
+             * thread's object, which keeps the TlsData word the copied TIB
+             * pointed at. */
+            uint32_t prev = BRIDGE_MEM32(tib + 0x28);
+            if (prev)
+                BRIDGE_MEM32(s->obj_va + 0x28) = BRIDGE_MEM32(prev + 0x28);
+            BRIDGE_MEM32(tib + 0x28) = s->obj_va;
         }
     }
     free(s);
@@ -857,6 +865,28 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
     return th;
 }
 
+/* ETHREAD.UniqueThread. XAPI's GetCurrentThreadId is
+ * `mov eax, fs:[0x28]; mov eax, [eax+0x12C]`, and PsCreateSystemThreadEx's
+ * ThreadId out parameter must hand the creator the same value. Neither was
+ * written, so every thread's id was 0: a title that keeps a table of its
+ * threads by id (Test Drive: Eve of Destruction's task system) found every
+ * thread in the main thread's slot, and its worker waited for work
+ * addressed to it for ever. Ids are unique, non-zero and never reused,
+ * like the kernel's. */
+#define ETHREAD_UNIQUE_THREAD 0x12Cu
+static volatile LONG s_next_thread_id;
+
+static uint32_t bridge_assign_thread_id(uint32_t kthread, uint32_t thread_id_va)
+{
+    uint32_t id = (uint32_t)InterlockedIncrement(&s_next_thread_id) * 4u;
+
+    if (kthread)
+        BRIDGE_MEM32(kthread + ETHREAD_UNIQUE_THREAD) = id;
+    if (thread_id_va)
+        BRIDGE_MEM32(thread_id_va) = id;
+    return id;
+}
+
 /* A worker with its guest thread object: the object is made first and holds
  * an extra reference until the handle token owns one, so a worker that ends
  * at once cannot free it underneath us. The KE shadow gets its own duplicate
@@ -864,10 +894,15 @@ static HANDLE bridge_spawn_thread(recomp_func_t fn, uint32_t ctx1,
 static HANDLE bridge_spawn_guest_thread(recomp_func_t fn, uint32_t ctx1,
                                         uint32_t ctx2, uint32_t stack_top,
                                         uint32_t routine, uint32_t handle_va,
-                                        uint32_t tls_size)
+                                        uint32_t tls_size, uint32_t thread_id_va)
 {
     uint32_t obj = thobj_alloc();
     HANDLE th, shadow = NULL;
+
+    /* Before the thread can run: its first GetCurrentThreadId may come before
+     * the creator has seen the id at all. */
+    if (obj)
+        bridge_assign_thread_id(obj, thread_id_va);
 
     thobj_ref(obj);
     th = bridge_spawn_thread(fn, ctx1, ctx2, stack_top, routine, obj, tls_size);
@@ -905,6 +940,7 @@ static void bridge_PsCreateSystemThreadEx(void)
 {
     uint32_t xbox_handle_ptr = STACK_ARG(0);
     uint32_t tls_size        = STACK_ARG(3);
+    uint32_t thread_id_ptr   = STACK_ARG(4);
     uint32_t start_context1  = STACK_ARG(5);
     uint32_t start_context2  = STACK_ARG(6);
     uint32_t start_routine   = STACK_ARG(9);
@@ -941,6 +977,8 @@ static void bridge_PsCreateSystemThreadEx(void)
             if (is_first_call) {
                 /* Main game thread: run directly, inheriting register state */
                 xbox_log_thread_role("guest-main", start_routine);
+                bridge_assign_thread_id(BRIDGE_MEM32(g_fs_base + 0x28),
+                                        thread_id_ptr);
                 /* Its TLS too: the stack is already in use, so the block
                  * comes from the heap, and the main TIB's fs:[0x28] object
                  * gets the TlsData pointer (see bridge_layout_tls). */
@@ -1013,7 +1051,8 @@ static void bridge_PsCreateSystemThreadEx(void)
                 } else {
                     bridge_spawn_guest_thread(fn, start_context1, start_context2,
                                               stack_top, start_routine,
-                                              xbox_handle_ptr, tls_size);
+                                              xbox_handle_ptr, tls_size,
+                                              thread_id_ptr);
                     fprintf(stderr, "  [KERNEL] PsCreateSystemThreadEx: spawned "
                             "worker 0x%08X (ctx=0x%08X, stack top 0x%08X)\n",
                             start_routine, start_context1, stack_top);
@@ -9372,6 +9411,7 @@ static void bridge_ObReferenceObjectByPointer(void)
 static void bridge_PsCreateSystemThread(void)
 {
     uint32_t xbox_handle_ptr = STACK_ARG(0);
+    uint32_t thread_id_ptr   = STACK_ARG(3);
     uint32_t start_context1  = STACK_ARG(4);
     uint32_t start_context2  = STACK_ARG(5);
     uint32_t start_routine   = STACK_ARG(6);
@@ -9391,6 +9431,8 @@ static void bridge_PsCreateSystemThread(void)
         if (fn) {
             if (is_first_call) {
                 xbox_log_thread_role("guest-main", start_routine);
+                bridge_assign_thread_id(BRIDGE_MEM32(g_fs_base + 0x28),
+                                        thread_id_ptr);
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context2;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = start_context1;
                 g_esp -= 4; BRIDGE_MEM32(g_esp) = 0;
@@ -9415,7 +9457,8 @@ static void bridge_PsCreateSystemThread(void)
                 } else {
                     bridge_spawn_guest_thread(fn, start_context1, start_context2,
                                               stack_top, start_routine,
-                                              xbox_handle_ptr, 0);
+                                              xbox_handle_ptr, 0,
+                                              thread_id_ptr);
                 }
             }
         } else {

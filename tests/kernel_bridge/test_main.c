@@ -13,6 +13,9 @@
  * the dispatcher. tests/kernel_directory uses the same seam for the directory
  * ABI; this one covers kernel memory ordinals.
  *
+ * Ordinal 255 must also write a non-zero id through its ThreadId argument;
+ * tests/kernel_thread_ids checks ids on real worker threads.
+ *
  * Checked here with ordinal 173, MmGetPhysicalAddress, which had two
  * implementations that disagreed -- the bridge translating through the
  * contiguous window and xbox_MmGetPhysicalAddress returning its argument
@@ -180,10 +183,15 @@ int main(void)
         memset(sp, 0, 11 * 4);
         sp[0] = 0xBEEF0003u;          /* guest return address */
         sp[1] = 0x40000u;             /* ThreadHandle out */
+        sp[5] = 0x40100u;             /* ThreadId out (arg 4) */
         sp[10] = MAIN_VA;             /* StartRoutine (arg 9) */
+        *(uint32_t *)(mem + 0x40100u) = 0;
         g_esp = STACK_VA;
         fn();
         check(s_main_ran, "ordinal 255's first call ran the main routine inline", NULL);
+        check(*(uint32_t *)(mem + 0x40100u) != 0,
+              "ordinal 255 writes the main thread's id (non-zero)",
+              "ThreadId was left 0");
         check(s_main_held == 1, "the main routine held the guest CPU", NULL);
         check(xbox_GuestCpuHeld() == 1, "the caller holds it again after the call", NULL);
     }
