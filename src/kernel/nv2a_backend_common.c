@@ -429,6 +429,12 @@ void nv2a_vp_consts_fill(const struct nv2a_pb_vsh *v, uint32_t surface_format,
     }
     o->u[4] = v->spec_enable ? 1u : 0u;
     o->u[5] = (v->light_ctl >> 17) & 1u;
+    /* Depth test off: no far-plane clip (see the vertex program epilogue).
+     * Test Drive: Eve of Destruction's 2D passes write z = 2^24 - 1 on a
+     * Z16 surface (zmax 65535) with the depth test off; the NV2A draws
+     * them, a far clip at zmax dropped every one and its Metal frames were
+     * black. */
+    o->u[6] = v->depth_enable ? 0u : 1u;
 }
 
 void nv2a_report_write(uint8_t *mem, uint32_t va, uint32_t count)
