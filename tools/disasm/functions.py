@@ -387,12 +387,7 @@ class FunctionDetector:
             i = bisect.bisect_right(starts, addr) - 1
             return not (i >= 0 and addr < bounds[i][1])
 
-        # A switch arm is code of the function that dispatches to it, and
-        # MSVC's memcpy keeps arms straight after a table. A start there
-        # clamps the function it belongs to, so arms are never followers.
-        arms = set()
-        for tbl in self.engine.jump_tables:
-            arms.update(self.engine.jump_table_entries(tbl))
+        arms = self._switch_arms()
 
         found = 0
         for tbl, end in sorted(self.engine.jump_tables.items()):
@@ -432,6 +427,19 @@ class FunctionDetector:
         if found:
             print(f"  {found} function(s) found right after a switch table")
         return found > 0
+
+    def _switch_arms(self) -> Set[int]:
+        """Every code address a known jump table points at.
+
+        A switch arm is code of the function that dispatches to it, and
+        MSVC's memcpy keeps arms straight after a table. A start there clamps
+        the function it belongs to, so neither the follower pass nor the gap
+        sweep starts one on an arm.
+        """
+        arms = set()
+        for tbl in self.engine.jump_tables:
+            arms.update(self.engine.jump_table_entries(tbl))
+        return arms
 
     def _pass_gap_prologues(self, sections: List[SectionInfo]) -> bool:
         """A function that starts right after a ret, with no padding between.
@@ -487,6 +495,12 @@ class FunctionDetector:
             i = bisect.bisect_right(covered_starts, addr) - 1
             return not (i >= 0 and addr < covered[i][1])
 
+        # SSX 3's memcpy ends a copy arm with a ret, pads, and starts the
+        # next arm (0x00213BF0) on a 16-byte boundary, where it probes as a
+        # closed body. Split off there, its own arm became a function and
+        # the next one (0x00213C04) belonged to nothing: the switch jumped to
+        # an unresolved address mid-copy and the run crashed.
+        arms = self._switch_arms()
         added = False
         for insn in list(self.engine.instructions.values()):
             if not insn.is_ret:
@@ -500,7 +514,7 @@ class FunctionDetector:
                     continue
                 nxt, past_padding = padded, True
             if (nxt in self._candidates or nxt in self.functions
-                    or nxt in self._alias_entries):
+                    or nxt in self._alias_entries or nxt in arms):
                 continue
             section = self.image.get_section_at_va(nxt)
             if section is None or not section.executable:
