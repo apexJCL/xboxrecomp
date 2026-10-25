@@ -5271,6 +5271,9 @@ static int g_thread_stacks_used = 0;
  * The new block is a copy of the template the loader built, so a thread starts
  * with the image's initialised thread-local data rather than zeros, and its
  * own per-thread structure behind slot 0.
+ * An image without TLS still gets the TIB, for the SEH chain and the thread
+ * object at fs:[0x28]: workers sharing the main TIB all read the main
+ * thread's id (tests/kernel_thread_ids).
  */
 uint32_t xbox_AllocThreadTib(void)
 {
@@ -5279,8 +5282,19 @@ uint32_t xbox_AllocThreadTib(void)
     const uint32_t tib_size = 0x40;
     uint32_t tib, block, thread_data, total;
 
-    if (!g_tls_total)
-        return 0;                    /* image has no TLS; nothing to copy */
+    /* No TLS to copy, but a TIB of its own all the same: the SEH chain and
+     * fs:[0x28], the thread object GetCurrentThreadId reads the id from, are
+     * per-thread whatever the image has. fs:[4] keeps the main thread's
+     * (there is no TLS block to point it at). */
+    if (!g_tls_total) {
+        tib = xbox_HeapAlloc(tib_size, 16);
+        if (!tib)
+            return 0;
+        memcpy(TIB_VA(tib), TIB_VA(XBOX_TIB_MAIN), tib_size);
+        *(uint32_t *)TIB_VA(tib + 0x00) = 0xFFFFFFFFu;   /* own SEH chain */
+        *(uint32_t *)TIB_VA(tib + 0x18) = tib;           /* NtTib.Self    */
+        return tib;
+    }
 
     total = g_tls_total;
     tib = xbox_HeapAlloc(tib_size + total + g_tls_thread_size, 16);
@@ -5298,6 +5312,9 @@ uint32_t xbox_AllocThreadTib(void)
     *(uint32_t *)TIB_VA(tib + 0x00) = 0xFFFFFFFFu;   /* own SEH chain    */
     *(uint32_t *)TIB_VA(block)      = thread_data;   /* slot 0           */
     *(uint32_t *)TIB_VA(tib + 0x04) = block + total; /* fs:[4], see above*/
+    /* NtTib.Self: code that reaches the TIB through fs:[0x18] must find this
+     * thread's, not the main thread's SEH head and thread object. */
+    *(uint32_t *)TIB_VA(tib + 0x18) = tib;
 
     return tib;
     #undef TIB_VA
