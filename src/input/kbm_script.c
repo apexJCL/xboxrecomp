@@ -2,11 +2,11 @@
  * kbm_script: key and mouse events injected on the pad poll, for tests that
  * have no one at the keyboard. RECOMP_DEBUG=kbm_script=<file>.
  *
- *   2.0   key down Return      # seconds since the first poll
- *   2.2   key up Return
+ *   2.0   key down enter       # seconds since the first poll
+ *   2.2   key up enter
  *   40p   key down W           # polls since the first poll (that one is 0p)
  *   5.0   mouse move 20 -5     # counts, applied as one poll's motion
- *   5.1   mouse down MouseLeft
+ *   5.1   mouse down mouse1
  *   6.0   wheel 1
  *
  * The events go into the same tables the windows write (xbox_InputKeyEvent,

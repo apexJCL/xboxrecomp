@@ -112,7 +112,8 @@ static void test_keycodes(void)
         { SDLK_MINUS, 0xBD }, { SDLK_PERIOD, 0xBE }, { SDLK_SLASH, 0xBF },
         { SDLK_GRAVE, 0xC0 }, { SDLK_LEFTBRACKET, 0xDB }, { SDLK_BACKSLASH, 0xDC },
         { SDLK_RIGHTBRACKET, 0xDD }, { SDLK_APOSTROPHE, 0xDE },
-        { SDLK_LGUI, 0 }, { SDLK_RGUI, 0 }, { SDLK_CAPSLOCK, 0 }, { SDLK_PRINTSCREEN, 0 },
+        { SDLK_PAUSE, 0x13 }, { SDLK_CAPSLOCK, 0x14 },
+        { SDLK_LGUI, 0 }, { SDLK_RGUI, 0 }, { SDLK_PRINTSCREEN, 0 },
     };
     /* The sided codes of the event path (input_names.h). */
     static const struct { SDL_Keycode sym; int code; } sided[] = {
@@ -127,10 +128,10 @@ static void test_keycodes(void)
     /* Every key the binding vocabulary names is reachable from SDL. */
     {
         const char *name;
-        int code, mouse, alias;
-        for (int i = 0; xbox_InputNameAt(i, &name, &code, &mouse, &alias); i++) {
+        int code, mouse;
+        for (int i = 0; xbox_InputNameAt(i, &name, &code, &mouse); i++) {
             int hit = 0;
-            if (mouse || alias)
+            if (mouse)
                 continue;
             for (int sym = 0; sym < 128 && !hit; sym++)
                 hit = xbox_InputSdlKeyToCode(sym) == code;
@@ -191,7 +192,7 @@ static void test_events(void)
     CHECK(held_count() == 0, "Shift+W released");
 
     /* The sides: either Shift holds Shift until both are up; keypad Enter
-     * holds Return as Win32 reports it, and KPEnter by its own name. */
+     * holds Return as Win32 reports it, and numpadenter by its own name. */
     key(SDL_EVENT_KEY_DOWN, SDLK_LSHIFT, 0, 0);
     key(SDL_EVENT_KEY_DOWN, SDLK_RSHIFT, 0, 0);
     key(SDL_EVENT_KEY_UP, SDLK_LSHIFT, 0, 0);
@@ -200,12 +201,12 @@ static void test_events(void)
     key(SDL_EVENT_KEY_UP, SDLK_RSHIFT, 0, 0);
     CHECK(held_count() == 0, "both Shifts up");
     key(SDL_EVENT_KEY_DOWN, SDLK_KP_ENTER, 0, 0);
-    CHECK(xbox_FramebufferKeyDown(0x0D) && xbox_FramebufferKeyDown(0x0E), "KPEnter");
+    CHECK(xbox_FramebufferKeyDown(0x0D) && xbox_FramebufferKeyDown(0x0E), "numpadenter");
     key(SDL_EVENT_KEY_DOWN, SDLK_RETURN, 0, 0);
     key(SDL_EVENT_KEY_UP, SDLK_KP_ENTER, 0, 0);
-    CHECK(xbox_FramebufferKeyDown(0x0D), "Return still held after KPEnter up");
+    CHECK(xbox_FramebufferKeyDown(0x0D), "Return still held after numpadenter up");
     key(SDL_EVENT_KEY_UP, SDLK_RETURN, 0, 0);
-    CHECK(held_count() == 0, "Return and KPEnter up");
+    CHECK(held_count() == 0, "Return and numpadenter up");
     key(SDL_EVENT_KEY_DOWN, SDLK_LALT, 0, 0);
     CHECK(xbox_FramebufferKeyDown(0x12) && xbox_FramebufferKeyDown(0xA4), "LAlt");
     key(SDL_EVENT_KEY_UP, SDLK_LALT, 0, 0);
@@ -223,7 +224,7 @@ static void test_events(void)
     CHECK(!xbox_FramebufferKeyDown('D'), "key-up with Cmd held not applied");
 
     /* Unmapped keys do nothing. */
-    key(SDL_EVENT_KEY_DOWN, SDLK_CAPSLOCK, 0, 0);
+    key(SDL_EVENT_KEY_DOWN, SDLK_SCROLLLOCK, 0, 0);
     key(SDL_EVENT_KEY_DOWN, SDLK_PRINTSCREEN, 0, 0);
     CHECK(held_count() == 0, "unmapped key held");
 

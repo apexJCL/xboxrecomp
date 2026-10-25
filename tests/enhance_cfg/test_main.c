@@ -1485,8 +1485,8 @@ static void test_input(void)
         "mouse = true\n"
         "[input.bindings]\n"
         "a = \"Space\"\n"
-        "start = [\"Return\", \"Escape\"]\n"
-        "b = \"MouseLeft\"\n";
+        "start = [\"Enter\", \"Escape\"]\n"
+        "b = \"mouse1\"\n";
     char want[4400];
     const char *out;
     xbox_mouse_opts mo;
@@ -1497,9 +1497,9 @@ static void test_input(void)
 
     /* The defaults file alone. */
     out = input_load(defaults, NULL);
-    CHECK(!strcmp(bound(XBOX_CTL_A), "Space"));
-    CHECK(!strcmp(bound(XBOX_CTL_START), "Return,Escape"));
-    CHECK(!strcmp(bound(XBOX_CTL_B), "MouseLeft"));
+    CHECK(!strcmp(bound(INPUT_A), "space"));
+    CHECK(!strcmp(bound(INPUT_START), "enter,escape"));
+    CHECK(!strcmp(bound(INPUT_B), "mouse1"));
     CHECK(xbox_InputKeyboardOn() && xbox_InputMouseOn());
     CHECK(enhance_cfg_source_of("input.keyboard") == ENHANCE_SRC_DEFAULTS);
     snprintf(want, sizeof want, "[INPUT] config: keyboard=on mouse=on look=right_stick"
@@ -1519,26 +1519,26 @@ static void test_input(void)
 
     /* The player's a replaces the defaults' whole. */
     out = input_load(defaults, "[input.bindings]\na = \"J\"\n");
-    CHECK(!strcmp(bound(XBOX_CTL_A), "J"));
-    CHECK(!strcmp(bound(XBOX_CTL_START), "Return,Escape"));
+    CHECK(!strcmp(bound(INPUT_A), "J"));
+    CHECK(!strcmp(bound(INPUT_START), "enter,escape"));
     CHECK(strstr(out, " bindings=2 (") != NULL);
     CHECK(strstr(out, " +1 (ecfg_in/user.toml)\n") != NULL);
 
     /* A key the player binds elsewhere leaves the inherited control. */
     out = input_load(defaults, "[input.bindings]\nback = \"Escape\"\n");
-    CHECK(!strcmp(bound(XBOX_CTL_BACK), "Escape"));
-    CHECK(!strcmp(bound(XBOX_CTL_START), "Return"));
-    CHECK(!strcmp(bound(XBOX_CTL_A), "Space"));
+    CHECK(!strcmp(bound(INPUT_BACK), "escape"));
+    CHECK(!strcmp(bound(INPUT_START), "enter"));
+    CHECK(!strcmp(bound(INPUT_A), "space"));
 
     /* [] unbinds; a control no file names keeps the compiled-in default. */
     out = input_load(defaults, "[input.bindings]\na = []\n");
-    CHECK(!strcmp(bound(XBOX_CTL_A), ""));
+    CHECK(!strcmp(bound(INPUT_A), ""));
     {
         char compiled[256];
         xbox_InputBindingsReset();
-        snprintf(compiled, sizeof compiled, "%s", bound(XBOX_CTL_Y));
+        snprintf(compiled, sizeof compiled, "%s", bound(INPUT_Y));
         input_load(defaults, NULL);
-        CHECK(!strcmp(bound(XBOX_CTL_Y), compiled) && compiled[0]);
+        CHECK(!strcmp(bound(INPUT_Y), compiled) && compiled[0]);
     }
 
     /* A control left on the compiled-in default still loses a key the
@@ -1548,15 +1548,15 @@ static void test_input(void)
         char compiled[256], key[64], user[128];
         const char *comma;
         xbox_InputBindingsReset();
-        snprintf(compiled, sizeof compiled, "%s", bound(XBOX_CTL_A));
+        snprintf(compiled, sizeof compiled, "%s", bound(INPUT_A));
         CHECK(compiled[0] != 0);
         comma = strchr(compiled, ',');
         snprintf(key, sizeof key, "%.*s",
                  (int)(comma ? (size_t)(comma - compiled) : strlen(compiled)), compiled);
         snprintf(user, sizeof user, "[input.bindings]\nb = \"%s\"\n", key);
         input_load(NULL, user);
-        CHECK(!strcmp(bound(XBOX_CTL_B), key));
-        CHECK(!strcmp(bound(XBOX_CTL_A), comma ? comma + 1 : ""));
+        CHECK(!strcmp(bound(INPUT_B), key));
+        CHECK(!strcmp(bound(INPUT_A), comma ? comma + 1 : ""));
     }
 
     /* The release key and the walk key bound to a control get a warning. */
@@ -1565,7 +1565,7 @@ static void test_input(void)
                      "x = \"LAlt\"\n");
     CHECK(strstr(out, "[INPUT] config warning: input.mouse_release_key 'F9' is also"
                  " bound to input.bindings.y\n") != NULL);
-    CHECK(strstr(out, "[INPUT] config warning: input.walk_key 'LAlt' is also"
+    CHECK(strstr(out, "[INPUT] config warning: input.walk_key 'lalt' is also"
                  " bound to input.bindings.x\n") != NULL);
     /* The code default is no walk key (the legacy keyboard): LAlt is free. */
     out = input_load(defaults, "[input.bindings]\nx = \"LAlt\"\n");
@@ -1614,8 +1614,8 @@ static void test_input(void)
     out = input_load(defaults, "[input.bindings]\nx = \"J\"\ny = \"J\"\n");
     CHECK(strstr(out, "[INPUT] config error: ecfg_in/user.toml:3: 'J' already bound to"
                  " input.bindings.x on line 2; ignored here\n") != NULL);
-    CHECK(!strcmp(bound(XBOX_CTL_X), "J"));
-    CHECK(!strcmp(bound(XBOX_CTL_Y), ""));
+    CHECK(!strcmp(bound(INPUT_X), "J"));
+    CHECK(!strcmp(bound(INPUT_Y), ""));
 
     /* Each mistake its line, and the rest of the file applied. */
     out = input_load(defaults,
@@ -1639,9 +1639,10 @@ static void test_input(void)
     CHECK(strstr(out, "[INPUT] config error: ecfg_in/user.toml:5: input.stick_ramp_ms should be"
                  " an integer (got string); using the default\n") != NULL);
     CHECK(strstr(out, "[INPUT] config error: ecfg_in/user.toml:7: unknown control 'jmp' under"
-                 " [input.bindings] (controls: a b x y white black ltrigger rtrigger start back"
-                 " lthumb rthumb dpad_up dpad_down dpad_left dpad_right lstick_up lstick_down"
-                 " lstick_left lstick_right rstick_up rstick_down rstick_left rstick_right);"
+                 " [input.bindings] (controls: dpad_up dpad_down dpad_left dpad_right start back"
+                 " left_thumb right_thumb a b x y black white left_trigger right_trigger"
+                 " left_stick_up left_stick_down left_stick_left left_stick_right"
+                 " right_stick_up right_stick_down right_stick_left right_stick_right);"
                  " ignored\n") != NULL);
     CHECK(strstr(out, "[INPUT] config error: ecfg_in/user.toml:8: unknown input 'Spacebar' in"
                  " input.bindings.x (see docs/input.md); skipped\n") != NULL);
@@ -1650,10 +1651,10 @@ static void test_input(void)
     CHECK(strstr(out, "[INPUT] config error: ecfg_in/user.toml:10: input.bindings.white 'F10' is"
                  " menu.open's default ([input.actions]); bound anyway\n") != NULL);
     CHECK(strstr(out, "[ENHANCE] ecfg_in") == NULL);     /* [INPUT] lines only */
-    CHECK(!strcmp(bound(XBOX_CTL_X), "K"));
-    CHECK(!strcmp(bound(XBOX_CTL_A), "Space"));            /* the defaults' */
-    CHECK(!strcmp(bound(XBOX_CTL_WHITE), "F10"));
-    CHECK(!strcmp(bound(XBOX_CTL_Y), "Q"));
+    CHECK(!strcmp(bound(INPUT_X), "K"));
+    CHECK(!strcmp(bound(INPUT_A), "space"));            /* the defaults' */
+    CHECK(!strcmp(bound(INPUT_WHITE), "F10"));
+    CHECK(!strcmp(bound(INPUT_Y), "Q"));
     xbox_InputMouseGetOpts(&mo);
     CHECK(mo.sensitivity == 1.0 && mo.look == XBOX_MOUSE_LOOK_RIGHT);
 
@@ -1678,9 +1679,9 @@ static void test_input(void)
     CHECK(!xbox_InputKeyboardOn() && !xbox_InputMouseOn());
     {
         char now[256];
-        snprintf(now, sizeof now, "%s", bound(XBOX_CTL_START));
+        snprintf(now, sizeof now, "%s", bound(INPUT_START));
         xbox_InputBindingsReset();
-        CHECK(!strcmp(now, bound(XBOX_CTL_START)));
+        CHECK(!strcmp(now, bound(INPUT_START)));
     }
 
     remove_defaults();

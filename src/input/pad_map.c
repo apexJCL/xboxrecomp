@@ -4,6 +4,7 @@
  * alone on every host.
  */
 #include "pad_map.h"
+#include "input_map.h"
 #include "recomp_env.h"
 
 #include <math.h>
@@ -15,28 +16,30 @@
     { host, kind, guest, xi, sdl, 0, gname, val }
 
 /* The order is the README's and the one tests/pad_map and the Proton
- * check (scripts/vpad.py seq) walk. */
+ * check (scripts/vpad.py seq) walk. The host names are upstream's pad
+ * sources (xbox_InputMap_SourceName), positional as SDL's are: south is the
+ * bottom face button, an Xbox A. */
 const xbox_pad_map_row xbox_pad_map[] = {
-    ROW_BTN("A",                XBOX_MAP_ANALOG,  XBOX_BUTTON_A,     XBOX_XI_A,     XBOX_SDL_BUTTON_A,     "bAnalogButtons[A]",     "255 held, 0 released"),
-    ROW_BTN("B",                XBOX_MAP_ANALOG,  XBOX_BUTTON_B,     XBOX_XI_B,     XBOX_SDL_BUTTON_B,     "bAnalogButtons[B]",     "255 held, 0 released"),
-    ROW_BTN("X",                XBOX_MAP_ANALOG,  XBOX_BUTTON_X,     XBOX_XI_X,     XBOX_SDL_BUTTON_X,     "bAnalogButtons[X]",     "255 held, 0 released"),
-    ROW_BTN("Y",                XBOX_MAP_ANALOG,  XBOX_BUTTON_Y,     XBOX_XI_Y,     XBOX_SDL_BUTTON_Y,     "bAnalogButtons[Y]",     "255 held, 0 released"),
-    ROW_BTN("Left shoulder (LB)",  XBOX_MAP_ANALOG, XBOX_BUTTON_WHITE, XBOX_XI_LEFT_SHOULDER,  XBOX_SDL_BUTTON_LEFTSHOULDER,  "bAnalogButtons[WHITE]", "255 held, 0 released"),
-    ROW_BTN("Right shoulder (RB)", XBOX_MAP_ANALOG, XBOX_BUTTON_BLACK, XBOX_XI_RIGHT_SHOULDER, XBOX_SDL_BUTTON_RIGHTSHOULDER, "bAnalogButtons[BLACK]", "255 held, 0 released"),
-    ROW_BTN("Start / Menu",     XBOX_MAP_DIGITAL, XBOX_GAMEPAD_START,      XBOX_XI_START,      XBOX_SDL_BUTTON_START,      "wButtons START",       "bit set while held"),
-    ROW_BTN("Back / View",      XBOX_MAP_DIGITAL, XBOX_GAMEPAD_BACK,       XBOX_XI_BACK,       XBOX_SDL_BUTTON_BACK,       "wButtons BACK",        "bit set while held"),
-    ROW_BTN("Left stick click", XBOX_MAP_DIGITAL, XBOX_GAMEPAD_LEFT_THUMB, XBOX_XI_LEFT_THUMB, XBOX_SDL_BUTTON_LEFTSTICK,  "wButtons LEFT_THUMB",  "bit set while held"),
-    ROW_BTN("Right stick click",XBOX_MAP_DIGITAL, XBOX_GAMEPAD_RIGHT_THUMB,XBOX_XI_RIGHT_THUMB,XBOX_SDL_BUTTON_RIGHTSTICK, "wButtons RIGHT_THUMB", "bit set while held"),
-    ROW_BTN("D-pad up",         XBOX_MAP_DIGITAL, XBOX_GAMEPAD_DPAD_UP,    XBOX_XI_DPAD_UP,    XBOX_SDL_BUTTON_DPAD_UP,    "wButtons DPAD_UP",     "bit set while held"),
-    ROW_BTN("D-pad down",       XBOX_MAP_DIGITAL, XBOX_GAMEPAD_DPAD_DOWN,  XBOX_XI_DPAD_DOWN,  XBOX_SDL_BUTTON_DPAD_DOWN,  "wButtons DPAD_DOWN",   "bit set while held"),
-    ROW_BTN("D-pad left",       XBOX_MAP_DIGITAL, XBOX_GAMEPAD_DPAD_LEFT,  XBOX_XI_DPAD_LEFT,  XBOX_SDL_BUTTON_DPAD_LEFT,  "wButtons DPAD_LEFT",   "bit set while held"),
-    ROW_BTN("D-pad right",      XBOX_MAP_DIGITAL, XBOX_GAMEPAD_DPAD_RIGHT, XBOX_XI_DPAD_RIGHT, XBOX_SDL_BUTTON_DPAD_RIGHT, "wButtons DPAD_RIGHT",  "bit set while held"),
-    ROW_BTN("Left trigger",     XBOX_MAP_TRIGGER, XBOX_BUTTON_LTRIGGER, XBOX_XI_SRC_LT, XBOX_SDL_AXIS_TRIGGERLEFT,  "bAnalogButtons[LTRIGGER]", "0..255"),
-    ROW_BTN("Right trigger",    XBOX_MAP_TRIGGER, XBOX_BUTTON_RTRIGGER, XBOX_XI_SRC_RT, XBOX_SDL_AXIS_TRIGGERRIGHT, "bAnalogButtons[RTRIGGER]", "0..255"),
-    { "Left stick X",  XBOX_MAP_STICK, 0, XBOX_XI_SRC_LX, XBOX_SDL_AXIS_LEFTX,  0, "sThumbLX", "-32768..32767, right positive" },
-    { "Left stick Y",  XBOX_MAP_STICK, 1, XBOX_XI_SRC_LY, XBOX_SDL_AXIS_LEFTY,  1, "sThumbLY", "-32768..32767, up positive" },
-    { "Right stick X", XBOX_MAP_STICK, 2, XBOX_XI_SRC_RX, XBOX_SDL_AXIS_RIGHTX, 0, "sThumbRX", "-32768..32767, right positive" },
-    { "Right stick Y", XBOX_MAP_STICK, 3, XBOX_XI_SRC_RY, XBOX_SDL_AXIS_RIGHTY, 1, "sThumbRY", "-32768..32767, up positive" },
+    ROW_BTN("south",            XBOX_MAP_ANALOG,  XBOX_BUTTON_A,     XBOX_XI_A,     XBOX_SDL_BUTTON_A,     "bAnalogButtons[A]",     "255 held, 0 released"),
+    ROW_BTN("east",             XBOX_MAP_ANALOG,  XBOX_BUTTON_B,     XBOX_XI_B,     XBOX_SDL_BUTTON_B,     "bAnalogButtons[B]",     "255 held, 0 released"),
+    ROW_BTN("west",             XBOX_MAP_ANALOG,  XBOX_BUTTON_X,     XBOX_XI_X,     XBOX_SDL_BUTTON_X,     "bAnalogButtons[X]",     "255 held, 0 released"),
+    ROW_BTN("north",            XBOX_MAP_ANALOG,  XBOX_BUTTON_Y,     XBOX_XI_Y,     XBOX_SDL_BUTTON_Y,     "bAnalogButtons[Y]",     "255 held, 0 released"),
+    ROW_BTN("left_shoulder",    XBOX_MAP_ANALOG,  XBOX_BUTTON_WHITE, XBOX_XI_LEFT_SHOULDER,  XBOX_SDL_BUTTON_LEFTSHOULDER,  "bAnalogButtons[WHITE]", "255 held, 0 released"),
+    ROW_BTN("right_shoulder",   XBOX_MAP_ANALOG,  XBOX_BUTTON_BLACK, XBOX_XI_RIGHT_SHOULDER, XBOX_SDL_BUTTON_RIGHTSHOULDER, "bAnalogButtons[BLACK]", "255 held, 0 released"),
+    ROW_BTN("start",            XBOX_MAP_DIGITAL, XBOX_GAMEPAD_START,      XBOX_XI_START,      XBOX_SDL_BUTTON_START,      "wButtons START",       "bit set while held"),
+    ROW_BTN("back",             XBOX_MAP_DIGITAL, XBOX_GAMEPAD_BACK,       XBOX_XI_BACK,       XBOX_SDL_BUTTON_BACK,       "wButtons BACK",        "bit set while held"),
+    ROW_BTN("left_stick_click", XBOX_MAP_DIGITAL, XBOX_GAMEPAD_LEFT_THUMB, XBOX_XI_LEFT_THUMB, XBOX_SDL_BUTTON_LEFTSTICK,  "wButtons LEFT_THUMB",  "bit set while held"),
+    ROW_BTN("right_stick_click",XBOX_MAP_DIGITAL, XBOX_GAMEPAD_RIGHT_THUMB,XBOX_XI_RIGHT_THUMB,XBOX_SDL_BUTTON_RIGHTSTICK, "wButtons RIGHT_THUMB", "bit set while held"),
+    ROW_BTN("dpad_up",          XBOX_MAP_DIGITAL, XBOX_GAMEPAD_DPAD_UP,    XBOX_XI_DPAD_UP,    XBOX_SDL_BUTTON_DPAD_UP,    "wButtons DPAD_UP",     "bit set while held"),
+    ROW_BTN("dpad_down",        XBOX_MAP_DIGITAL, XBOX_GAMEPAD_DPAD_DOWN,  XBOX_XI_DPAD_DOWN,  XBOX_SDL_BUTTON_DPAD_DOWN,  "wButtons DPAD_DOWN",   "bit set while held"),
+    ROW_BTN("dpad_left",        XBOX_MAP_DIGITAL, XBOX_GAMEPAD_DPAD_LEFT,  XBOX_XI_DPAD_LEFT,  XBOX_SDL_BUTTON_DPAD_LEFT,  "wButtons DPAD_LEFT",   "bit set while held"),
+    ROW_BTN("dpad_right",       XBOX_MAP_DIGITAL, XBOX_GAMEPAD_DPAD_RIGHT, XBOX_XI_DPAD_RIGHT, XBOX_SDL_BUTTON_DPAD_RIGHT, "wButtons DPAD_RIGHT",  "bit set while held"),
+    ROW_BTN("left_trigger",     XBOX_MAP_TRIGGER, XBOX_BUTTON_LTRIGGER, XBOX_XI_SRC_LT, XBOX_SDL_AXIS_TRIGGERLEFT,  "bAnalogButtons[LTRIGGER]", "0..255"),
+    ROW_BTN("right_trigger",    XBOX_MAP_TRIGGER, XBOX_BUTTON_RTRIGGER, XBOX_XI_SRC_RT, XBOX_SDL_AXIS_TRIGGERRIGHT, "bAnalogButtons[RTRIGGER]", "0..255"),
+    { "left_stick_left / left_stick_right",   XBOX_MAP_STICK, 0, XBOX_XI_SRC_LX, XBOX_SDL_AXIS_LEFTX,  0, "sThumbLX", "-32768..32767, right positive" },
+    { "left_stick_down / left_stick_up",      XBOX_MAP_STICK, 1, XBOX_XI_SRC_LY, XBOX_SDL_AXIS_LEFTY,  1, "sThumbLY", "-32768..32767, up positive" },
+    { "right_stick_left / right_stick_right", XBOX_MAP_STICK, 2, XBOX_XI_SRC_RX, XBOX_SDL_AXIS_RIGHTX, 0, "sThumbRX", "-32768..32767, right positive" },
+    { "right_stick_down / right_stick_up",    XBOX_MAP_STICK, 3, XBOX_XI_SRC_RY, XBOX_SDL_AXIS_RIGHTY, 1, "sThumbRY", "-32768..32767, up positive" },
 };
 const size_t xbox_pad_map_count = sizeof xbox_pad_map / sizeof xbox_pad_map[0];
 
@@ -198,18 +201,50 @@ static const char *sdl_name(const xbox_pad_map_row *r)
     return r->sdl < XBOX_SDL_BUTTON_COUNT ? btn[r->sdl] : "?";
 }
 
+/* The [input.bindings] control a row drives, in upstream's names: the
+ * wButtons bits are InputControl's first eight in bit order and the analog
+ * buttons follow from INPUT_A in the XBOX_BUTTON_* order. */
+static const char *control_name(const xbox_pad_map_row *r, char *buf, size_t size)
+{
+    static const int stick[4][2] = {
+        { INPUT_LSTICK_LEFT, INPUT_LSTICK_RIGHT }, { INPUT_LSTICK_DOWN, INPUT_LSTICK_UP },
+        { INPUT_RSTICK_LEFT, INPUT_RSTICK_RIGHT }, { INPUT_RSTICK_DOWN, INPUT_RSTICK_UP },
+    };
+    int c = -1;
+    switch (r->kind) {
+    case XBOX_MAP_DIGITAL:
+        for (int b = 0; b < 8; b++)
+            if (r->guest == 1u << b) c = INPUT_DPAD_UP + b;
+        break;
+    case XBOX_MAP_ANALOG:
+    case XBOX_MAP_TRIGGER:
+        c = INPUT_A + r->guest;
+        break;
+    default:
+        if (r->guest < 4) {
+            snprintf(buf, size, "`%s` / `%s`", xbox_InputMap_ControlName(stick[r->guest][0]),
+                     xbox_InputMap_ControlName(stick[r->guest][1]));
+            return buf;
+        }
+    }
+    snprintf(buf, size, "`%s`", c >= 0 && xbox_InputMap_ControlName(c)
+             ? xbox_InputMap_ControlName(c) : "?");
+    return buf;
+}
+
 size_t xbox_PadMapReadmeRow(size_t i, char *buf, size_t size)
 {
     int n;
+    char ctl[64];
     if (i == 0)
-        n = snprintf(buf, size, "| Host control | Guest field | Guest value | XInput | SDL3 |");
+        n = snprintf(buf, size, "| Host control | Control | Guest field | Guest value | XInput | SDL3 |");
     else if (i == 1)
-        n = snprintf(buf, size, "|---|---|---|---|---|");
+        n = snprintf(buf, size, "|---|---|---|---|---|---|");
     else if (i - 2 < xbox_pad_map_count) {
         const xbox_pad_map_row *r = &xbox_pad_map[i - 2];
-        n = snprintf(buf, size, "| %s | `%s` | %s | `%s` | `%s`%s |",
-                     r->host, r->guest_name, r->value, xinput_name(r),
-                     sdl_name(r), r->sdl_invert ? " as `-1 - v`" : "");
+        n = snprintf(buf, size, "| `%s` | %s | `%s` | %s | `%s` | `%s`%s |",
+                     r->host, control_name(r, ctl, sizeof ctl), r->guest_name, r->value,
+                     xinput_name(r), sdl_name(r), r->sdl_invert ? " as `-1 - v`" : "");
     } else
         return 0;
     return n < 0 ? 0 : (size_t)n;

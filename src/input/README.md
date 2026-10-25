@@ -153,28 +153,28 @@ and fails if the table below and the code disagree. Regenerate it with
   labels (Nintendo's swapped A/B, say) maps by place, not by letter.
 
 <!-- pad_map:begin (generated from src/input/pad_map.c; tests/pad_map checks it) -->
-| Host control | Guest field | Guest value | XInput | SDL3 |
-|---|---|---|---|---|
-| A | `bAnalogButtons[A]` | 255 held, 0 released | `A` | `SOUTH` |
-| B | `bAnalogButtons[B]` | 255 held, 0 released | `B` | `EAST` |
-| X | `bAnalogButtons[X]` | 255 held, 0 released | `X` | `WEST` |
-| Y | `bAnalogButtons[Y]` | 255 held, 0 released | `Y` | `NORTH` |
-| Left shoulder (LB) | `bAnalogButtons[WHITE]` | 255 held, 0 released | `LEFT_SHOULDER` | `LEFT_SHOULDER` |
-| Right shoulder (RB) | `bAnalogButtons[BLACK]` | 255 held, 0 released | `RIGHT_SHOULDER` | `RIGHT_SHOULDER` |
-| Start / Menu | `wButtons START` | bit set while held | `START` | `START` |
-| Back / View | `wButtons BACK` | bit set while held | `BACK` | `BACK` |
-| Left stick click | `wButtons LEFT_THUMB` | bit set while held | `LEFT_THUMB` | `LEFT_STICK` |
-| Right stick click | `wButtons RIGHT_THUMB` | bit set while held | `RIGHT_THUMB` | `RIGHT_STICK` |
-| D-pad up | `wButtons DPAD_UP` | bit set while held | `DPAD_UP` | `DPAD_UP` |
-| D-pad down | `wButtons DPAD_DOWN` | bit set while held | `DPAD_DOWN` | `DPAD_DOWN` |
-| D-pad left | `wButtons DPAD_LEFT` | bit set while held | `DPAD_LEFT` | `DPAD_LEFT` |
-| D-pad right | `wButtons DPAD_RIGHT` | bit set while held | `DPAD_RIGHT` | `DPAD_RIGHT` |
-| Left trigger | `bAnalogButtons[LTRIGGER]` | 0..255 | `bLeftTrigger` | `LEFT_TRIGGER` |
-| Right trigger | `bAnalogButtons[RTRIGGER]` | 0..255 | `bRightTrigger` | `RIGHT_TRIGGER` |
-| Left stick X | `sThumbLX` | -32768..32767, right positive | `sThumbLX` | `LEFTX` |
-| Left stick Y | `sThumbLY` | -32768..32767, up positive | `sThumbLY` | `LEFTY` as `-1 - v` |
-| Right stick X | `sThumbRX` | -32768..32767, right positive | `sThumbRX` | `RIGHTX` |
-| Right stick Y | `sThumbRY` | -32768..32767, up positive | `sThumbRY` | `RIGHTY` as `-1 - v` |
+| Host control | Control | Guest field | Guest value | XInput | SDL3 |
+|---|---|---|---|---|---|
+| `south` | `a` | `bAnalogButtons[A]` | 255 held, 0 released | `A` | `SOUTH` |
+| `east` | `b` | `bAnalogButtons[B]` | 255 held, 0 released | `B` | `EAST` |
+| `west` | `x` | `bAnalogButtons[X]` | 255 held, 0 released | `X` | `WEST` |
+| `north` | `y` | `bAnalogButtons[Y]` | 255 held, 0 released | `Y` | `NORTH` |
+| `left_shoulder` | `white` | `bAnalogButtons[WHITE]` | 255 held, 0 released | `LEFT_SHOULDER` | `LEFT_SHOULDER` |
+| `right_shoulder` | `black` | `bAnalogButtons[BLACK]` | 255 held, 0 released | `RIGHT_SHOULDER` | `RIGHT_SHOULDER` |
+| `start` | `start` | `wButtons START` | bit set while held | `START` | `START` |
+| `back` | `back` | `wButtons BACK` | bit set while held | `BACK` | `BACK` |
+| `left_stick_click` | `left_thumb` | `wButtons LEFT_THUMB` | bit set while held | `LEFT_THUMB` | `LEFT_STICK` |
+| `right_stick_click` | `right_thumb` | `wButtons RIGHT_THUMB` | bit set while held | `RIGHT_THUMB` | `RIGHT_STICK` |
+| `dpad_up` | `dpad_up` | `wButtons DPAD_UP` | bit set while held | `DPAD_UP` | `DPAD_UP` |
+| `dpad_down` | `dpad_down` | `wButtons DPAD_DOWN` | bit set while held | `DPAD_DOWN` | `DPAD_DOWN` |
+| `dpad_left` | `dpad_left` | `wButtons DPAD_LEFT` | bit set while held | `DPAD_LEFT` | `DPAD_LEFT` |
+| `dpad_right` | `dpad_right` | `wButtons DPAD_RIGHT` | bit set while held | `DPAD_RIGHT` | `DPAD_RIGHT` |
+| `left_trigger` | `left_trigger` | `bAnalogButtons[LTRIGGER]` | 0..255 | `bLeftTrigger` | `LEFT_TRIGGER` |
+| `right_trigger` | `right_trigger` | `bAnalogButtons[RTRIGGER]` | 0..255 | `bRightTrigger` | `RIGHT_TRIGGER` |
+| `left_stick_left / left_stick_right` | `left_stick_left` / `left_stick_right` | `sThumbLX` | -32768..32767, right positive | `sThumbLX` | `LEFTX` |
+| `left_stick_down / left_stick_up` | `left_stick_down` / `left_stick_up` | `sThumbLY` | -32768..32767, up positive | `sThumbLY` | `LEFTY` as `-1 - v` |
+| `right_stick_left / right_stick_right` | `right_stick_left` / `right_stick_right` | `sThumbRX` | -32768..32767, right positive | `sThumbRX` | `RIGHTX` |
+| `right_stick_down / right_stick_up` | `right_stick_down` / `right_stick_up` | `sThumbRY` | -32768..32767, up positive | `sThumbRY` | `RIGHTY` as `-1 - v` |
 <!-- pad_map:end -->
 
 **Host-only buttons.** A host pad has buttons the Duke never had, and the
@@ -240,7 +240,7 @@ v0.14.0's resolver.
   give full deflection (unless `stick_ramp_ms` is set), and opposite keys
   cancel.
 - `RECOMP_TRACE=key` logs every key and mouse edge by its binding name
-  (`[KEY] down Return`), the first 200 and then one in 50.
+  (`[KEY] down enter`), the first 200 and then one in 50.
 
 <!-- keyboard_map:begin (generated from src/input/keyboard.c; tests/input_keyboard checks it) -->
 | Key | Guest control |
@@ -283,26 +283,23 @@ The keyboard and the mouse are one source on port 0 (`xbox_InputKbmPoll`,
 the backend hook), switched by `RECOMP_KEYBOARD` and `RECOMP_MOUSE` or by a
 title's `[input]` table (`src/enhance/enhance_input.c`, documented in
 [`docs/runtime/config.md`](../../docs/runtime/config.md#input)). It composes
-the pad from the runtime bindings: a control (`a`, `start`, `lstick_up`,
-...) holds up to eight inputs, and any of them held drives it.
+the pad from the runtime bindings: a control (`a`, `start`,
+`left_stick_up`, ...) holds up to eight inputs, and any of them held drives it.
 
-- **Vocabulary** (`input_names.c`, case-insensitive): `A`..`Z`, `0`..`9`,
-  `F1`..`F12`, `Space`, `Return` (alias `Enter`), `Escape` (alias `Esc`),
-  `Backspace`, `Tab`, `LShift`/`RShift`/`Shift`, `LCtrl`/`RCtrl`/`Ctrl`,
-  `LAlt`/`RAlt`/`Alt`, the arrows `Up`/`Down`/`Left`/`Right`, `Insert`,
-  `Delete`, `Home`, `End`, `PageUp`, `PageDown`, `KP0`..`KP9`, `KPEnter`,
-  `KPPlus`, `KPMinus`, `KPMultiply`, `KPDivide`, `KPPeriod`, the US-labelled
-  punctuation (`Comma`, `Period`, `Slash`, `Semicolon`, `Quote`,
-  `LBracket`, `RBracket`, `Backslash`, `Minus`, `Equals`, `Grave`), and
-  `MouseLeft`, `MouseRight`, `MouseMiddle`, `Mouse4`, `Mouse5`, `WheelUp`,
-  `WheelDown`. `Shift`, `Ctrl` and `Alt` hear either side; keypad Enter also
-  holds `Return`, as Win32 reports it. `LGui`/`RGui` (Cmd, the Windows key)
-  are the system's and have no name.
-- **Controls**: `a`, `b`, `x`, `y`, `white`, `black`, `ltrigger`,
-  `rtrigger`, `start`, `back`, `lthumb`, `rthumb`, `dpad_up`, `dpad_down`,
-  `dpad_left`, `dpad_right`, `lstick_up`, `lstick_down`, `lstick_left`,
-  `lstick_right`, `rstick_up`, `rstick_down`, `rstick_left`,
-  `rstick_right`.
+- **Vocabulary**: upstream's key names (`input_map.c`, "Key names" under
+  the mapping rules below), case-insensitive, aliases included, mapped onto
+  the fork's codes by `input_names.c`. The fork adds three inputs upstream
+  has no virtual-key code for, named in its style: `numpadenter`, `wheelup`
+  and `wheeldown`. `shift`, `ctrl` and `alt` hear either side; keypad Enter
+  also holds `enter`, as Win32 reports it. `LGui`/`RGui` (Cmd, the Windows
+  key) are the system's and have no name. The fork's older names (`KP8`,
+  `KPEnter`, `LBracket`, `MouseLeft`, ...) were dropped with no alias.
+- **Controls**: upstream's `InputControl` names, in its order: `dpad_up`,
+  `dpad_down`, `dpad_left`, `dpad_right`, `start`, `back`, `left_thumb`,
+  `right_thumb`, `a`, `b`, `x`, `y`, `black`, `white`, `left_trigger`,
+  `right_trigger`, `left_stick_up`, `left_stick_down`, `left_stick_left`,
+  `left_stick_right`, `right_stick_up`, `right_stick_down`,
+  `right_stick_left`, `right_stick_right`.
 - **Stick keys**: with `stick_ramp_ms` above 0 a stick key starts at 0.41 of
   full deflection (just past a 0.4 deadzone) and reaches full over that
   time; two perpendicular keys give 1/√2 each, and the walk key caps the
@@ -393,7 +390,9 @@ player choose their controls, on the same key table as the keyboard map above:
   travel. `xbox_InputMap_PadMapDefaults` is the identity (shoulders as Black
   and White, as `xinput_device.c` maps them) with 15% stick deadzones, a 5%
   trigger threshold and a 50% press threshold; it is an initializer, applied
-  only by a port that calls it.
+  only by a port that calls it. This fork's runtime does not: its pads go
+  through `pad_map.c` (the host controller table above), which maps LB to
+  White and RB to Black, so `PadMapDefaults` is unused here.
 - **Deadzones.** `xbox_InputMap_ApplyStick` is radial: inside the deadzone the
   stick is centred, beyond it the range is stretched so full deflection stays
   full and the direction is kept. `xbox_InputMap_ApplyTrigger` zeroes a

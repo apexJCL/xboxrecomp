@@ -223,23 +223,16 @@ static void fire_log(const struct binding *b, uint64_t now)
 
 /* ---- names ------------------------------------------------------------- */
 
-/* Control index to its bit: A..RTRIGGER are the analog buttons, in the
- * XBOX_BUTTON_* order (Black before White); the rest wButtons bits. */
+/* Control index to its bit, in upstream's InputControl order: the first
+ * eight are the wButtons bits in bit order, A..right_trigger the analog
+ * buttons in the XBOX_BUTTON_* order (Black before White). A stick
+ * direction has none. */
 static uint32_t control_bit(int ctl)
 {
-    static const uint8_t analog[8] = {
-        XBOX_BUTTON_A, XBOX_BUTTON_B, XBOX_BUTTON_X, XBOX_BUTTON_Y,
-        XBOX_BUTTON_WHITE, XBOX_BUTTON_BLACK, XBOX_BUTTON_LTRIGGER, XBOX_BUTTON_RTRIGGER,
-    };
-    static const uint16_t digital[8] = {
-        XBOX_GAMEPAD_START, XBOX_GAMEPAD_BACK, XBOX_GAMEPAD_LEFT_THUMB,
-        XBOX_GAMEPAD_RIGHT_THUMB, XBOX_GAMEPAD_DPAD_UP, XBOX_GAMEPAD_DPAD_DOWN,
-        XBOX_GAMEPAD_DPAD_LEFT, XBOX_GAMEPAD_DPAD_RIGHT,
-    };
-    if (ctl >= XBOX_CTL_A && ctl <= XBOX_CTL_RTRIGGER)
-        return 1u << (ANALOG_BIT0 + analog[ctl]);
-    if (ctl >= XBOX_CTL_START && ctl <= XBOX_CTL_DPAD_RIGHT)
-        return digital[ctl - XBOX_CTL_START];
+    if (ctl >= INPUT_DPAD_UP && ctl <= INPUT_RIGHT_THUMB)
+        return 1u << ctl;
+    if (ctl >= INPUT_A && ctl <= INPUT_RIGHT_TRIGGER)
+        return 1u << (ANALOG_BIT0 + ctl - INPUT_A);
     return 0;
 }
 
@@ -252,7 +245,7 @@ static uint32_t pad_name_bit(const char *s, int *host)
         if (isupper((unsigned char)*p))
             return 0;
     *host = 0;
-    ctl = xbox_InputControlFromName(s);
+    ctl = xbox_InputMap_ControlFromName(s);
     if (ctl >= 0)
         return control_bit(ctl);
     h = xbox_InputHostButtonFromName(s);
@@ -300,13 +293,13 @@ static const char *guest_key_use(int code, char *buf, size_t size)
     xbox_mouse_opts mo;
     int walk = xbox_InputKeyboardWalkKey();
 
-    for (int ctl = 0; ctl < XBOX_CTL_COUNT; ctl++) {
+    for (int ctl = 0; ctl < INPUT_CONTROL_COUNT; ctl++) {
         int codes[XBOX_BIND_MAX], mice[XBOX_BIND_MAX];
         int n = xbox_InputBindingsOf(ctl, codes, mice, XBOX_BIND_MAX);
         for (int k = 0; k < n; k++)
             if (!mice[k] && same_key(codes[k], code)) {
                 snprintf(buf, size, "bound to the guest's %s (input.bindings)",
-                         xbox_InputControlName(ctl));
+                         xbox_InputMap_ControlName(ctl));
                 return buf;
             }
     }
@@ -424,7 +417,7 @@ static int parse_binding(const char *where, const char *text, struct binding *b)
         }
         if (ntok == 1) {
             warn(where, text, "a single guest button would take it from the game;"
-                 " use a chord of two with a hold (back+lthumb@400) or a host-only"
+                 " use a chord of two with a hold (back+left_thumb@400) or a host-only"
                  " button (guide, paddle1)");
             return 0;
         }
@@ -449,6 +442,17 @@ static int parse_binding(const char *where, const char *text, struct binding *b)
         }
         b->kind = B_CHORD;
         return 1;
+    }
+
+    /* Name every member first: an old pad name in a chord
+     * (back+lthumb@400) is an unknown name, not a key misusing '@'. */
+    for (int i = 0; i < ntok; i++) {
+        int code, is_mouse;
+        if (!bits[i] && !xbox_InputNameToCode(tok[i], &code, &is_mouse)) {
+            warn(where, text, "unknown name '%s' (keys as in docs/input.md,"
+                 " pad buttons in lowercase)", tok[i]);
+            return 0;
+        }
     }
 
     /* A key, after its modifiers. */

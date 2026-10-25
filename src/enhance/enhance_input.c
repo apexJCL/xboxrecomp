@@ -216,21 +216,21 @@ typedef struct {
     int           line[XBOX_BIND_MAX];
 } file_set;
 
-static file_set s_set[NFILES][XBOX_CTL_COUNT];
+static file_set s_set[NFILES][INPUT_CONTROL_COUNT];
 
 static void control_list(char *out, size_t size)
 {
     size_t n = 0;
     out[0] = 0;
-    for (int i = 0; i < XBOX_CTL_COUNT && n < size; i++)
+    for (int i = 0; i < INPUT_CONTROL_COUNT && n < size; i++)
         n += (size_t)snprintf(out + n, size - n, "%s%s", i ? " " : "",
-                              xbox_InputControlName(i));
+                              xbox_InputMap_ControlName(i));
 }
 
 /* Which control of file f already has (code, mouse), or -1. */
 static int owner_in_file(int f, int code, int mouse, int *line)
 {
-    for (int c = 0; c < XBOX_CTL_COUNT; c++)
+    for (int c = 0; c < INPUT_CONTROL_COUNT; c++)
         for (int k = 0; k < s_set[f][c].n; k++)
             if (s_set[f][c].code[k] == code && s_set[f][c].mouse[k] == mouse) {
                 *line = s_set[f][c].line[k];
@@ -255,7 +255,7 @@ static void add_input(int f, const recomp_cfg *cfg, const char *key, int ctl,
         return;                 /* ["A", "a"]: one input */
     if (other >= 0) {
         say(cfg, key, "'%s' already bound to " PREFIX "%s on line %d; ignored here",
-            name, xbox_InputControlName(other), line);
+            name, xbox_InputMap_ControlName(other), line);
         return;
     }
     if (s->n == XBOX_BIND_MAX) {
@@ -274,7 +274,7 @@ static void add_input(int f, const recomp_cfg *cfg, const char *key, int ctl,
 static void scan_file(int f)
 {
     const recomp_cfg *cfg = enhance_cfg_file(f);
-    char controls[256];
+    char controls[512];
     size_t i;
 
     for (i = 0; i < recomp_cfg_count(cfg); i++) {
@@ -285,7 +285,7 @@ static void scan_file(int f)
         if (strncmp(key, PREFIX, sizeof PREFIX - 1) != 0)
             continue;
         enhance_cfg_lookup(key);        /* read, for report_unused */
-        ctl = xbox_InputControlFromName(key + sizeof PREFIX - 1);
+        ctl = xbox_InputMap_ControlFromName(key + sizeof PREFIX - 1);
         if (ctl < 0) {
             control_list(controls, sizeof controls);
             say(cfg, key, "unknown control '%s' under [input.bindings] (controls: %s); ignored",
@@ -333,7 +333,7 @@ static void apply_bindings(int counts[NFILES])
     /* The poll keeps the committed table until enhance_input_init commits
      * this one (a live reload). */
     xbox_InputBindingsStage();
-    for (int ctl = 0; ctl < XBOX_CTL_COUNT; ctl++) {
+    for (int ctl = 0; ctl < INPUT_CONTROL_COUNT; ctl++) {
         int f;
         for (f = 0; f < NFILES && !s_set[f][ctl].named; f++)
             ;
@@ -370,14 +370,14 @@ static void warn_key_clash(const char *key, int code)
 {
     if (!code)
         return;
-    for (int ctl = 0; ctl < XBOX_CTL_COUNT; ctl++) {
+    for (int ctl = 0; ctl < INPUT_CONTROL_COUNT; ctl++) {
         int codes[XBOX_BIND_MAX], mice[XBOX_BIND_MAX];
         int n = xbox_InputBindingsOf(ctl, codes, mice, XBOX_BIND_MAX);
         for (int k = 0; k < n; k++)
             if (!mice[k] && codes[k] == code) {
                 fprintf(stderr, "[INPUT] config warning: %s '%s' is also bound to "
                         PREFIX "%s\n", key, xbox_InputCodeName(code, 0),
-                        xbox_InputControlName(ctl));
+                        xbox_InputMap_ControlName(ctl));
             }
     }
 }

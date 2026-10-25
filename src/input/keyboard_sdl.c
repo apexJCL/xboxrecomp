@@ -41,6 +41,8 @@ static int common_key(int key)
     case SDLK_TAB:          return 0x09;
     case SDLK_ESCAPE:       return 0x1B;
     case SDLK_SPACE:        return 0x20;
+    case SDLK_PAUSE:        return XBOX_VK_PAUSE;
+    case SDLK_CAPSLOCK:     return XBOX_VK_CAPITAL;
     case SDLK_UP:           return XBOX_VK_UP;
     case SDLK_DOWN:         return XBOX_VK_DOWN;
     case SDLK_LEFT:         return XBOX_VK_LEFT;

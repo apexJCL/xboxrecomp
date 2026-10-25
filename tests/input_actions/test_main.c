@@ -289,7 +289,7 @@ static int menu_fires(void)
 static void test_hold_chord(void)
 {
     XBOX_INPUT_STATE st;
-    const char *out = start(ARMED "[input.actions]\nmenu.open = [\"back+lthumb@400\"]\n");
+    const char *out = start(ARMED "[input.actions]\nmenu.open = [\"back+left_thumb@400\"]\n");
 
     CHECK(strstr(out, "[ENHANCE] actions hook=on (menu.enabled)\n") != NULL);
     CHECK(enhance_actions_armed());
@@ -346,7 +346,7 @@ static void test_hold_chord(void)
     CHECK(menu_fires() == 1);
     CHECK(menu_fires() == 0);
     CHECK(!enhance_action_down(enhance_action_find("menu.open")));
-    CHECK(count(out, "[ACTION] menu.open via back+lthumb@400\n") == 1);
+    CHECK(count(out, "[ACTION] menu.open via back+left_thumb@400\n") == 1);
 }
 
 /* ---- 2. guide+a (rule 7) ---------------------------------------------- */
@@ -459,23 +459,23 @@ static void test_refusals(void)
         ARMED
         "[input]\nwalk_key = \"F7\"\n"
         "[input.bindings]\nwhite = \"F6\"\n"
-        "[input.actions]\nmenu.open = [\"a\", \"back+lthumb\", \"back+lthumb@100\","
-        " \"lthumb+guide\", \"F6\", \"F7\", \"Ctrl+F8\", \"F8\"]\n"
-        "overlay.stats = [\"Z\", \"F9\", \"MouseLeft\", \"F2+F8\", \"pad2:F8\","
+        "[input.actions]\nmenu.open = [\"a\", \"back+left_thumb\", \"back+left_thumb@100\","
+        " \"left_thumb+guide\", \"F6\", \"F7\", \"Ctrl+F8\", \"F8\"]\n"
+        "overlay.stats = [\"Z\", \"F9\", \"mouse1\", \"F2+F8\", \"pad2:F8\","
         " \"guide+a+b\", \"paddle1@5000\", \"F3\", \"F4\"]\n");
 
     CHECK(strstr(out, "'a' refused: a single guest button") != NULL);
-    CHECK(strstr(out, "'back+lthumb' refused: a chord of guest buttons needs a hold"
+    CHECK(strstr(out, "'back+left_thumb' refused: a chord of guest buttons needs a hold"
                  " of at least 200 ms") != NULL);
-    CHECK(strstr(out, "'back+lthumb@100' refused: a chord of guest buttons") != NULL);
-    CHECK(strstr(out, "'lthumb+guide' refused: a chord with a host-only button needs"
+    CHECK(strstr(out, "'back+left_thumb@100' refused: a chord of guest buttons") != NULL);
+    CHECK(strstr(out, "'left_thumb+guide' refused: a chord with a host-only button needs"
                  " it first") != NULL);
     CHECK(strstr(out, "'F6' refused: 'F6' is bound to the guest's") != NULL);
     CHECK(strstr(out, "'F7' refused: 'F7' is the walk key (input.walk_key)") != NULL);
     CHECK(strstr(out, "'Ctrl+F8' refused: 'Ctrl' is bound to the guest's") != NULL);
     CHECK(strstr(out, "'Z' refused: 'Z' is bound to the guest's") != NULL);
     CHECK(strstr(out, "'F9' refused: 'F9' is the mouse release key") != NULL);
-    CHECK(strstr(out, "'MouseLeft' refused: 'MouseLeft' is a mouse input") != NULL);
+    CHECK(strstr(out, "'mouse1' refused: 'mouse1' is a mouse input") != NULL);
     CHECK(strstr(out, "'F2+F8' refused: 'F2' is not a modifier") != NULL);
     CHECK(strstr(out, "'pad2:F8' refused: '@' and 'padN:' are for pad bindings") != NULL);
     CHECK(strstr(out, "'paddle1@5000' refused: the hold after '@' must be") != NULL);
@@ -505,6 +505,13 @@ static void test_refusals(void)
     xbox_InputKeyEvent(VK_F10, 1);
     poll0();
     CHECK(menu_fires() == 0);
+
+    /* An old pad name in a hold chord (the fork's names before upstream's)
+     * is named, not taken for a key misusing '@'. */
+    out = start(ARMED "[input.actions]\nmenu.open = [\"back+lthumb@400\", \"pad2:KP8\"]\n");
+    CHECK(strstr(out, "'back+lthumb@400' refused: unknown name 'lthumb'") != NULL);
+    CHECK(strstr(out, "'pad2:KP8' refused: unknown name 'KP8'") != NULL);
+    CHECK(strstr(out, "are for pad bindings") == NULL);
 
     /* Unknown actions under [input.actions] are named. */
     out = start(ARMED "[input.actions]\nmenu.opne = \"F8\"\n");
@@ -536,7 +543,7 @@ static void test_chord_delay(void)
 {
     XBOX_INPUT_STATE st;
     const char *out = start(ARMED "[input]\nchord_delay_ms = 50\n"
-                            "[input.actions]\nmenu.open = [\"back+lthumb@400\"]\n");
+                            "[input.actions]\nmenu.open = [\"back+left_thumb@400\"]\n");
     CHECK(strstr(out, "chord_delay_ms") == NULL);   /* no warning */
 
     /* A lone chord member reaches the title after the delay. */
@@ -1140,7 +1147,7 @@ static void test_live_rebuild(void)
     /* The keyboard on, so the reload's [input.bindings] swap races the
      * poll's composition too. */
     start_with(ARMED "[input]\nkeyboard = true\n"
-               "[input.actions]\nmenu.open = [\"paddle1\", \"back+lthumb@200\"]\n",
+               "[input.actions]\nmenu.open = [\"paddle1\", \"back+left_thumb@200\"]\n",
                &k_fake, NULL);
     hold_extra(XBOX_HOST_PADDLE1, 1);
     hold_btn(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_LEFT_THUMB, 1);

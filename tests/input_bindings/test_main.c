@@ -75,58 +75,103 @@ static XBOX_INPUT_STATE state(int keys, int mouse)
 static void test_names(void)
 {
     const char *name, *other;
-    int code, mouse, alias, c2, m2, a2, n = 0;
+    int code, mouse, c2, m2, n = 0;
 
-    for (int i = 0; xbox_InputNameAt(i, &name, &code, &mouse, &alias); i++, n++) {
+    for (int i = 0; xbox_InputNameAt(i, &name, &code, &mouse); i++, n++) {
         int got = -1, got_mouse = -1;
         CHECK(xbox_InputNameToCode(name, &got, &got_mouse) && got == code
               && got_mouse == mouse, "%s does not look up to its own code", name);
-        if (alias)
-            continue;
         CHECK(xbox_InputCodeName(code, mouse) && !strcmp(xbox_InputCodeName(code, mouse), name),
               "%s: code 0x%02X names %s", name, code,
               xbox_InputCodeName(code, mouse) ? xbox_InputCodeName(code, mouse) : "(null)");
-        for (int j = i + 1; xbox_InputNameAt(j, &other, &c2, &m2, &a2); j++)
-            CHECK(a2 || c2 != code || m2 != mouse, "%s and %s share code 0x%02X",
+        for (int j = i + 1; xbox_InputNameAt(j, &other, &c2, &m2); j++)
+            CHECK(c2 != code || m2 != mouse, "%s and %s share code 0x%02X",
                   name, other, code);
     }
     CHECK(n > 100, "only %d names", n);
 
+    /* One vocabulary: every key upstream names is the fork's under the same
+     * name, and the mouse buttons are upstream's mouse1..mouse5. */
+    for (int vk = 1; vk < 256; vk++) {
+        const char *up = xbox_InputMap_KeyName(vk);
+        if (!up)
+            continue;
+        CHECK(xbox_InputNameToCode(up, &code, &mouse), "upstream key %s rejected", up);
+        CHECK(xbox_InputCodeName(code, mouse) && !strcmp(xbox_InputCodeName(code, mouse), up),
+              "upstream key %s comes back as %s", up,
+              xbox_InputCodeName(code, mouse) ? xbox_InputCodeName(code, mouse) : "(null)");
+    }
+    CHECK(xbox_InputNameToCode("mouse1", &code, &mouse) && mouse && code == XBOX_MOUSE_LEFT
+          && xbox_InputNameToCode("mouse3", &code, &mouse) && mouse
+          && code == XBOX_MOUSE_MIDDLE, "mouse names");
+    CHECK(xbox_InputNameToCode("wheeldown", &code, &mouse) && mouse
+          && code == XBOX_MOUSE_WHEEL_DOWN && !strcmp(xbox_InputCodeName(6, 1), "wheelup"),
+          "wheel names");
+    CHECK(code_of("numpadenter") == XBOX_VK_KP_ENTER
+          && !strcmp(xbox_InputCodeName(XBOX_VK_KP_ENTER, 0), "numpadenter"), "keypad Enter");
+    /* A mouse VK is no key of the fork's. */
+    CHECK(!xbox_InputCodeName(0x01, 0) && !xbox_InputCodeName(0x04, 0), "mouse VK as key");
+
     /* Aliases and case. */
-    CHECK(code_of("Enter") == 0x0D && code_of("Esc") == 0x1B, "Enter, Esc");
-    CHECK(!strcmp(xbox_InputCodeName(0x0D, 0), "Return")
-          && !strcmp(xbox_InputCodeName(0x1B, 0), "Escape"), "canonical names win");
-    CHECK(code_of("return") == 0x0D && code_of("SPACE") == 0x20 && code_of("lalt") == 0xA4,
+    CHECK(code_of("Return") == 0x0D && code_of("Esc") == 0x1B && code_of("control") == 0x11,
+          "upstream aliases");
+    CHECK(!strcmp(xbox_InputCodeName(0x0D, 0), "enter")
+          && !strcmp(xbox_InputCodeName(0x1B, 0), "escape"), "canonical names win");
+    CHECK(code_of("ENTER") == 0x0D && code_of("SPACE") == 0x20 && code_of("LAlt") == 0xA4
+          && code_of("numpad8") == 0x68 && code_of("NUMPAD8") == 0x68,
           "lookup is case-insensitive");
     CHECK(code_of("Shift") == 0x10 && code_of("Ctrl") == 0x11 && code_of("Alt") == 0x12,
           "either-side names");
-    CHECK(code_of("LShift") == XBOX_VK_LSHIFT && code_of("RAlt") == XBOX_VK_RMENU
-          && code_of("KPEnter") == XBOX_VK_KP_ENTER, "sided codes");
-    CHECK(xbox_InputNameToCode("MouseLeft", &code, &mouse) && mouse && code == XBOX_MOUSE_LEFT
-          && xbox_InputNameToCode("WheelDown", &code, &mouse) && mouse
-          && code == XBOX_MOUSE_WHEEL_DOWN, "mouse names");
+    CHECK(code_of("pause") == 0x13 && code_of("capslock") == 0x14, "pause, capslock");
+    CHECK(code_of("LShift") == XBOX_VK_LSHIFT && code_of("RAlt") == XBOX_VK_RMENU,
+          "sided codes");
+    /* The fork's old spellings are gone, with no alias. */
+    {
+        static const char *const old[] = {
+            "KP0", "KP8", "KPEnter", "KPPlus", "KPMinus", "KPMultiply", "KPDivide",
+            "KPPeriod", "LBracket", "RBracket", "MouseLeft", "MouseRight", "MouseMiddle",
+        };
+        for (size_t i = 0; i < sizeof old / sizeof old[0]; i++)
+            CHECK(!xbox_InputNameToCode(old[i], NULL, NULL), "old name %s accepted", old[i]);
+    }
     /* The system's keys are not the game's. */
     CHECK(!xbox_InputNameToCode("LGui", NULL, NULL) && !xbox_InputNameToCode("RGui", NULL, NULL),
           "LGui/RGui accepted");
     CHECK(!xbox_InputNameToCode("Nope", NULL, NULL) && !xbox_InputNameToCode("", NULL, NULL)
           && !xbox_InputNameToCode(NULL, NULL, NULL), "unknown name accepted");
 
-    /* Controls. */
-    static const char *const ctl[XBOX_CTL_COUNT] = {
-        "a", "b", "x", "y", "white", "black", "ltrigger", "rtrigger",
-        "start", "back", "lthumb", "rthumb",
+    /* Controls: upstream's names in upstream's order. */
+    static const char *const ctl[INPUT_CONTROL_COUNT] = {
         "dpad_up", "dpad_down", "dpad_left", "dpad_right",
-        "lstick_up", "lstick_down", "lstick_left", "lstick_right",
-        "rstick_up", "rstick_down", "rstick_left", "rstick_right",
+        "start", "back", "left_thumb", "right_thumb",
+        "a", "b", "x", "y", "black", "white", "left_trigger", "right_trigger",
+        "left_stick_up", "left_stick_down", "left_stick_left", "left_stick_right",
+        "right_stick_up", "right_stick_down", "right_stick_left", "right_stick_right",
     };
-    for (int c = 0; c < XBOX_CTL_COUNT; c++) {
-        CHECK(xbox_InputControlFromName(ctl[c]) == c, "control %s", ctl[c]);
-        CHECK(xbox_InputControlName(c) && !strcmp(xbox_InputControlName(c), ctl[c]),
+    for (int c = 0; c < INPUT_CONTROL_COUNT; c++) {
+        CHECK(xbox_InputMap_ControlFromName(ctl[c]) == c, "control %s", ctl[c]);
+        CHECK(xbox_InputMap_ControlName(c) && !strcmp(xbox_InputMap_ControlName(c), ctl[c]),
               "control %d name", c);
     }
-    CHECK(xbox_InputControlFromName("START") == XBOX_CTL_START, "control case");
-    CHECK(xbox_InputControlFromName("select") == -1 && !xbox_InputControlName(XBOX_CTL_COUNT),
+    CHECK(xbox_InputMap_ControlFromName("START") == INPUT_START, "control case");
+    CHECK(xbox_InputMap_ControlFromName("select") == -1 && !xbox_InputMap_ControlName(INPUT_CONTROL_COUNT),
           "unknown control");
+    {
+        static const char *const old[] = {
+            "ltrigger", "rtrigger", "lthumb", "rthumb", "lstick_up", "rstick_left",
+        };
+        for (size_t i = 0; i < sizeof old / sizeof old[0]; i++)
+            CHECK(xbox_InputMap_ControlFromName(old[i]) == -1, "old control %s accepted", old[i]);
+    }
+
+    /* Host-only buttons are upstream's pad source names. */
+    for (int h = 0; h < XBOX_HOST_BUTTONS; h++) {
+        const char *hn = xbox_InputHostButtonName(h);
+        CHECK(hn && xbox_InputMap_SourceFromName(hn) >= 0
+              && xbox_InputHostButtonFromName(hn) == h, "host button %d", h);
+    }
+    CHECK(xbox_InputHostButtonFromName("guide") == 0 && xbox_InputHostButtonFromName("south") == -1
+          && xbox_InputHostButtonFromName("touchpad") == 6, "host buttons");
 }
 
 /* ── 2. bindings ─────────────────────────────────────────────────────── */
@@ -137,27 +182,27 @@ static void test_bindings(void)
 
     fresh();
     /* The runtime table starts as the compiled-in map: Return is Start. */
-    int n = xbox_InputBindingsOf(XBOX_CTL_START, codes, mouse, XBOX_BIND_MAX);
+    int n = xbox_InputBindingsOf(INPUT_START, codes, mouse, XBOX_BIND_MAX);
     int has_return = 0;
     for (int i = 0; i < n; i++)
         has_return |= codes[i] == 0x0D && !mouse[i];
     CHECK(has_return, "compiled-in Start has no Return");
 
-    xbox_InputBindingsClear(XBOX_CTL_A);
-    CHECK(xbox_InputBindingsOf(XBOX_CTL_A, NULL, NULL, 0) == 0, "clear");
-    CHECK(xbox_InputBind(XBOX_CTL_A, 0x20, 0) == 0
-          && xbox_InputBind(XBOX_CTL_A, XBOX_MOUSE_LEFT, 1) == 0, "bind");
-    n = xbox_InputBindingsOf(XBOX_CTL_A, codes, mouse, XBOX_BIND_MAX);
+    xbox_InputBindingsClear(INPUT_A);
+    CHECK(xbox_InputBindingsOf(INPUT_A, NULL, NULL, 0) == 0, "clear");
+    CHECK(xbox_InputBind(INPUT_A, 0x20, 0) == 0
+          && xbox_InputBind(INPUT_A, XBOX_MOUSE_LEFT, 1) == 0, "bind");
+    n = xbox_InputBindingsOf(INPUT_A, codes, mouse, XBOX_BIND_MAX);
     CHECK(n == 2 && codes[0] == 0x20 && !mouse[0] && codes[1] == XBOX_MOUSE_LEFT && mouse[1],
           "bindings of a: %d", n);
-    CHECK(xbox_InputBind(XBOX_CTL_COUNT, 0x20, 0) == -1 && xbox_InputBind(XBOX_CTL_A, 0, 0) == -1
-          && xbox_InputBind(XBOX_CTL_A, 8, 1) == -1 && xbox_InputBind(XBOX_CTL_A, 256, 0) == -1,
+    CHECK(xbox_InputBind(INPUT_CONTROL_COUNT, 0x20, 0) == -1 && xbox_InputBind(INPUT_A, 0, 0) == -1
+          && xbox_InputBind(INPUT_A, 8, 1) == -1 && xbox_InputBind(INPUT_A, 256, 0) == -1,
           "out-of-range binds accepted");
     for (int i = 2; i < XBOX_BIND_MAX; i++)
-        xbox_InputBind(XBOX_CTL_A, 0x41 + i, 0);
-    CHECK(xbox_InputBind(XBOX_CTL_A, 0x5A, 0) == -1, "a ninth input accepted");
+        xbox_InputBind(INPUT_A, 0x41 + i, 0);
+    CHECK(xbox_InputBind(INPUT_A, 0x5A, 0) == -1, "a ninth input accepted");
     xbox_InputBindingsReset();
-    n = xbox_InputBindingsOf(XBOX_CTL_A, codes, mouse, XBOX_BIND_MAX);
+    n = xbox_InputBindingsOf(INPUT_A, codes, mouse, XBOX_BIND_MAX);
     CHECK(n > 0 && codes[0] != 0x20, "reset did not restore the compiled-in a");
 }
 
@@ -192,10 +237,10 @@ static void test_ramp(void)
     XBOX_INPUT_STATE s;
 
     fresh();
-    bind_only(XBOX_CTL_LSTICK_UP, "W");
-    bind_only(XBOX_CTL_LSTICK_RIGHT, "D");
-    bind_only(XBOX_CTL_LSTICK_DOWN, "S");
-    bind_only(XBOX_CTL_A, "Space");
+    bind_only(INPUT_LSTICK_UP, "W");
+    bind_only(INPUT_LSTICK_RIGHT, "D");
+    bind_only(INPUT_LSTICK_DOWN, "S");
+    bind_only(INPUT_A, "Space");
     xbox_InputKeyboardOpts(60, code_of("LAlt"), 0.5);
 
     s = state(1, 0);
@@ -271,8 +316,8 @@ static void test_sides(void)
     fresh();
     /* A binding of the either-side name hears both keys; a sided one only
      * its own. */
-    bind_only(XBOX_CTL_X, "Shift");
-    bind_only(XBOX_CTL_Y, "RCtrl");
+    bind_only(INPUT_X, "Shift");
+    bind_only(INPUT_Y, "RCtrl");
     xbox_InputKeyEvent(XBOX_VK_RSHIFT, 1);
     xbox_InputKeyEvent(XBOX_VK_LCONTROL, 1);
     s = state(1, 0);
@@ -311,8 +356,8 @@ static void test_wheel(void)
     XBOX_INPUT_STATE s;
 
     fresh();
-    bind_only(XBOX_CTL_WHITE, "WheelUp");
-    bind_only(XBOX_CTL_BLACK, "WheelDown");
+    bind_only(INPUT_WHITE, "wheelup");
+    bind_only(INPUT_BLACK, "wheeldown");
     xbox_InputMouseFocus(0);
     CHECK(xbox_InputMouseCaptured(), "focus did not capture");
 
@@ -406,7 +451,7 @@ static void test_mouse_model(void)
 
     /* The mouse axis replaces the keys' for the poll it moved in. */
     xbox_InputMouseOpts(NULL);
-    bind_only(XBOX_CTL_RSTICK_RIGHT, "L");
+    bind_only(INPUT_RSTICK_RIGHT, "L");
     xbox_InputKeyEvent(code_of("L"), 1);
     xbox_InputMouseMotion(-20, 0);
     s = state(1, 1);
@@ -423,7 +468,7 @@ static void test_capture(void)
 
     /* focus, the default. */
     fresh();
-    bind_only(XBOX_CTL_B, "MouseLeft");
+    bind_only(INPUT_B, "mouse1");
     CHECK(!xbox_InputMouseCaptured(), "captured before focus");
     xbox_InputMouseMotion(40, 0);
     xbox_InputMouseFocus(0);
@@ -480,7 +525,7 @@ static void test_capture(void)
      * XBOX_MOUSE_FOCUS_CLICK_MS is the focusing click and drives nothing;
      * one later, or the second, drives. The clock wraps. */
     fresh();
-    bind_only(XBOX_CTL_RTRIGGER, "MouseLeft");
+    bind_only(INPUT_RIGHT_TRIGGER, "mouse1");
     xbox_InputMouseFocusGainedAt(5000);
     xbox_InputMouseButtonAt(XBOX_MOUSE_LEFT, 1, 5010);
     s = state(1, 1);
@@ -531,7 +576,7 @@ static void test_capture(void)
 
     /* click: the first press grabs and is consumed. */
     fresh();
-    bind_only(XBOX_CTL_B, "MouseLeft");
+    bind_only(INPUT_B, "mouse1");
     xbox_InputMouseDefaultOpts(&o);
     o.capture = XBOX_MOUSE_CAPTURE_CLICK;
     xbox_InputMouseOpts(&o);
@@ -551,7 +596,7 @@ static void test_capture(void)
 
     /* never: no capture, and the buttons drive. */
     fresh();
-    bind_only(XBOX_CTL_B, "MouseLeft");
+    bind_only(INPUT_B, "mouse1");
     o.capture = XBOX_MOUSE_CAPTURE_NEVER;
     xbox_InputMouseOpts(&o);
     xbox_InputMouseFocus(0);
@@ -621,14 +666,14 @@ static void test_script(void)
         "1p    key down Nope\n"
         "2p    jump\n"
         "0.5   mouse move 20 -5\n"
-        "0.6   mouse down MouseRight\n"
+        "0.6   mouse down mouse2\n"
         "0.7   wheel 1\n"
         "x     key down W\n";
 
     fresh();
-    bind_only(XBOX_CTL_A, "Space");
-    bind_only(XBOX_CTL_X, "MouseRight");
-    bind_only(XBOX_CTL_WHITE, "WheelUp");
+    bind_only(INPUT_A, "Space");
+    bind_only(INPUT_X, "mouse2");
+    bind_only(INPUT_WHITE, "wheelup");
     xbox_InputMouseFocus(0);
     CHECK(xbox_InputKbmScriptParse(text, "test.kbm") == 5, "events parsed");
 
@@ -653,7 +698,7 @@ static void test_script(void)
     CHECK(!s.Gamepad.sThumbRX && !s.Gamepad.sThumbRY, "the move lasts one poll");
     f_now = 1000 + 600;
     xbox_InputKbmPoll(&s);
-    CHECK(s.Gamepad.bAnalogButtons[XBOX_BUTTON_X] == 255, "mouse down MouseRight");
+    CHECK(s.Gamepad.bAnalogButtons[XBOX_BUTTON_X] == 255, "mouse down mouse2");
     f_now = 1000 + 700;
     xbox_InputKbmPoll(&s);
     CHECK(s.Gamepad.bAnalogButtons[XBOX_BUTTON_WHITE] == 255, "wheel 1");
@@ -692,9 +737,9 @@ static void test_merge(void)
     fresh();
     f_plugged = 1;
     xbox_InputSetBackend(&k_fake);
-    bind_only(XBOX_CTL_A, "Space");
-    bind_only(XBOX_CTL_DPAD_UP, "Up");
-    bind_only(XBOX_CTL_LSTICK_RIGHT, "D");
+    bind_only(INPUT_A, "Space");
+    bind_only(INPUT_DPAD_UP, "Up");
+    bind_only(INPUT_LSTICK_RIGHT, "D");
     xbox_InputKeyEvent(code_of("Space"), 1);
     xbox_InputKeyEvent(code_of("Up"), 1);
     xbox_InputKeyEvent(code_of("D"), 1);

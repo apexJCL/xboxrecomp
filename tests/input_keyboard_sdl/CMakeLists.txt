@@ -11,6 +11,7 @@ add_executable(input_keyboard_sdl_test
     ${INPUT_SRC}/keyboard.c
     ${INPUT_SRC}/mouse.c
     ${INPUT_SRC}/input_names.c
+    ${INPUT_SRC}/input_map.c
     ${INPUT_SRC}/kbm_script.c
     ${INPUT_SRC}/keyboard_sdl.c
     ${INPUT_SRC}/mouse_sdl.c)

@@ -15,6 +15,7 @@ add_executable(pad_map_test
     ${INPUT_SRC}/keyboard.c
     ${INPUT_SRC}/mouse.c
     ${INPUT_SRC}/input_names.c
+    ${INPUT_SRC}/input_map.c
     ${INPUT_SRC}/kbm_script.c)
 target_include_directories(pad_map_test PRIVATE ${INPUT_SRC})
 target_link_libraries(pad_map_test PRIVATE platform)

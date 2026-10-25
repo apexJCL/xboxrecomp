@@ -16,6 +16,7 @@ add_executable(input_bindings_test
     ${INPUT_SRC}/keyboard.c
     ${INPUT_SRC}/mouse.c
     ${INPUT_SRC}/input_names.c
+    ${INPUT_SRC}/input_map.c
     ${INPUT_SRC}/kbm_script.c)
 target_include_directories(input_bindings_test PRIVATE ${INPUT_SRC})
 target_link_libraries(input_bindings_test PRIVATE platform)

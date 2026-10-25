@@ -4,7 +4,7 @@
  * XDK D3D's wait-for-idle spins until bits 2..6 of the register
  * equal the low five bits of its fence word. A fresh scaffold registers no
  * mirror, so the register stayed 0 and Spartan: Total Warrior's boot spun in
- * that wait (runs/spartan r9) although the executor had written the fence.
+ * that wait although the executor had written the fence.
  *
  * In this order, because a mirror registration cannot be undone:
  *

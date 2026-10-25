@@ -508,33 +508,38 @@ a string or a list of strings naming inputs:
 ```toml
 [input.bindings]
 a = "Space"
-start = ["Return", "Escape"]
-b = "MouseLeft"
-lthumb = []                 # unbound
+start = ["Enter", "Escape"]
+b = "mouse1"
+left_thumb = []             # unbound
 ```
 
-Controls: `a b x y white black ltrigger rtrigger start back lthumb rthumb
-dpad_up dpad_down dpad_left dpad_right lstick_up lstick_down lstick_left
-lstick_right rstick_up rstick_down rstick_left rstick_right`.
+Controls, by upstream's names (`src/input/input_map.c`): `dpad_up
+dpad_down dpad_left dpad_right start back left_thumb right_thumb a b x y
+black white left_trigger right_trigger left_stick_up left_stick_down
+left_stick_left left_stick_right right_stick_up right_stick_down
+right_stick_left right_stick_right`.
 
 Inputs, in any case, by the label the host layout gives the key (the key
 labelled Z is `Z` on AZERTY too): `A`..`Z`, `0`..`9`, `F1`..`F12`,
-`Space`, `Return` (or `Enter`), `Escape` (or `Esc`), `Backspace`, `Tab`,
-`LShift` `RShift` `Shift`, `LCtrl` `RCtrl` `Ctrl`, `LAlt` `RAlt` `Alt`
-(the unsided names match either side), `Up` `Down` `Left` `Right`,
-`Insert` `Delete` `Home` `End` `PageUp` `PageDown`, `KP0`..`KP9`,
-`KPEnter` `KPPlus` `KPMinus` `KPMultiply` `KPDivide` `KPPeriod`, `Comma`
-`Period` `Slash` `Semicolon` `Quote` `LBracket` `RBracket` `Backslash`
-`Minus` `Equals` `Grave`; the mouse: `MouseLeft` `MouseRight`
-`MouseMiddle` `Mouse4` `Mouse5` `WheelUp` `WheelDown`. The Cmd and
-Windows keys are not bindable: they belong to the system. The table lives
-in `src/input/input_names.c`; `RECOMP_TRACE=key` prints each key's name as
+and upstream's key names (`xbox_InputMap_KeyFromName`, listed under
+"Key names" in `src/input/README.md`): `Space`, `Enter` (or `Return`),
+`Escape` (or `Esc`), `Backspace`, `Tab`, `Pause`, `CapsLock`, `LShift`
+`RShift` `Shift`, `LCtrl` `RCtrl` `Ctrl` (or `Control`), `LAlt` `RAlt`
+`Alt` (the unsided names match either side), `Up` `Down` `Left` `Right`,
+`Insert` `Delete` `Home` `End` `PageUp` `PageDown`, `Numpad0`..`Numpad9`,
+`NumpadAdd` `NumpadSubtract` `NumpadMultiply` `NumpadDivide`
+`NumpadDecimal`, the OEM keys (`Comma` `Period` `Slash` `Semicolon`
+`LeftBracket` `RightBracket` ...), and the mouse buttons `Mouse1`..`Mouse5`
+(left, right, middle, back, forward). The fork adds `NumpadEnter`,
+`WheelUp` and `WheelDown`. The Cmd and Windows keys are not bindable: they
+belong to the system. The table lives in `src/input/input_names.c` over
+upstream's `input_map.c`; `RECOMP_TRACE=key` prints each key's name as
 it is pressed. A control holds up to 8 inputs.
 
 **Resolution.**
 
 - Per control, the highest file that names it wins whole: the player's
-  `start = "Return"` replaces the defaults' `["Return", "Escape"]`, and
+  `start = "Enter"` replaces the defaults' `["Enter", "Escape"]`, and
   `a = []` unbinds.
 - An input a higher file names under one control is removed from every
   control a lower file gave it, so binding `Escape` to `back` in your file
@@ -548,7 +553,7 @@ it is pressed. A control holds up to 8 inputs.
 is one line, with the file and the line of the key:
 
 ```
-[INPUT] config error: config/config.toml:7: unknown control 'jmp' under [input.bindings] (controls: a b x ... rstick_right); ignored
+[INPUT] config error: config/config.toml:7: unknown control 'jmp' under [input.bindings] (controls: dpad_up dpad_down ... right_stick_right); ignored
 [INPUT] config error: config/config.toml:8: unknown input 'Spacebar' in input.bindings.x (see docs/input.md); skipped
 [INPUT] config error: config/config.toml:3: 'J' already bound to input.bindings.x on line 2; ignored here
 [INPUT] config error: config/config.toml:9: input.bindings.a is a string or a list of strings (got integer); ignored
@@ -599,7 +604,7 @@ state (a consumed chord). Remapping the game's own controls stays with
 
 ```toml
 [input.actions]
-menu.open = ["F10", "guide+a", "paddle1", "back+lthumb@400"]
+menu.open = ["F10", "guide+a", "paddle1", "back+left_thumb@400"]
 camera.free.toggle = "F6"
 overlay.stats = []                  # unbound
 ```
@@ -623,7 +628,7 @@ The toolkit's actions:
 | `shot.window` | none | a window shot (a log line for now) |
 
 A game's `config.default.toml` adds to these, for example a fallback chord
-for hosts where Guide is not seen (BLiNX 2: `back+lthumb@400`). A mod
+for hosts where Guide is not seen (BLiNX 2: `back+left_thumb@400`). A mod
 registers its own actions, named after the mod (`camera.free.toggle`).
 
 **A binding** is one of:
@@ -639,8 +644,8 @@ registers its own actions, named after the mod (`camera.free.toggle`).
   and left Fn button), and `touchpad`. The Duke has none of them, so the
   game never sees one.
 - **A pad chord**: two to eight buttons joined by `+`, from `a b x y
-  white black ltrigger rtrigger start back lthumb rthumb dpad_up
-  dpad_down dpad_left dpad_right` and the host-only names, with an
+  black white left_trigger right_trigger start back left_thumb
+  right_thumb dpad_up dpad_down dpad_left dpad_right` and the host-only names, with an
   optional hold `@<ms>` (`0` .. `2000`). It is read on port 0 (player
   1) unless it starts with `pad2:` .. `pad4:`. A chord whose first member
   is host-only and whose others are guest buttons (`guide+a`) is a
@@ -662,7 +667,7 @@ gets one line and the rest of the action's bindings stand:
    press, and masking then gives it a release the player did not make:
    with `back+start`, START pauses BLiNX 2 and is then released. So pick
    members the game ignores on a lone press (a button with no use plus
-   one used only in menus, as `back+lthumb` in BLiNX 2), or set
+   one used only in menus, as `back+left_thumb` in BLiNX 2), or set
    `input.chord_delay_ms`, which holds each chord member back from the
    game for that long after its press. That costs the same latency on
    those buttons, which is why it is off by default.
@@ -702,8 +707,8 @@ guest buttons fire only from a poll.
 line (or `(default)` for a default), and the binding:
 
 ```
-[INPUT] action input.actions.menu.open (./config/config.toml:3): 'a' refused: a single guest button would take it from the game; use a chord of two with a hold (back+lthumb@400) or a host-only button (guide, paddle1)
-[INPUT] action input.actions.menu.open (./config/config.toml:3): 'back+lthumb' refused: a chord of guest buttons needs a hold of at least 200 ms (back+lthumb@400)
+[INPUT] action input.actions.menu.open (./config/config.toml:3): 'a' refused: a single guest button would take it from the game; use a chord of two with a hold (back+left_thumb@400) or a host-only button (guide, paddle1)
+[INPUT] action input.actions.menu.open (./config/config.toml:3): 'back+left_thumb' refused: a chord of guest buttons needs a hold of at least 200 ms (back+left_thumb@400)
 [INPUT] action input.actions.menu.open (./config/config.toml:3): 'a+guide' refused: a chord with a host-only button needs it first and only once (guide+a)
 [INPUT] action input.actions.menu.open (./config/config.toml:3): 'Z' refused: 'Z' is bound to the guest's a (input.bindings); the game keeps it
 [INPUT] action input.actions.menu.open (./config/config.toml:3): more than 8 bindings; the rest skipped

@@ -19,6 +19,7 @@ add_executable(input_hotplug_sdl_test
     ${INPUT_SRC}/keyboard.c
     ${INPUT_SRC}/mouse.c
     ${INPUT_SRC}/input_names.c
+    ${INPUT_SRC}/input_map.c
     ${INPUT_SRC}/kbm_script.c)
 target_include_directories(input_hotplug_sdl_test PRIVATE ${INPUT_SRC} ${INPUT_SRC}/..)
 target_link_libraries(input_hotplug_sdl_test PRIVATE platform SDL3::SDL3 m)

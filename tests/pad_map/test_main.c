@@ -7,6 +7,7 @@
  * rather than being compared with itself.
  */
 #include "pad_map.h"
+#include "input_map.h"
 #include "input_backend.h"
 #include "recomp_env.h"
 
@@ -46,26 +47,26 @@ struct expect {
 };
 
 static const struct expect k_expect[] = {
-    { "A", XBOX_XI_A, 0, XBOX_SDL_BUTTON_A, F_ANALOG, 0 },
-    { "B", XBOX_XI_B, 0, XBOX_SDL_BUTTON_B, F_ANALOG, 1 },
-    { "X", XBOX_XI_X, 0, XBOX_SDL_BUTTON_X, F_ANALOG, 2 },
-    { "Y", XBOX_XI_Y, 0, XBOX_SDL_BUTTON_Y, F_ANALOG, 3 },
-    { "Left shoulder (LB)",  0x0100, 0, 9,  F_ANALOG, 5 },   /* WHITE */
-    { "Right shoulder (RB)", 0x0200, 0, 10, F_ANALOG, 4 },   /* BLACK */
-    { "Start / Menu",      0x0010, 0, 6,  F_BTN, 0x0010 },
-    { "Back / View",       0x0020, 0, 4,  F_BTN, 0x0020 },
-    { "Left stick click",  0x0040, 0, 7,  F_BTN, 0x0040 },
-    { "Right stick click", 0x0080, 0, 8,  F_BTN, 0x0080 },
-    { "D-pad up",          0x0001, 0, 11, F_BTN, 0x0001 },
-    { "D-pad down",        0x0002, 0, 12, F_BTN, 0x0002 },
-    { "D-pad left",        0x0004, 0, 13, F_BTN, 0x0004 },
-    { "D-pad right",       0x0008, 0, 14, F_BTN, 0x0008 },
-    { "Left trigger",      0, XBOX_XI_SRC_LT, 4, F_ANALOG, 6 },
-    { "Right trigger",     0, XBOX_XI_SRC_RT, 5, F_ANALOG, 7 },
-    { "Left stick X",      0, XBOX_XI_SRC_LX, 0, F_STICK, 0 },
-    { "Left stick Y",      0, XBOX_XI_SRC_LY, 1, F_STICK, 1 },
-    { "Right stick X",     0, XBOX_XI_SRC_RX, 2, F_STICK, 2 },
-    { "Right stick Y",     0, XBOX_XI_SRC_RY, 3, F_STICK, 3 },
+    { "south",             XBOX_XI_A, 0, XBOX_SDL_BUTTON_A, F_ANALOG, 0 },
+    { "east",              XBOX_XI_B, 0, XBOX_SDL_BUTTON_B, F_ANALOG, 1 },
+    { "west",              XBOX_XI_X, 0, XBOX_SDL_BUTTON_X, F_ANALOG, 2 },
+    { "north",             XBOX_XI_Y, 0, XBOX_SDL_BUTTON_Y, F_ANALOG, 3 },
+    { "left_shoulder",     0x0100, 0, 9,  F_ANALOG, 5 },   /* WHITE */
+    { "right_shoulder",    0x0200, 0, 10, F_ANALOG, 4 },   /* BLACK */
+    { "start",             0x0010, 0, 6,  F_BTN, 0x0010 },
+    { "back",              0x0020, 0, 4,  F_BTN, 0x0020 },
+    { "left_stick_click",  0x0040, 0, 7,  F_BTN, 0x0040 },
+    { "right_stick_click", 0x0080, 0, 8,  F_BTN, 0x0080 },
+    { "dpad_up",           0x0001, 0, 11, F_BTN, 0x0001 },
+    { "dpad_down",         0x0002, 0, 12, F_BTN, 0x0002 },
+    { "dpad_left",         0x0004, 0, 13, F_BTN, 0x0004 },
+    { "dpad_right",        0x0008, 0, 14, F_BTN, 0x0008 },
+    { "left_trigger",      0, XBOX_XI_SRC_LT, 4, F_ANALOG, 6 },
+    { "right_trigger",     0, XBOX_XI_SRC_RT, 5, F_ANALOG, 7 },
+    { "left_stick_left / left_stick_right",   0, XBOX_XI_SRC_LX, 0, F_STICK, 0 },
+    { "left_stick_down / left_stick_up",      0, XBOX_XI_SRC_LY, 1, F_STICK, 1 },
+    { "right_stick_left / right_stick_right", 0, XBOX_XI_SRC_RX, 2, F_STICK, 2 },
+    { "right_stick_down / right_stick_up",    0, XBOX_XI_SRC_RY, 3, F_STICK, 3 },
 };
 #define N_EXPECT (sizeof k_expect / sizeof k_expect[0])
 
@@ -120,6 +121,17 @@ static void test_rows(void)
 
         CHECK(!strcmp(xbox_pad_map[i].host, e->host), "row %u is '%s', want '%s'",
               (unsigned)i, xbox_pad_map[i].host, e->host);
+        /* One vocabulary: the host names are upstream's pad sources. */
+        for (const char *p = e->host; *p;) {
+            char tok[32];
+            size_t n = strcspn(p, " /");
+            snprintf(tok, sizeof tok, "%.*s", (int)n, p);
+            if (n)
+                CHECK(xbox_InputMap_SourceFromName(tok) > 0,
+                      "row %u: '%s' is no upstream source", (unsigned)i, tok);
+            p += n;
+            p += strspn(p, " /");
+        }
 
         memset(&xi, 0, sizeof xi);
         memset(&sd, 0, sizeof sd);

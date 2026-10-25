@@ -24,6 +24,7 @@ add_executable(enhance_mod_test
     ${XR_SRC}/input/keyboard.c
     ${XR_SRC}/input/mouse.c
     ${XR_SRC}/input/input_names.c
+    ${XR_SRC}/input/input_map.c
     ${XR_SRC}/input/kbm_script.c
     ${XR_SRC}/kernel/nv2a_backend_common.c
     ${XR_SRC}/kernel/nv2a_tex_pack.c

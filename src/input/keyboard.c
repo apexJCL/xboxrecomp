@@ -267,37 +267,37 @@ typedef struct {
 } bind_set;
 
 /* What each control drives. */
-static const struct { uint8_t kind; uint16_t target; int8_t sign; } k_ctl[XBOX_CTL_COUNT] = {
-    [XBOX_CTL_A]           = { XBOX_KEY_ANALOG, XBOX_BUTTON_A, 0 },
-    [XBOX_CTL_B]           = { XBOX_KEY_ANALOG, XBOX_BUTTON_B, 0 },
-    [XBOX_CTL_X]           = { XBOX_KEY_ANALOG, XBOX_BUTTON_X, 0 },
-    [XBOX_CTL_Y]           = { XBOX_KEY_ANALOG, XBOX_BUTTON_Y, 0 },
-    [XBOX_CTL_WHITE]       = { XBOX_KEY_ANALOG, XBOX_BUTTON_WHITE, 0 },
-    [XBOX_CTL_BLACK]       = { XBOX_KEY_ANALOG, XBOX_BUTTON_BLACK, 0 },
-    [XBOX_CTL_LTRIGGER]    = { XBOX_KEY_ANALOG, XBOX_BUTTON_LTRIGGER, 0 },
-    [XBOX_CTL_RTRIGGER]    = { XBOX_KEY_ANALOG, XBOX_BUTTON_RTRIGGER, 0 },
-    [XBOX_CTL_START]       = { XBOX_KEY_BUTTON, XBOX_GAMEPAD_START, 0 },
-    [XBOX_CTL_BACK]        = { XBOX_KEY_BUTTON, XBOX_GAMEPAD_BACK, 0 },
-    [XBOX_CTL_LTHUMB]      = { XBOX_KEY_BUTTON, XBOX_GAMEPAD_LEFT_THUMB, 0 },
-    [XBOX_CTL_RTHUMB]      = { XBOX_KEY_BUTTON, XBOX_GAMEPAD_RIGHT_THUMB, 0 },
-    [XBOX_CTL_DPAD_UP]     = { XBOX_KEY_BUTTON, XBOX_GAMEPAD_DPAD_UP, 0 },
-    [XBOX_CTL_DPAD_DOWN]   = { XBOX_KEY_BUTTON, XBOX_GAMEPAD_DPAD_DOWN, 0 },
-    [XBOX_CTL_DPAD_LEFT]   = { XBOX_KEY_BUTTON, XBOX_GAMEPAD_DPAD_LEFT, 0 },
-    [XBOX_CTL_DPAD_RIGHT]  = { XBOX_KEY_BUTTON, XBOX_GAMEPAD_DPAD_RIGHT, 0 },
-    [XBOX_CTL_LSTICK_UP]   = { XBOX_KEY_AXIS, XBOX_KEY_LY, +1 },
-    [XBOX_CTL_LSTICK_DOWN] = { XBOX_KEY_AXIS, XBOX_KEY_LY, -1 },
-    [XBOX_CTL_LSTICK_LEFT] = { XBOX_KEY_AXIS, XBOX_KEY_LX, -1 },
-    [XBOX_CTL_LSTICK_RIGHT]= { XBOX_KEY_AXIS, XBOX_KEY_LX, +1 },
-    [XBOX_CTL_RSTICK_UP]   = { XBOX_KEY_AXIS, XBOX_KEY_RY, +1 },
-    [XBOX_CTL_RSTICK_DOWN] = { XBOX_KEY_AXIS, XBOX_KEY_RY, -1 },
-    [XBOX_CTL_RSTICK_LEFT] = { XBOX_KEY_AXIS, XBOX_KEY_RX, -1 },
-    [XBOX_CTL_RSTICK_RIGHT]= { XBOX_KEY_AXIS, XBOX_KEY_RX, +1 },
+static const struct { uint8_t kind; uint16_t target; int8_t sign; } k_ctl[INPUT_CONTROL_COUNT] = {
+    [INPUT_A]             = { XBOX_KEY_ANALOG, XBOX_BUTTON_A, 0 },
+    [INPUT_B]             = { XBOX_KEY_ANALOG, XBOX_BUTTON_B, 0 },
+    [INPUT_X]             = { XBOX_KEY_ANALOG, XBOX_BUTTON_X, 0 },
+    [INPUT_Y]             = { XBOX_KEY_ANALOG, XBOX_BUTTON_Y, 0 },
+    [INPUT_WHITE]         = { XBOX_KEY_ANALOG, XBOX_BUTTON_WHITE, 0 },
+    [INPUT_BLACK]         = { XBOX_KEY_ANALOG, XBOX_BUTTON_BLACK, 0 },
+    [INPUT_LEFT_TRIGGER]  = { XBOX_KEY_ANALOG, XBOX_BUTTON_LTRIGGER, 0 },
+    [INPUT_RIGHT_TRIGGER] = { XBOX_KEY_ANALOG, XBOX_BUTTON_RTRIGGER, 0 },
+    [INPUT_START]         = { XBOX_KEY_BUTTON, XBOX_GAMEPAD_START, 0 },
+    [INPUT_BACK]          = { XBOX_KEY_BUTTON, XBOX_GAMEPAD_BACK, 0 },
+    [INPUT_LEFT_THUMB]    = { XBOX_KEY_BUTTON, XBOX_GAMEPAD_LEFT_THUMB, 0 },
+    [INPUT_RIGHT_THUMB]   = { XBOX_KEY_BUTTON, XBOX_GAMEPAD_RIGHT_THUMB, 0 },
+    [INPUT_DPAD_UP]       = { XBOX_KEY_BUTTON, XBOX_GAMEPAD_DPAD_UP, 0 },
+    [INPUT_DPAD_DOWN]     = { XBOX_KEY_BUTTON, XBOX_GAMEPAD_DPAD_DOWN, 0 },
+    [INPUT_DPAD_LEFT]     = { XBOX_KEY_BUTTON, XBOX_GAMEPAD_DPAD_LEFT, 0 },
+    [INPUT_DPAD_RIGHT]    = { XBOX_KEY_BUTTON, XBOX_GAMEPAD_DPAD_RIGHT, 0 },
+    [INPUT_LSTICK_UP]     = { XBOX_KEY_AXIS, XBOX_KEY_LY, +1 },
+    [INPUT_LSTICK_DOWN]   = { XBOX_KEY_AXIS, XBOX_KEY_LY, -1 },
+    [INPUT_LSTICK_LEFT]   = { XBOX_KEY_AXIS, XBOX_KEY_LX, -1 },
+    [INPUT_LSTICK_RIGHT]  = { XBOX_KEY_AXIS, XBOX_KEY_LX, +1 },
+    [INPUT_RSTICK_UP]     = { XBOX_KEY_AXIS, XBOX_KEY_RY, +1 },
+    [INPUT_RSTICK_DOWN]   = { XBOX_KEY_AXIS, XBOX_KEY_RY, -1 },
+    [INPUT_RSTICK_LEFT]   = { XBOX_KEY_AXIS, XBOX_KEY_RX, -1 },
+    [INPUT_RSTICK_RIGHT]  = { XBOX_KEY_AXIS, XBOX_KEY_RX, +1 },
 };
 
 /* The control a compiled-in row drives. */
 static int row_control(const xbox_key_row *r)
 {
-    for (int c = 0; c < XBOX_CTL_COUNT; c++)
+    for (int c = 0; c < INPUT_CONTROL_COUNT; c++)
         if (k_ctl[c].kind == r->kind && k_ctl[c].target == r->target
             && (r->kind != XBOX_KEY_AXIS || k_ctl[c].sign == r->sign))
             return c;
@@ -316,7 +316,7 @@ static void bind_add(bind_set *t, int control, int code, int is_mouse)
 
 static void compiled_bindings(bind_set *t)
 {
-    memset(t, 0, sizeof(bind_set) * XBOX_CTL_COUNT);
+    memset(t, 0, sizeof(bind_set) * INPUT_CONTROL_COUNT);
     for (size_t i = 0; i < xbox_key_map_count; i++) {
         int c = row_control(&xbox_key_map[i]);
         if (c < 0)
@@ -329,7 +329,7 @@ static void compiled_bindings(bind_set *t)
 
 /* Written before the first poll (the config layer, a title), read by the
  * poll. */
-static bind_set s_bind[XBOX_CTL_COUNT];
+static bind_set s_bind[INPUT_CONTROL_COUNT];
 static int      s_bind_ready;
 
 static void bindings_ready(void)
@@ -356,7 +356,7 @@ void xbox_InputBindingsReset(void)
 
 void xbox_InputBindingsClear(int control)
 {
-    if (control < 0 || control >= XBOX_CTL_COUNT)
+    if (control < 0 || control >= INPUT_CONTROL_COUNT)
         return;
     bindings_ready();
     s_bind[control].n = 0;
@@ -364,7 +364,7 @@ void xbox_InputBindingsClear(int control)
 
 int xbox_InputBind(int control, int code, int is_mouse)
 {
-    if (control < 0 || control >= XBOX_CTL_COUNT || code <= 0
+    if (control < 0 || control >= INPUT_CONTROL_COUNT || code <= 0
         || code > (is_mouse ? XBOX_MOUSE_INPUTS : 255))
         return -1;
     bindings_ready();
@@ -376,7 +376,7 @@ int xbox_InputBind(int control, int code, int is_mouse)
 
 int xbox_InputBindingsOf(int control, int *codes, int *is_mouse, int max)
 {
-    if (control < 0 || control >= XBOX_CTL_COUNT)
+    if (control < 0 || control >= INPUT_CONTROL_COUNT)
         return 0;
     bindings_ready();
     for (int i = 0; i < s_bind[control].n && i < max; i++) {
@@ -453,7 +453,7 @@ static void compose(XBOX_INPUT_STATE *out, const bind_set *t,
     memset(out, 0, sizeof *out);
     if (mouse)
         xbox_InputMouseTick(now, have_clock);
-    for (int c = 0; c < XBOX_CTL_COUNT; c++) {
+    for (int c = 0; c < INPUT_CONTROL_COUNT; c++) {
         const bind_set *b = &t[c];
         int held = 0;
         for (int i = 0; i < b->n && !held; i++)
@@ -533,7 +533,7 @@ static void compose(XBOX_INPUT_STATE *out, const bind_set *t,
 /* ---- the committed table ------------------------------------------------- */
 
 typedef struct {
-    bind_set     bind[XBOX_CTL_COUNT];
+    bind_set     bind[INPUT_CONTROL_COUNT];
     compose_opts o;
 } live_table;
 
@@ -625,7 +625,7 @@ int xbox_InputKbmPoll(XBOX_INPUT_STATE *out)
 
 void xbox_InputKeyboardState(XBOX_INPUT_STATE *out)
 {
-    static bind_set compiled[XBOX_CTL_COUNT];
+    static bind_set compiled[INPUT_CONTROL_COUNT];
     static int ready;
     static const compose_opts o = { 0, 0, 1.0 };
 
