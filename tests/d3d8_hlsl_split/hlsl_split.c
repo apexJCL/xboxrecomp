@@ -26,8 +26,8 @@
 #define NPROG 400
 #define NCOMB 400
 #define NCASE (2 * NPROG + NCOMB)
-#define EXPECTED_HASH 0xe55d6979u      /* all cases, one FNV-1a */
-#define EXPECTED_CHARS 7395312u        /* re-recorded: CLIPPLANE clip_mode in the cbuffer */
+#define EXPECTED_HASH 0xdb72c33eu      /* all cases, one FNV-1a */
+#define EXPECTED_CHARS 7420112u        /* re-recorded: depth-off z capped at w */
 
 #include "expected.h"   /* s_expect[NCASE], or HLSL_NO_EXPECT */
 

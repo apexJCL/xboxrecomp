@@ -294,6 +294,7 @@ int d3d8_vsh_generate_msl(const NV2AVshProgram *program, unsigned flags,
         "    float4 vp_scale; float4 vp_off;\n"
         "    float4 fog_param;   /* SET_FOG_PARAMS[0], [1] */\n"
         "    uint4  fog_ctl;     /* enable, 0 linear/1 exp/2 exp2, abs, inf/NaN result */\n"
+        /* spec_ctl.z: depth test off, so no far-plane clip (epilogue below). */
         "    uint4  spec_ctl;    /* x: specular on, y: alpha from material */\n"
         "};\n"
         D3D8_MSL_VOUT
@@ -347,6 +348,10 @@ int d3d8_vsh_generate_msl(const NV2AVshProgram *program, unsigned flags,
             "    float  pw = (oPos.w == 0.0) ? 1.0 : oPos.w;\n"
             "    o.pos = float4((oPos.xy * vp.vp_scale.xy + vp.vp_off.xy) * pw,\n"
             "                   oPos.z * vp.vp_scale.z * pw, pw);\n"
+            /* The NV2A culls beyond zmax only with the depth test on (the CPU
+             * path's far plane, nv2a_pb_exec.c); Metal always clips at z > w.
+             * Capping z at w keeps the near plane and drops the far one. */
+            "    if (vp.spec_ctl.z != 0u) o.pos.z = min(o.pos.z, o.pos.w);\n"
             "    {\n"
             "        float fd = oFog.x, ff = 1.0;\n"
             "        if (vp.fog_ctl.x != 0u) {\n"

@@ -351,6 +351,7 @@ int d3d8_vsh_generate_hlsl_ex(const NV2AVshProgram *program, unsigned flags,
             "    float4 vp_off;\n"
             "    float4 fog_param;   /* SET_FOG_PARAMS[0], [1] */\n"
             "    uint4  fog_ctl;     /* enable, 0 linear/1 exp/2 exp2, abs, inf/NaN result */\n"
+            /* spec_ctl.z: depth test off, so no far-plane clip (epilogue below). */
             "    uint4  spec_ctl;    /* x: specular on, y: alpha from material */\n"
             "};\n"
             "\n");
@@ -461,7 +462,12 @@ int d3d8_vsh_generate_hlsl_ex(const NV2AVshProgram *program, unsigned flags,
             "    oPos.xy = trunc(oPos.xy * 16.0) / 16.0;\n"
             "    float  pw = (oPos.w == 0.0) ? 1.0 : oPos.w;\n"
             "    o.oPos = float4((oPos.xy * vp_scale.xy + vp_off.xy) * pw,\n"
-            "                    oPos.z * vp_scale.z * pw, pw);\n");
+            "                    oPos.z * vp_scale.z * pw, pw);\n"
+            /* As the MSL: the NV2A culls beyond zmax only with the depth test
+             * on (the CPU path's far plane, nv2a_pb_exec.c), and the
+             * rasteriser state keeps DepthClipEnable for the near plane.
+             * Capping z at w drops the far clip for depth-off draws. */
+            "    if (spec_ctl.z != 0u) o.oPos.z = min(o.oPos.z, o.oPos.w);\n");
     } else {
         sb_append(&sb, "    o.oPos = oPos;\n");
     }

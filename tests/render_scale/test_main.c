@@ -116,6 +116,15 @@ int main(void)
         memset(&v, 0, sizeof v);
         nv2a_vp_consts_fill(&v, 0x128, 640, 480, 0, &c);
         CHECK(c.c[0] == 2.0f / 640.0f && c.c[4] == -1.0f && c.c[1] == -2.0f / 480.0f);
+        /* spec_ctl.z (u[6]) follows the depth test: off, the epilogue caps
+         * z at w and nothing is far-clipped, as on the NV2A; on, it clips. */
+        CHECK(c.u[6] == 1 && c.u[4] == 0 && c.u[5] == 0);
+        v.depth_enable = 1;
+        v.spec_enable = 1;
+        nv2a_vp_consts_fill(&v, 0x128, 640, 480, 0, &c);
+        CHECK(c.u[6] == 0 && c.u[4] == 1 && c.u[5] == 0);
+        v.depth_enable = 0;
+        v.spec_enable = 0;
         o.aspect_w = 16; o.aspect_h = 9;
         nv2a_host_opts_set(&o);
         CHECK(nv2a_host_pad(640, 480) == 107);

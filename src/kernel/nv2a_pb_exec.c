@@ -5037,11 +5037,15 @@ static void fast_batch_setup(void)
  *                                       (ZMIN_MAX_CONTROL CULL_NEAR_FAR, the
  *                                       XDK default), and since screen z is
  *                                       affine in x, y, clipping here is
- *                                       exactly that cull. Whether it culls
- *                                       with depth off too is open: xemu's
- *                                       ZCLAMP CULL is not gated on the depth
- *                                       test, and the GPU backends clip far
- *                                       with depth off
+ *                                       exactly that cull. xemu's ZCLAMP
+ *                                       CULL is not gated on the depth test,
+ *                                       but Test Drive: Eve of Destruction's
+ *                                       depth-off 2D passes write z far past
+ *                                       zmax and draw on the console, so
+ *                                       depth off has no far plane here, and
+ *                                       the GPU backends cap z at w for it
+ *                                       (vp consts u[6], d3d8_vsh_msl.c and
+ *                                       d3d8_vsh_hlsl.c)
  *
  * A triangle with all three vertices inside every plane goes to the
  * rasteriser untouched, so nothing that drew before changes by a bit. Only
