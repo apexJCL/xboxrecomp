@@ -446,7 +446,102 @@ int main(int argc, char **argv)
               "a decommitted page comes back zeroed, its neighbours kept", d);
     }
 
-    /* 6. Contiguous memory can be given back. */
+    /* 6. A block too big for either side of the low reserve (15-16 MB) is
+     * placed from the top down, as the console kernel places it. TDEOD asks
+     * for 50 MB at boot; the largest run above the reserve is about 48 MB,
+     * so it was refused and the title panicked. The low pages stay free. */
+    if (!ext) {
+        const uint32_t MB = 1024u * 1024u;
+        uint32_t big = xbox_ContiguousAlloc(50 * MB, 4096), lo;
+
+        snprintf(d, sizeof d, "got 0x%08X", big);
+        check(big != 0, "a 50 MB contiguous block is granted", d);
+        lo = xbox_ContiguousAllocEx(0x1000, 4096, 0, 0x00FFFFFFu);
+        snprintf(d, sizeof d, "big 0x%08X, low 0x%08X", big, lo);
+        check(lo != 0 && (!big || lo + 0x1000 <= big || lo >= big + 50 * MB),
+              "beside it, a low request still fits", d);
+        if (lo)
+            xbox_ContiguousFree(lo);
+        if (big)
+            xbox_ContiguousFree(big);
+    }
+
+    /* 6b. With a block already at the top, the top-down search steps below
+     * it, unaligned and with a 1 MB alignment; the size gate's edge; and a
+     * small request in a full arena is refused rather than handed the
+     * reserve, which the low-memory GPU buffers need (the EndVisibilityTest
+     * out-of-memory). */
+    if (!ext) {
+        const uint32_t MB = 1024u * 1024u;
+        const uint32_t top = XBOX_CONTIG_SIZE - XBOX_GPU_INSTANCE_DEFAULT;
+        static uint32_t blocks[20000];
+        uint32_t mark, big, n = 0, in_reserve = 0, low;
+        int k;
+
+        mark = xbox_ContiguousAllocEx(0x1000, 4096, top - 0x1000, top - 1);
+        big = xbox_ContiguousAlloc(50 * MB, 4096);
+        snprintf(d, sizeof d, "mark 0x%08X, big 0x%08X", mark, big);
+        check(mark && big && big + 50 * MB <= mark,
+              "with a block at the top, a 50 MB block ends below it", d);
+        if (big)
+            xbox_ContiguousFree(big);
+        if (mark)
+            xbox_ContiguousFree(mark);
+        /* Aligned, the first candidate ends at the last MB boundary, 0x03F00000,
+         * so the block at the top must sit inside [0x03D00000, 0x03F00000)
+         * for the search to have to step down: one 2 MB below the top. */
+        mark = xbox_ContiguousAllocEx(0x1000, 4096, top - 0x200000, top - 0x1FF001);
+        big = xbox_ContiguousAlloc(50 * MB, MB);
+        snprintf(d, sizeof d, "mark 0x%08X, big 0x%08X", mark, big);
+        check(mark && big && big + 50 * MB <= mark && (big & (MB - 1)) == 0,
+              "and with a 1 MB alignment, aligned and below it", d);
+        if (big)
+            xbox_ContiguousFree(big);
+        if (mark)
+            xbox_ContiguousFree(mark);
+
+        /* The size gate's edge: under a 24 MB bound there are 8 MB above the
+         * reserve and 15 MB less page 0 below it. One page past the larger
+         * side goes top-down; one page fewer still fits below, bottom up. */
+        big = xbox_ContiguousAllocEx(15 * MB, 4096, 0, 24 * MB - 1);
+        snprintf(d, sizeof d, "got 0x%08X", big);
+        check(big && big - XBOX_CONTIG_BASE + 15 * MB == 24 * MB,
+              "15 MB under a 24 MB bound is placed top-down", d);
+        if (big)
+            xbox_ContiguousFree(big);
+        big = xbox_ContiguousAllocEx(15 * MB - 0x1000, 4096, 0, 24 * MB - 1);
+        snprintf(d, sizeof d, "got 0x%08X", big);
+        check(big && big - XBOX_CONTIG_BASE + 15 * MB - 0x1000 <= 15 * MB,
+              "and a page less fits below the reserve", d);
+        if (big)
+            xbox_ContiguousFree(big);
+
+        /* Fill everything outside the reserve, 1 MB then a page at a time. */
+        for (k = 0; k < 2; k++) {
+            uint32_t sz = k ? 0x1000 : MB, c;
+            while (n < sizeof blocks / sizeof blocks[0]
+                   && (c = xbox_ContiguousAlloc(sz, 4096)) != 0) {
+                uint32_t phys = c - XBOX_CONTIG_BASE;
+                if (phys < 16 * MB && phys + sz > 15 * MB)
+                    in_reserve++;
+                blocks[n++] = c;
+            }
+        }
+        snprintf(d, sizeof d, "%u blocks, %u of them in 15-16 MB", n, in_reserve);
+        check(n < sizeof blocks / sizeof blocks[0] && in_reserve == 0,
+              "a full arena refuses a small request, the reserve kept", d);
+        low = xbox_ContiguousAllocEx(0x1000, 4096, 0, 0x00FFFFFFu);
+        snprintf(d, sizeof d, "got 0x%08X", low);
+        check(low && low - XBOX_CONTIG_BASE >= 15 * MB
+              && low - XBOX_CONTIG_BASE < 16 * MB,
+              "and the reserve still serves a low-16-MB request", d);
+        if (low)
+            xbox_ContiguousFree(low);
+        while (n)
+            xbox_ContiguousFree(blocks[--n]);
+    }
+
+    /* 7. Contiguous memory can be given back. */
     if (!ext) {
         uint32_t c1 = xbox_ContiguousAlloc(0x20000, 4096);
         uint32_t c2;
@@ -463,7 +558,7 @@ int main(int argc, char **argv)
         }
     }
 
-    /* 7. The physical range of MmAllocateContiguousMemoryEx is honoured. */
+    /* 8. The physical range of MmAllocateContiguousMemoryEx is honoured. */
     if (!ext) {
         const uint32_t MB = 1024u * 1024u;
         uint32_t c = 0, lo, hi;
@@ -499,7 +594,7 @@ int main(int argc, char **argv)
         }
     }
 
-    /* 8. A page allocation owns whole pages. */
+    /* 9. A page allocation owns whole pages. */
     {
         uint32_t b, sz = 0x46500, small, st, nb = 0;
 

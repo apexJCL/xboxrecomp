@@ -5577,6 +5577,49 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
             p = (q + align_pages - 1) & ~(align_pages - 1);
         }
     }
+    /* Too big for either side of the low reserve: place it the way the
+     * console kernel does, from the top down, which crosses the reserve but
+     * leaves the low pages free. Test Drive: Eve of Destruction's memory
+     * manager asks for one 50 MB block at boot; with the 1 MB reserve at
+     * 15 MB the largest run above it is ~48 MB, the request failed, and the
+     * title panicked with "Can't alloc 51200K".
+     *
+     * Only for a request that could never fit beside the reserve, even in
+     * an empty arena (alignment aside). An ordinary request that failed
+     * because the arena is full or fragmented stays refused: letting it
+     * into 15-16 MB would take the pages the reserve keeps for the
+     * low-memory GPU buffers (the EndVisibilityTest out-of-memory it was
+     * made for). */
+    if (!result && limit > CONTIG_LOW_RESERVE_END && n <= limit) {
+        /* The room each side of the reserve has in an empty arena. From
+         * the caller's bound, not lo_page: g_contig_first_free moves with
+         * the arena's use. Page 0 is never free. */
+        uint32_t bottom = (uint32_t)(((uint64_t)phys_lo + CONTIG_PAGE - 1) / CONTIG_PAGE);
+        uint32_t below, above = limit - CONTIG_LOW_RESERVE_END;
+
+        if (bottom < 1) bottom = 1;
+        below = bottom < CONTIG_LOW_RESERVE_START
+                ? CONTIG_LOW_RESERVE_START - bottom : 0;
+
+        p = (limit - n) & ~(align_pages - 1);
+        while (n > below && n > above && p >= lo_page) {
+            for (q = p; q < p + n && !g_contig_used[q]; q++)
+                ;
+            if (q == p + n) {
+                contig_take(p, n);
+                result = XBOX_CONTIG_BASE + p * CONTIG_PAGE;
+                fprintf(stderr, "  [CONTIG] %u KB placed top-down at 0x%08X "
+                        "(does not fit beside the low reserve)\n",
+                        n * (CONTIG_PAGE / 1024), result);
+                fflush(stderr);
+                break;
+            }
+            /* q is the used page that stopped us: retry ending below it. */
+            if (q < n + lo_page)
+                break;
+            p = (q - n) & ~(align_pages - 1);
+        }
+    }
     if (result) {
         g_contig_allocs++;
         contig_report("alloc", result, n);
