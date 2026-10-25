@@ -5560,6 +5560,32 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
             p = (q + align_pages - 1) & ~(align_pages - 1);
         }
     }
+    /* Too big for either side of the low reserve: place it the way the
+     * console kernel does, from the top down, which crosses the reserve but
+     * leaves the low pages free. Test Drive: Eve of Destruction's memory
+     * manager asks for one 50 MB block at boot; with the 1 MB reserve at
+     * 15 MB the largest run above it is ~48 MB, the request failed, and the
+     * title panicked with "Can't alloc 51200K". */
+    if (!result && limit > CONTIG_LOW_RESERVE_END && n <= limit) {
+        uint32_t lo = lo_page;
+        p = (limit - n) & ~(align_pages - 1);
+        while (p >= lo) {
+            for (q = p; q < p + n && !g_contig_used[q]; q++)
+                ;
+            if (q == p + n) {
+                contig_take(p, n);
+                result = XBOX_CONTIG_BASE + p * CONTIG_PAGE;
+                fprintf(stderr, "  [CONTIG] %u KB placed top-down at 0x%08X "
+                        "(does not fit beside the low reserve)\n",
+                        n * (CONTIG_PAGE / 1024), result);
+                break;
+            }
+            /* q is the used page that stopped us: retry ending below it. */
+            if (q < n + lo)
+                break;
+            p = (q - n) & ~(align_pages - 1);
+        }
+    }
     if (result) {
         g_contig_allocs++;
         contig_report("alloc", result, n);
