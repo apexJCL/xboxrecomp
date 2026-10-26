@@ -4969,6 +4969,26 @@ static void contig_take(uint32_t first, uint32_t n)
         g_contig_first_free++;
 }
 
+/* Below (xbox_PhysNoteRamName). */
+static volatile uint8_t g_phys_ram_named[CONTIG_PAGES];
+
+/* A page this arena may hand out: free, and its number does not already name
+ * a live heap page (MmGetPhysicalAddress). One number would then name two
+ * pages, and a device given it picks RAM: Kung Fu Chaos reloads its menu music
+ * into contiguous memory whose numbers DirectSound had named for heap sounds
+ * still loaded, and the APU played those heap bytes for part of every lap of
+ * the stream (a harsh 600 ms loop at the character select).
+ * RECOMP_CONTIG_AVOID_NAMED=0 hands such pages out as before. */
+static int contig_free_page(uint32_t q)
+{
+    static int avoid = -1;
+    if (avoid < 0) {
+        const char *e = getenv("RECOMP_CONTIG_AVOID_NAMED");
+        avoid = !(e && e[0] == '0');
+    }
+    return !g_contig_used[q] && !(avoid && g_phys_ram_named[q]);
+}
+
 uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
                                 uint32_t phys_lo, uint32_t phys_hi)
 {
@@ -4999,7 +5019,7 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
             p = (CONTIG_LOW_RESERVE_END + align_pages - 1) & ~(align_pages - 1);
             continue;
         }
-        for (q = p; q < p + n && !g_contig_used[q]; q++)
+        for (q = p; q < p + n && contig_free_page(q); q++)
             ;
         if (q == p + n) {
             contig_take(p, n);
@@ -5007,7 +5027,7 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
             break;
         }
         /* Skip the used run that stopped us, then realign. */
-        while (q < limit && g_contig_used[q]) q++;
+        while (q < limit && !contig_free_page(q)) q++;
         p = (q + align_pages - 1) & ~(align_pages - 1);
     }
     if (result) {
@@ -5179,8 +5199,6 @@ uint32_t xbox_ContiguousInUseBytes(void)
  * pass late (or a cleared one a pass early); the title fills a buffer after
  * naming it and frees it after stopping the voice, so a stale read costs at
  * most one pass of one voice. */
-static volatile uint8_t g_phys_ram_named[CONTIG_PAGES];
-
 void xbox_PhysNoteRamName(uint32_t va)
 {
     if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE)
