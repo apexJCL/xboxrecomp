@@ -1274,7 +1274,38 @@ static void *mcpx_apu_frame_thread(void *arg)
                           (fectl & NV_PAPU_FECTL_FEMETHMODE_TRAPPED) &&
                           !g_test_tone.active;
 
-        hs_trap(fe_trapped);
+        /* The title turned the SE off (SECTL XCNTMODE) after it had run:
+         * xemu's frame thread produces no frame then, as for a trapped front
+         * end. The lightweight branch below advanced the frame counter and
+         * handed the device its 32 silent samples a frame: Kung Fu Chaos
+         * turns the SE off for one to four frames during a match, and each
+         * time left 32-128 samples of digital zero in the middle of the
+         * sound, ending on a period boundary (crackle). Only for a moment
+         * (RECOMP_APU_SE_OFF_HOLD_MS, 100 by default, 0: off): a title that
+         * leaves it off keeps the software mixer running as before. */
+        bool se_off = false;
+        {
+            static int64_t off_since_us, hold_us = -1;
+            static bool ever_on;
+            if (hold_us < 0) {
+                const char *e = getenv("RECOMP_APU_SE_OFF_HOLD_MS");
+                long ms = e && *e ? strtol(e, NULL, 10) : 100;
+                if (ms < 0) ms = 0;
+                if (ms > 10000) ms = 10000;   /* a bound, not a preference */
+                hold_us = (int64_t)ms * 1000;
+            }
+            if (xcntmode != NV_PAPU_SECTL_XCNTMODE_OFF) {
+                off_since_us = 0;
+                ever_on = ever_on || apu_active;
+            } else if (ever_on && hold_us > 0 && !g_test_tone.active) {
+                int64_t now = qemu_clock_get_us(QEMU_CLOCK_REALTIME);
+                if (!off_since_us)
+                    off_since_us = now;
+                se_off = now - off_since_us < hold_us;
+            }
+        }
+
+        hs_trap(fe_trapped || se_off);
 
         if (apu_active && !g_test_tone.active) {
             /* Full pipeline: VP voices → DSP → monitor → waveOut */
@@ -1293,7 +1324,7 @@ static void *mcpx_apu_frame_thread(void *arg)
             } else {
                 se_frame(d);
             }
-        } else if (fe_trapped) {
+        } else if (fe_trapped || se_off) {
             /* The title has the APU on, but the front end is trapped (a voice
              * went idle under FETFORCE1) and stays so until DirectSound's
              * service routine clears FECTL, or the title halted it. No frame
@@ -1349,9 +1380,11 @@ static void *mcpx_apu_frame_thread(void *arg)
         mcpx_apu_vp_trace_flush();
         SwitchToThread();
         apu_lockstat_lock(d, APU_LOCK_FRAME);
-        if (fe_trapped &&
-            (qatomic_read(&d->regs[NV_PAPU_FECTL]) &
-             NV_PAPU_FECTL_FEMETHMODE_TRAPPED)) {
+        if ((fe_trapped &&
+             (qatomic_read(&d->regs[NV_PAPU_FECTL]) &
+              NV_PAPU_FECTL_FEMETHMODE_TRAPPED))
+            || (se_off && GET_MASK(qatomic_read(&d->regs[NV_PAPU_SECTL]),
+                                   NV_PAPU_SECTL_XCNTMODE) == NV_PAPU_SECTL_XCNTMODE_OFF)) {
             /* Still trapped after the delivery (held off at raised IRQL, or
              * cleared from a DPC): give the title a millisecond with the lock
              * dropped rather than spinning on it. */
