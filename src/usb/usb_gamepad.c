@@ -558,6 +558,31 @@ static void pad_script_apply(int pad, uint8_t *out)
     }
 }
 
+void usb_gamepad_out(int pad, const uint8_t *d, int len)
+{
+    static int off = -1;
+    static WORD last[4][2];
+    XBOX_VIBRATION v;
+
+    if (off < 0) {
+        const char *e = getenv("RECOMP_RUMBLE");   /* =0: the pad never vibrates */
+        off = e && e[0] == '0';
+    }
+    if (off || len < 6 || d[0] != 0x00 || d[1] < 6)
+        return;
+    v.wLeftMotorSpeed = (WORD)(d[2] | (d[3] << 8));
+    v.wRightMotorSpeed = (WORD)(d[4] | (d[5] << 8));
+    /* The title sends the report over and over; only a change goes on. */
+    if (last[pad & 3][0] == v.wLeftMotorSpeed && last[pad & 3][1] == v.wRightMotorSpeed)
+        return;
+    /* Remembered only once it reached the pad: a report sent while no
+     * controller was there goes again when the title repeats it. */
+    if (xbox_InputSetState((DWORD)pad, &v) == ERROR_SUCCESS) {
+        last[pad & 3][0] = v.wLeftMotorSpeed;
+        last[pad & 3][1] = v.wRightMotorSpeed;
+    }
+}
+
 int usb_gamepad_report(int pad, uint8_t *out, int max)
 {
     XBOX_INPUT_STATE state;

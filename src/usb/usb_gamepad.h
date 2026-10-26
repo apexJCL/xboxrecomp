@@ -24,6 +24,11 @@ typedef struct {
     uint16_t wLength;
 } UsbSetup;
 
+/* A report the title sent the pad (interrupt OUT, or SET_REPORT's data):
+ * the rumble report, 00 06 then the left and right motor speeds (LE 16-bit),
+ * goes to the host pad. */
+void usb_gamepad_out(int pad, const uint8_t *data, int len);
+
 /* Answer a control request.
  *
  * Returns the number of bytes written to `out` (at most `max`), or -1 if the

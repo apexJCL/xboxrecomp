@@ -789,9 +789,22 @@ static uint32_t ohci_do_td(OhciController *hc, uint32_t ed0, uint32_t td)
          * pad unresponsive. */
         moved = len;
         if (endpoint == 0) {
+            /* SET_REPORT (21 09) on the control pipe: a rumble report. */
+            if (g_setup_pending && g_setup.bmRequestType == 0x21 && g_setup.bRequest == 0x09
+                    && len >= 6) {
+                uint8_t *d = td_buf(td, cbp, (uint32_t)len);
+                if (d)
+                    usb_gamepad_out(pad, d, len);
+            }
             g_setup_pending = 0;
             s_n_out_ep0++;
         } else {
+            /* The interrupt OUT endpoint: a rumble report. */
+            if (len >= 6) {
+                uint8_t *d = td_buf(td, cbp, (uint32_t)len);
+                if (d)
+                    usb_gamepad_out(pad, d, len);
+            }
             s_n_out_other++;
         }
     }
