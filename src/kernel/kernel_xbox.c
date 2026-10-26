@@ -11,6 +11,7 @@
 
 #include "kernel.h"
 #include <string.h>
+#include <stdlib.h>
 
 /* ============================================================================
  * Exported Data Objects
@@ -148,6 +149,17 @@ NTSTATUS __stdcall xbox_ExQueryNonVolatileSetting(
         /* NTSC with widescreen and HDTV support enabled */
         if (ValueLength >= sizeof(ULONG)) {
             *(PULONG)Value = XC_VIDEO_FLAGS_WIDESCREEN | XC_VIDEO_FLAGS_HDTV;
+            /* RECOMP_XC_VIDEO=<value>: the setting as the XDK lays it
+             * out -- WIDESCREEN 0x00010000, HDTV_720p 0x00020000, HDTV_1080i
+             * 0x00040000, HDTV_480p 0x00080000, LETTERBOX 0x00100000, PAL_60
+             * 0x00400000. The default above sets none of those bits, so
+             * XGetVideoFlags reports no progressive mode, and Kung Fu Chaos
+             * renders its matches as 640x240 fields (half the lines). */
+            {
+                const char *e = getenv("RECOMP_XC_VIDEO");
+                if (e && *e)
+                    *(PULONG)Value = (ULONG)strtoul(e, NULL, 0);
+            }
             if (Type) *Type = 4; /* REG_DWORD */
             if (ResultLength) *ResultLength = sizeof(ULONG);
         }

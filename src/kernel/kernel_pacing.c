@@ -31,11 +31,25 @@
 
 /* ── The vblank schedule ─────────────────────────────────── */
 
+/* RECOMP_VBLANK_HZ=<n> (experimental): the vblank rate, 60 by default.
+ * A title that steps its simulation once a vblank runs faster with it; one
+ * that times itself draws more frames. */
+static uint64_t vblank_hz(void)
+{
+    static uint64_t hz;
+    if (!hz) {
+        const char *e = getenv("RECOMP_VBLANK_HZ");
+        unsigned long v = e ? strtoul(e, NULL, 10) : 0;
+        hz = (v >= 30 && v <= 480) ? v : XBOX_VBLANK_HZ;
+    }
+    return hz;
+}
+
 static uint64_t vblank_due(const XboxVblankSchedule *s, uint64_t n)
 {
     /* n * 1e9 overflows 64 bits only after ~9.7 years of vblanks; the
      * 100 ms restart rule resets n long before a host runs that long. */
-    return s->t0_ns + n * 1000000000ull / XBOX_VBLANK_HZ;
+    return s->t0_ns + n * 1000000000ull / vblank_hz();
 }
 
 int xbox_VblankSchedule(XboxVblankSchedule *s, uint64_t now_ns,
