@@ -6609,6 +6609,132 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
     }
     return 0;
 }
+/* ---- 2D blits ---------------------------------------------------------------
+ *
+ * XDK D3D binds NV_CONTEXT_SURFACES_2D (NV062) on subchannel 3 and
+ * NV_IMAGE_BLIT (NV09F) on subchannel 2 for CopyRects and friends. Nothing
+ * executed them, so whatever a title copied that way stayed as it was:
+ * Kung Fu Chaos fills its 640x480 menu and pause backgrounds with them, and
+ * they stayed black. Carried out here in guest memory, after the backend has
+ * written the source back (sync_guest); the destination is then decoded like
+ * any texture the title wrote. A destination a GPU backend holds as a render
+ * target is not updated on the GPU (logged). RECOMP_BLIT_2D=0 turns it off. */
+static struct {
+    uint32_t fmt, pitch, src, dst;   /* NV062 */
+    uint32_t op;                     /* NV09F_SET_OPERATION + 1; 0 = never set */
+    uint32_t in, out;                /* NV09F points, y << 16 | x */
+} s_2d;
+static uint64_t s_2d_blits;
+
+static uint32_t blit_bpp(uint32_t fmt)
+{
+    switch (fmt) {
+    case 0x01: return 1;                         /* LE_Y8 */
+    case 0x02: case 0x03: case 0x04: return 2;   /* X1R5G5B5, X1R5G5B5_O1R5G5B5, R5G6B5 */
+    case 0x05: case 0x06: case 0x07: case 0x0A: case 0x0B: return 4;   /* 32-bit */
+    default: return 0;
+    }
+}
+
+static void blit_2d(uint32_t size)
+{
+    static int off = -1;
+    uint8_t *mem = (uint8_t *)xbox_GetMemoryOffset();
+    uint32_t w = size & 0xFFFF, h = size >> 16;
+    uint32_t sx = s_2d.in & 0xFFFF, sy = s_2d.in >> 16;
+    uint32_t dx = s_2d.out & 0xFFFF, dy = s_2d.out >> 16;
+    uint32_t sp = s_2d.pitch & 0xFFFF, dp = s_2d.pitch >> 16;
+    uint32_t bpp = blit_bpp(s_2d.fmt), y, src_va, dst_va;
+    const struct nv2a_pb_backend *be = nv2a_pb_get_backend();
+
+    if (off < 0) {
+        const char *e = getenv("RECOMP_BLIT_2D");
+        off = e && e[0] == '0';
+    }
+    if (off || !w || !h || !bpp || !sp || !dp)
+        return;
+    if (s_2d.op && s_2d.op != 3 + 1) {   /* only SRCCOPY is carried out */
+        static int said;
+        if (said++ < 4)
+            fprintf(stderr, "  [BLIT2D] operation %u not supported: dropped\n", s_2d.op - 1);
+        return;
+    }
+    /* A row wider than either pitch, or a rectangle that runs past the 4 GB
+     * guest space, is not a copy XDK D3D makes: dropped rather than guessed. */
+    if ((uint64_t)(sx + w) * bpp > sp || (uint64_t)(dx + w) * bpp > dp
+            || (uint64_t)dma_resolve(s_2d.src) + (uint64_t)(sy + h) * sp > 0xFFFFFFFFull
+            || (uint64_t)dma_resolve(s_2d.dst) + (uint64_t)(dy + h) * dp > 0xFFFFFFFFull) {
+        static int said;
+        if (said++ < 4)
+            fprintf(stderr, "  [BLIT2D] dropped: (%u,%u) %ux%u bpp %u pitch %u -> (%u,%u) pitch %u\n",
+                    sx, sy, w, h, bpp, sp, dx, dy, dp);
+        return;
+    }
+    if (be->on_blit && be->on_blit(s_2d.src, sx, sy, sp, s_2d.dst, dx, dy, dp, w, h, bpp)) {
+        if (s_2d_blits++ < 10)
+            fprintf(stderr, "  [BLIT2D] #%llu flip %u: 0x%08X -> 0x%08X %ux%u on the backend\n",
+                    (unsigned long long)s_2d_blits, s_gpu.flips, s_2d.src, s_2d.dst, w, h);
+        return;
+    }
+    src_va = dma_resolve(s_2d.src);
+    dst_va = dma_resolve(s_2d.dst);
+    if (be->sync_guest)
+        be->sync_guest(s_2d.src, sp, sx + w, sy + h);
+    /* Rows in the order that keeps an overlapping copy intact: bottom up when
+     * the destination starts after the source (memmove covers each row). */
+    {
+        uint64_t s0 = (uint64_t)src_va + (uint64_t)sy * sp + (uint64_t)sx * bpp;
+        uint64_t d0 = (uint64_t)dst_va + (uint64_t)dy * dp + (uint64_t)dx * bpp;
+        int up = d0 > s0;
+        for (y = 0; y < h; y++) {
+            uint32_t r = up ? h - 1 - y : y;
+            memmove(mem + dst_va + (size_t)(dy + r) * dp + (size_t)dx * bpp,
+                    mem + src_va + (size_t)(sy + r) * sp + (size_t)sx * bpp,
+                    (size_t)w * bpp);
+        }
+    }
+    if (s_2d_blits++ < 30)
+        fprintf(stderr, "  [BLIT2D] #%llu flip %u: 0x%08X (%u,%u) pitch %u -> 0x%08X (%u,%u)"
+                " pitch %u, %ux%u, format 0x%X (%u bpp)\n",
+                (unsigned long long)s_2d_blits, s_gpu.flips, s_2d.src, sx, sy, sp,
+                s_2d.dst, dx, dy, dp, w, h, s_2d.fmt, bpp);
+}
+
+/* Subchannels 2 and 3 under XDK D3D's fixed binding. 1 if taken. */
+static int method_2d(uint32_t subch, uint32_t method, uint32_t param)
+{
+    /* The class bound on each subchannel, from SET_OBJECT through RAMHT
+     * (instance word 0, bits 7:0); 0 while unknown, which keeps XDK D3D's
+     * fixed binding (NV062 on 3, NV09F on 2) for a pushbuffer that never
+     * shows the bind. */
+    static uint8_t cls[8];
+    if (method == 0x0000) {
+        struct ctxdma_hit hit;
+        uint32_t base, limit, ramht;
+        cls[subch & 7] = ctxdma_lookup(param, &base, &limit, &hit, &ramht)
+                         ? (uint8_t)(hit.w0 & 0xFF) : 0;
+        return 0;
+    }
+    if ((subch == 3 && cls[3] && cls[3] != 0x62) || (subch == 2 && cls[2] && cls[2] != 0x9F))
+        return 0;
+    if (subch == 3) {
+        switch (method) {
+        case 0x0300: s_2d.fmt = param; return 1;     /* NV062_SET_COLOR_FORMAT */
+        case 0x0304: s_2d.pitch = param; return 1;   /* NV062_SET_PITCH */
+        case 0x0308: s_2d.src = param; return 1;     /* NV062_SET_OFFSET_SOURCE */
+        case 0x030C: s_2d.dst = param; return 1;     /* NV062_SET_OFFSET_DESTIN */
+        }
+    } else if (subch == 2) {
+        switch (method) {
+        case 0x0300: s_2d.in = param; return 1;      /* NV09F_POINT_IN */
+        case 0x0304: s_2d.out = param; return 1;     /* NV09F_POINT_OUT */
+        case 0x0308: blit_2d(param); return 1;       /* NV09F_SIZE: the copy */
+        case 0x02FC: s_2d.op = param + 1; return 1;  /* NV09F_SET_OPERATION */
+        }
+    }
+    return 0;
+}
+
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
@@ -6720,6 +6846,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         }
     }
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
+        if (method_2d(subch, method, param))
+            return;
         note_unhandled(method, param);
         return;
     }

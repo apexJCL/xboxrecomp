@@ -344,6 +344,14 @@ struct nv2a_pb_backend {
      * Called on the ack thread only, like on_flip. NULL: guest memory is
      * already current (CPU) or never read (D3D11 dumps itself). */
     void (*sync_guest)(uint32_t offset, uint32_t pitch, uint32_t w, uint32_t h);
+    /* on_blit (optional): an NV09F image blit, w x h at bpp bytes a pixel,
+     * from (sx, sy) of the surface at colour offset `src` (pitch sp) to
+     * (dx, dy) of `dst` (pitch dp). 1 when the backend did it on its own
+     * memory (the guest bytes at `dst` are then not written); 0 for the
+     * executor to copy guest memory itself. */
+    int  (*on_blit)(uint32_t src, uint32_t sx, uint32_t sy, uint32_t sp,
+                    uint32_t dst, uint32_t dx, uint32_t dy, uint32_t dp,
+                    uint32_t w, uint32_t h, uint32_t bpp);
 };
 
 /* Route the executor's events to `backend`. NULL restores the CPU rasteriser.
