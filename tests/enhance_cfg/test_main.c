@@ -20,6 +20,7 @@
 #include "nv2a_backend_common.h"
 #include "nv2a_overlay.h"
 #include "nv2a_tex_pack.h"
+#include "pad_map.h"
 #include "recomp_cfg.h"
 #include "recomp_env.h"
 #include "recomp_exe_dir.h"
@@ -1000,6 +1001,24 @@ DWORD xbox_input_backend_read_host(DWORD slot, struct xbox_host_pad *host)
     memset(host, 0, sizeof *host);
     return ERROR_DEVICE_NOT_CONNECTED;
 }
+/* input_core.c's pad setup, kept so [input.pad] round-trips here. */
+static xbox_pad_setup s_pad_setup;
+static int s_pad_setup_set;
+void xbox_InputSetPadSetup(const xbox_pad_setup *s)
+{
+    s_pad_setup_set = s != NULL;
+    if (s)
+        s_pad_setup = *s;
+}
+void xbox_InputPadSetup(xbox_pad_setup *out)
+{
+    if (s_pad_setup_set)
+        *out = s_pad_setup;
+    else
+        xbox_PadSetupIdentity(out);
+}
+static int s_glyphs = XBOX_PAD_FAMILY_AUTO;
+void xbox_InputSetGlyphFamily(int family) { s_glyphs = family; }
 
 static void enhance_reset_env(void)
 {
@@ -1717,6 +1736,127 @@ static void test_exe_dir(void)
     }
 }
 
+/* ── [input.pad] (enhance_input.c, design D3 of gamepad-input-ux) ──── */
+
+static xbox_pad_setup pad_now(void)
+{
+    xbox_pad_setup s;
+    xbox_InputPadSetup(&s);
+    return s;
+}
+
+static void test_input_pad(void)
+{
+    static const char defaults[] =
+        "[input.pad]\n"
+        "x = [\"west\", \"paddle3\"]\n"
+        "dpad_up = [\"dpad_up\", \"paddle1\"]\n";
+    xbox_pad_setup s, id;
+    const char *out;
+
+    MKDIR("ecfg_in");
+    xbox_PadSetupIdentity(&id);
+
+    /* No [input.pad]: the identity, and no pad line. */
+    out = input_load(NULL, NULL);
+    s = pad_now();
+    CHECK(xbox_PadSetupIsIdentity(&s));
+    CHECK(strstr(out, "[INPUT] pad map") == NULL);
+    CHECK(s_glyphs == XBOX_PAD_FAMILY_AUTO);
+
+    /* The defaults' second cells go to the alternate map. */
+    out = input_load(defaults, NULL);
+    s = pad_now();
+    CHECK(s.map.source[INPUT_X] == INPUT_SRC_WEST && s.alt.source[INPUT_X] == INPUT_SRC_PADDLE3);
+    CHECK(s.map.source[INPUT_DPAD_UP] == INPUT_SRC_DPAD_UP
+          && s.alt.source[INPUT_DPAD_UP] == INPUT_SRC_PADDLE1);
+    CHECK(s.map.source[INPUT_A] == INPUT_SRC_SOUTH && s.alt.source[INPUT_A] == INPUT_SRC_NONE);
+    CHECK(strstr(out, "[INPUT] pad map: 2 (") != NULL);
+    CHECK(strstr(out, "config error") == NULL);
+    capture_begin();
+    enhance_cfg_report_unused();
+    out = capture_end();
+    CHECK(strstr(out, "input.pad") == NULL);
+
+    /* The player's file: a control wins whole, and a source it binds leaves
+     * the controls below (paddle3 off x, left_shoulder off white). */
+    out = input_load(defaults, "[input.pad]\ny = \"paddle3\"\nb = \"left_shoulder\"\n");
+    s = pad_now();
+    CHECK(s.map.source[INPUT_Y] == INPUT_SRC_PADDLE3 && s.alt.source[INPUT_Y] == INPUT_SRC_NONE);
+    CHECK(s.map.source[INPUT_X] == INPUT_SRC_WEST && s.alt.source[INPUT_X] == INPUT_SRC_NONE);
+    CHECK(s.map.source[INPUT_B] == INPUT_SRC_LEFT_SHOULDER);
+    CHECK(s.map.source[INPUT_WHITE] == INPUT_SRC_NONE);
+    CHECK(s.map.source[INPUT_BLACK] == INPUT_SRC_RIGHT_SHOULDER);
+    CHECK(strstr(out, " +2 (ecfg_in/user.toml)") != NULL);
+
+    /* A source removed from cell 0 moves cell 1 up. */
+    out = input_load(defaults, "[input.pad]\na = \"west\"\n");
+    s = pad_now();
+    CHECK(s.map.source[INPUT_A] == INPUT_SRC_WEST);
+    CHECK(s.map.source[INPUT_X] == INPUT_SRC_PADDLE3 && s.alt.source[INPUT_X] == INPUT_SRC_NONE);
+
+    /* [] and "none" unbind; sticks swap; options. */
+    out = input_load(NULL, "[input]\npad_deadzone_left = 20\npad_threshold = 30\n"
+                     "pad_invert_ry = true\nglyphs = \"steam\"\n"
+                     "[input.pad]\nback = []\nstart = \"none\"\n"
+                     "left_stick = \"right\"\nright_stick = \"none\"\n");
+    s = pad_now();
+    CHECK(s.map.source[INPUT_BACK] == INPUT_SRC_NONE && s.map.source[INPUT_START] == INPUT_SRC_NONE);
+    CHECK(s.map.left_stick == INPUT_STICK_RIGHT && s.map.right_stick == INPUT_STICK_NONE);
+    CHECK(s.map.deadzone_left == 20 && s.map.deadzone_right == 0);
+    CHECK(s.map.button_threshold == 30 && s.alt.button_threshold == 30);
+    CHECK(!s.invert_ly && s.invert_ry);
+    CHECK(s_glyphs == XBOX_PAD_FAMILY_STEAM);
+    CHECK(strstr(out, "deadzone=20/0%") != NULL && strstr(out, "invert=ry") != NULL);
+    CHECK(strstr(out, "config error") == NULL);
+
+    /* The env deadzone keeps its integer meaning; the file key wins, said once. */
+    recomp_env_set(RENV_PAD_DEADZONE, "7849");
+    out = input_load(NULL, "[input]\npad_deadzone_right = 10\n");
+    CHECK(strstr(out, "input.pad_deadzone_right wins over RECOMP_PAD_DEADZONE=7849 on the"
+                      " right stick") != NULL);
+    out = input_load(NULL, NULL);
+    CHECK(strstr(out, "wins over RECOMP_PAD_DEADZONE") == NULL);
+    recomp_env_set(RENV_PAD_DEADZONE, NULL);
+
+    /* Mistakes: old spellings, keyboard-only controls, a source twice in one
+     * file, too many cells, a bad stick, out of range; guide warns. */
+    out = input_load(NULL, "[input]\npad_deadzone_left = 99\nglyphs = \"sega\"\n"
+                     "[input.pad]\nltrigger = \"left_trigger\"\na = \"cross\"\n"
+                     "left_stick_up = \"dpad_up\"\nb = \"south\"\ny = [\"west\", \"north\", \"east\"]\n"
+                     "x = \"south\"\nleft_stick = \"both\"\nback = \"guide\"\n");
+    s = pad_now();
+    CHECK(strstr(out, "unknown control 'ltrigger' under [input.pad]") != NULL);
+    CHECK(strstr(out, "unknown control 'left_stick_up' under [input.pad]") != NULL);
+    CHECK(strstr(out, "unknown pad source 'cross'") != NULL);
+    CHECK(strstr(out, "'south' already mapped to input.pad.b") != NULL);
+    CHECK(strstr(out, "more than 2 sources; 'east' ignored") != NULL);
+    CHECK(strstr(out, "left_stick 'both' is not one of left, right, none") != NULL);
+    CHECK(strstr(out, "input.pad_deadzone_left 99 out of range 0 .. 95") != NULL);
+    CHECK(strstr(out, "glyphs 'sega' is not one of") != NULL);
+    CHECK(strstr(out, "'guide': most hosts keep Guide") != NULL);
+    CHECK(s.map.source[INPUT_B] == INPUT_SRC_SOUTH && s.map.source[INPUT_X] == INPUT_SRC_NONE);
+    CHECK(s.map.source[INPUT_Y] == INPUT_SRC_WEST && s.alt.source[INPUT_Y] == INPUT_SRC_NORTH);
+    CHECK(s.map.source[INPUT_A] == INPUT_SRC_NONE);   /* named, nothing valid */
+    CHECK(s.map.source[INPUT_BACK] == INPUT_SRC_GUIDE);
+    CHECK(s.map.left_stick == INPUT_STICK_LEFT && s.map.deadzone_left == 0);
+    CHECK(s_glyphs == XBOX_PAD_FAMILY_AUTO);
+
+    /* RECOMP_CONFIG=none: the identity. */
+    recomp_env_set(RENV_CONFIG, "none");
+    remove_defaults();
+    capture_begin();
+    enhance_cfg_init("ecfg_in", NULL);
+    enhance_input_init();
+    out = capture_end();
+    s = pad_now();
+    CHECK(xbox_PadSetupIsIdentity(&s));
+    recomp_env_set(RENV_CONFIG, NULL);
+    remove("ecfg_in/user.toml");
+    enhance_cfg_shutdown();
+    (void)id;
+}
+
 int main(void)
 {
     test_subset();
@@ -1731,6 +1871,7 @@ int main(void)
     test_present_surface();
     test_tex_pack_key();
     test_input();
+    test_input_pad();
     test_exe_dir();
     printf("enhance_cfg: %d checks, %d failed\n", s_checks, s_fail);
     return s_fail ? 1 : 0;

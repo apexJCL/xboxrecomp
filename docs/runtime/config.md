@@ -506,6 +506,13 @@ table of `src/input/README.md` and no mouse.
 | `input.walk_scale` | float | `0.41` .. `1.0` (outside is clamped) | `1.0` | none |
 | `input.chord_delay_ms` | int | `0` .. `100`: a member of a host-action pad chord reaches the game this long after its press, so a chord completed inside the window never does ([input.actions], rule 3) | `0` | `RECOMP_INPUT_CHORD_DELAY_MS` |
 | `[input.actions]` | table | an action name to a binding or a list of them; `[]` unbinds (below) | the actions' defaults | none |
+| `[input.pad]` | table | a Duke control to the host pad sources that drive it (below) | the identity: the game sees what it sees with no file | none |
+| `input.pad_deadzone_left` | int | `0` .. `95`: percent of full deflection; the stick is rescaled so it still reaches full. `0` keeps the raw stick | `0` | none (`RECOMP_PAD_DEADZONE` below) |
+| `input.pad_deadzone_right` | int | as above, for the right stick | `0` | none |
+| `input.pad_threshold` | int | `1` .. `100`: percent a trigger or stick direction must reach to press a digital control it is mapped to | `50` | none |
+| `input.pad_invert_ly` | bool | the left stick's Y axis is inverted, before `left_stick`/`right_stick` swap | `false` | none |
+| `input.pad_invert_ry` | bool | the right stick's Y axis is inverted | `false` | none |
+| `input.glyphs` | string | `"auto"`, `"xbox"`, `"playstation"`, `"nintendo"`, `"steam"`: the button family the overlay names buttons by; `auto` asks the pad (below) | `"auto"` | none |
 
 These defaults are the layer's. The three stick knobs default to the
 legacy keyboard (no ramp, no walk key), so a title that ships no `[input]`
@@ -610,15 +617,76 @@ and how many controls each file decided, lowest file first:
 The `[ENHANCE]` lines do not mention `[input]`, and the golden runs, which
 run under `RECOMP_CONFIG=none`, keep both off.
 
+**The pad map (`[input.pad]`).** Which host pad button or axis drives each
+of the Duke's controls. Without the table the game sees the identity, the
+same pad it saw before the table existed: the face buttons by position,
+White on the left shoulder and Black on the right, the triggers and both
+sticks raw, no deadzone. `src/input/pad_map.c` holds that identity and
+applies the map in `input_core.c`, under upstream's `PadMap`
+(`src/input/input_map.c`).
+
+```toml
+[input.pad]
+a = ["south", "paddle1"]    # two sources: the second is the alternate map
+white = "right_shoulder"
+black = "left_shoulder"
+left_thumb = []             # unbound: the game never sees it
+right_stick = "left"        # the physical left stick drives the Duke's right
+```
+
+Keys are the Duke's controls by the names of `[input.bindings]` (`dpad_up`
+.. `right_trigger`; the eight stick directions are keyboard-only), plus
+`left_stick` and `right_stick`, each `"left"`, `"right"` or `"none"`: which
+physical stick drives it. A value is a host source, a list of up to two, or
+`[]` / `"none"` to unbind. Sources, by upstream's names: `south east west
+north` (the face buttons by position: an Xbox pad's A B X Y, a PlayStation
+pad's cross circle square triangle, a Nintendo pad's B A Y X), `back guide
+start left_stick_click right_stick_click left_shoulder right_shoulder
+dpad_up dpad_down dpad_left dpad_right misc1 touchpad paddle1 .. paddle4
+left_trigger right_trigger`, and the stick directions `left_stick_up` ..
+`right_stick_right`. Upstream's names only: `a` or `lb` as a source is an
+unknown name.
+
+Resolution is that of `[input.bindings]`: per control, the highest file
+that names it wins whole, and a source a higher file maps leaves every
+control a lower file gave it, so `b = "left_shoulder"` in your file takes
+the left shoulder off White. A source named under two controls in one file
+is reported and the second ignored. Mapping `guide` is applied with a
+warning, since most hosts keep Guide for themselves. A map changes which
+sources the host actions may use (below).
+
+`input.pad_deadzone_left` and `_right` are upstream's percent with its
+rescale; `RECOMP_PAD_DEADZONE` keeps its integer meaning (0 .. 32767, the
+stock path) and a file deadzone wins over it on that stick, with one line.
+With a map in force, init logs it after the `[INPUT] config` line, by the
+same per-file counts:
+
+```
+[INPUT] pad map: 3 (./config/config.toml) deadzone=10/0% invert=ry
+[INPUT] config: input.pad_deadzone_left wins over RECOMP_PAD_DEADZONE=4000 on the left stick
+```
+
+**Pad family and Steam Input.** `xbox_InputPadFamily(slot)` says which
+button family a pad has, for the overlay's glyphs: `xbox`, `playstation`,
+`nintendo` (the GameCube adapter too) or `steam` (the Deck's own pad,
+28de:1205). SDL builds take it from SDL's pad type and the vendor and
+product; the XInput backend answers `xbox`. `input.glyphs` other than
+`auto` overrides it for every pad. `xbox_InputSteamInput(slot)` says
+whether Steam Input stands between the pad and the game: on SDL, `on` when
+SDL gives the pad a Steam handle or it is Steam's virtual pad (28de:11ff),
+else `off`; on XInput (Windows, Proton) it cannot tell, and answers
+`maybe` when Steam launched the game (`SteamGameId` set, or `SteamDeck=1`,
+in the environment, read through `recomp_env`), else `off`.
+
 ### Host actions (`[input.actions]`)
 
 An action is something the host does rather than the game: open the menu,
 toggle the stats strip, a mod's free camera. `src/enhance/enhance_actions.c`
-binds actions to keys, to host-only pad buttons and to pad chords, and
-never gives the game a press it would not have had: it reads the host pad
-beside the state the game gets, and only ever takes presses out of that
-state (a consumed chord). Remapping the game's own controls stays with
-`[input.bindings]`.
+binds actions to keys, to host pad sources and to chords of them, and
+never gives the game a press it would not have had: it reads the raw host
+pad, before `[input.pad]` maps it, beside the state the game gets, and only
+ever takes presses out of that state (a consumed chord). Remapping the
+game's own controls stays with `[input.bindings]` and `[input.pad]`.
 
 ```toml
 [input.actions]
@@ -655,32 +723,50 @@ registers its own actions, named after the mod (`camera.free.toggle`).
   modifiers: `F10`, `ctrl+F6`. A plain key fires only with no modifier
   held, and `ctrl+F6` only with Ctrl and no other modifier. Mouse inputs
   are not bindings.
-- **A host-only button** alone: `guide`, `misc1` (share, capture),
-  `paddle1` .. `paddle4` (upper right, upper left, lower right, lower
-  left: the Elite's P1, P3, P2, P4, the Deck's R4, L4, R5, L5, and the
-  DualSense Edge's right back button, left back button, right Fn button
-  and left Fn button), and `touchpad`. The Duke has none of them, so the
-  game never sees one.
-- **A pad chord**: two to eight buttons joined by `+`, from `a b x y
-  black white left_trigger right_trigger start back left_thumb
-  right_thumb dpad_up dpad_down dpad_left dpad_right` and the host-only names, with an
-  optional hold `@<ms>` (`0` .. `2000`). It is read on port 0 (player
-  1) unless it starts with `pad2:` .. `pad4:`. A chord whose first member
-  is host-only and whose others are guest buttons (`guide+a`) is a
-  modifier chord (rule 7).
+- **A host source** alone, by the source names of `[input.pad]`:
+  `guide`, `misc1` (share, capture), `paddle1` .. `paddle4` (upper right,
+  upper left, lower right, lower left: the Elite's P1, P3, P2, P4, the
+  Deck's R4, L4, R5, L5, and the DualSense Edge's right back button, left
+  back button, right Fn button and left Fn button), `touchpad`, or any
+  other source the pad map does not give the game. The identity gives the
+  game none of the first ones, so by default the game never sees them.
+- **A pad chord**: two to eight sources joined by `+`, with an optional
+  hold `@<ms>` (`0` .. `2000`). It is read on port 0 (player 1) unless it
+  starts with `pad2:` .. `pad4:`. A Duke control's name (`a b x y black
+  white left_trigger right_trigger start back left_thumb right_thumb
+  dpad_up` ..) in a binding means the source the identity gives it (`a` is
+  `south`, `white` is `left_shoulder`, `left_thumb` is
+  `left_stick_click`), so a remap in `[input.pad]` never moves a binding:
+  `guide+a` stays Guide plus the south button whatever the map does with
+  them. Names are lower case.
+
+**The kind of a pad binding** follows from which of its sources the pad
+map gives the game (either map, and every direction of a stick a map
+uses), and is worked out again whenever the map changes:
+
+| Sources the game uses | Kind | Fires |
+|---|---|---|
+| none, one source | host-only | on its press |
+| none, a chord | a host-only chord | when all are down, after the hold |
+| some | a modifier chord: the unused ones are the modifiers | rule 7 |
+| all, a chord with `@200` or more | a guest chord | rules 1 and 3 |
+| a single source, or all of a chord with a shorter hold | inactive, with a line | never |
 
 **Rules**, so a binding never takes what the game uses. A refused binding
 gets one line and the rest of the action's bindings stand:
 
-1. A single guest button (`a`, `start`) is refused. A chord of guest
-   buttons needs a hold of at least 200 ms.
+1. A single source the game uses (`a`, `start` under the identity) is
+   inactive. A chord whose sources the game all uses needs a hold of at
+   least 200 ms, or it is inactive.
 2. A key the game receives is refused, and the game keeps it. The check
    is against the effective key map: the compiled-in table, then
    `[input.bindings]`, `input.walk_key` and `input.mouse_release_key`.
    Modifiers count: Ctrl and Shift drive the game in the compiled-in
    table, so `ctrl+F6` is refused unless the player unbinds them.
 3. A chord is consumed. From the moment all of its buttons are down, they
-   reach the game released until each is let go. A chord let go before
+   reach the game released until each is let go; a stick direction
+   (`left_stick_up`) reaches it centred on that half of the axis, so the
+   other way still passes. A chord let go before
    its hold fires nothing. The game does still see the first button's
    press, and masking then gives it a release the player did not make:
    with `back+start`, START pauses BLiNX 2 and is then released. So pick
@@ -689,8 +775,8 @@ gets one line and the rest of the action's bindings stand:
    `input.chord_delay_ms`, which holds each chord member back from the
    game for that long after its press. That costs the same latency on
    those buttons, which is why it is off by default.
-4. The defaults use only F-keys, host-only buttons, modifier chords and
-   chords with a hold.
+4. The defaults use only F-keys, sources the identity leaves to the host,
+   modifier chords and chords with a hold.
 5. A scripted or replayed pad (a game harness's) never fires an action:
    actions read the host pad, which the script does not touch. A key from
    `RECOMP_KBM_SCRIPT` does, because it goes through the same key table
@@ -707,31 +793,43 @@ gets one line and the rest of the action's bindings stand:
    A golden run (`RECOMP_CONFIG=none`) has `hook=off`. The overlay's
    stats and toast layers are armed with the hook and only then: stock
    bakes no font, and a mod's toast is then its log line only.
-7. A modifier chord (`guide+a`) fires on the guest button's press while
-   the host-only button is held; no hold is needed. While the host-only
-   button is held, the guest members of every modifier chord on that port
-   reach the game released from their press until they are let go, even
-   when the host-only button goes first, so the game never sees the A of
-   `guide+a`. A guest member pressed before the host-only one goes to the
-   game and does not complete the chord. The button that closes the menu
-   stays masked after the close until it is let go.
+7. A modifier chord (`guide+a`) fires on the press of its last member
+   the game uses while all its modifiers (the members the game does not
+   use) are held; a hold `@N` is kept, counted from that press. Order in
+   the text does not matter (`left_thumb+guide` is `guide+left_thumb`),
+   and a chord may have several modifiers (`guide+paddle1+a`). While its
+   modifiers are held, the used members of every modifier chord on that
+   port reach the game released from their press until they are let go,
+   even when a modifier is let go first, so the game never sees the A of
+   `guide+a`. A used member pressed before the modifiers goes to the game
+   and does not complete the chord. The button that closes the menu stays
+   masked after the close until it is let go.
 
 The game may stop polling the pad (a loading screen). The flip then reads
 the host pad itself when a port has not been polled for 100 ms, so keys,
 host-only buttons and modifier chords still fire there. Plain chords of
 guest buttons fire only from a poll.
 
-**Errors and the log.** Each refusal names the action, the file and the
-line (or `(default)` for a default), and the binding:
+**Errors and the log.** Each refusal or inactive binding names the action,
+the file and the line (or `(default)` for a default), and the binding. An
+inactive binding names the sources the game has and through which
+controls; it stays in the table and comes back if the map frees them:
 
 ```
-[INPUT] action input.actions.menu.open (./config/config.toml:3): 'a' refused: a single guest button would take it from the game; use a chord of two with a hold (back+left_thumb@400) or a host-only button (guide, paddle1)
-[INPUT] action input.actions.menu.open (./config/config.toml:3): 'back+left_thumb' refused: a chord of guest buttons needs a hold of at least 200 ms (back+left_thumb@400)
-[INPUT] action input.actions.menu.open (./config/config.toml:3): 'a+guide' refused: a chord with a host-only button needs it first and only once (guide+a)
+[INPUT] action input.actions.menu.open (./config/config.toml:3): 'a' inactive: south (the game's a) goes to the game; a single source the game uses would take it from the game; use a chord of two with a hold (back+left_thumb@400) or a source the game does not use (guide, paddle1)
+[INPUT] action input.actions.menu.open (./config/config.toml:3): 'back+left_thumb' inactive: every member goes to the game (back (the game's back), left_stick_click (the game's left_thumb)); such a chord needs a hold of at least 200 ms (@400)
+[INPUT] action input.actions.menu.open (./config/config.toml:3): 'back+lthumb@400' refused: unknown name 'lthumb'
 [INPUT] action input.actions.menu.open (./config/config.toml:3): 'Z' refused: 'Z' is bound to the guest's a (input.bindings); the game keeps it
 [INPUT] action input.actions.menu.open (./config/config.toml:3): more than 8 bindings; the rest skipped
 [INPUT] config warning: ./config/config.toml:4: no action named 'menu.opne'
 [INPUT] config warning: input.chord_delay_ms=500 out of 0..100; using 100
+```
+
+When a map change (a reload) changes a binding's kind, one line says so:
+
+```
+[INPUT] action menu.open (default): 'paddle1' inactive: paddle1 (the game's x) goes to the game; ... (was host-only)
+[INPUT] action menu.open (default): 'paddle1' is now host-only (was inactive)
 ```
 
 Every fire is logged, at most 10 lines a second:
@@ -753,7 +851,9 @@ the game. Where it does not, F10 and the game's fallback chord still work.
 | Windows build under Proton (desktop Linux) | XInput through Wine | Only with Steam Input off for the title | Steam Input off; F10; the fallback chord |
 
 Only Guide reaches a Windows build: XInput has no paddles, share button or
-touchpad. A chord with Guide stays incomplete where Guide is not seen, and
+touchpad. Whether Steam Input is in between, as `xbox_InputSteamInput`
+reports it (above): SDL knows (`on` or `off`); XInput says `maybe` when
+Steam launched the game. A chord with Guide stays incomplete where Guide is not seen, and
 its guest member then reaches the game as usual.
 
 **The Steam Deck and Steam Input.** On the Deck the menu goes on R4, the

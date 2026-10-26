@@ -2,8 +2,8 @@
  * Xbox Input Compatibility Layer
  *
  * The host backends behind input_core.c (input_backend.h): each one reads
- * a host pad and maps it to the Duke layout through the table in
- * pad_map.c, so both hosts map controls the same way.
+ * a host pad into an InputRaw through pad_map.c's adapter, so both hosts
+ * name controls the same way; input_core.c applies the pad map.
  *
  *   _WIN32 -> Windows XInput (also Proton/Wine)
  *   POSIX  -> SDL3 gamepad
@@ -13,6 +13,7 @@
 #include "recomp_env.h"
 #include "pad_map.h"
 #include "keyboard.h"
+#include "host_pad.h"
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -67,17 +68,15 @@ static xi_get_state_ex_fn xi_reader(void)
     return __atomic_load_n(&g_xi_ex, __ATOMIC_ACQUIRE);
 }
 
-static uint32_t g_xi_extra[XBOX_MAX_CONTROLLERS];   /* atomic */
-
 /* Any thread: XInput is thread safe. */
-static DWORD xi_read(DWORD port, XBOX_INPUT_STATE *out, uint32_t *extra)
+static DWORD xi_get_raw(DWORD port, InputRaw *raw, DWORD *packet_out, int extras)
 {
     XBOX_HOST_XINPUT_GAMEPAD pad;
     XINPUT_GAMEPAD g;
     DWORD packet, rc;
-    /* Only the armed host actions want Guide; a stock run keeps the
-     * documented call. */
-    xi_get_state_ex_fn ex = xbox_InputPadFilterSet() ? xi_reader() : NULL;
+    /* Only the armed host actions or a map that names Guide want it; a stock
+     * run keeps the documented call. */
+    xi_get_state_ex_fn ex = extras ? xi_reader() : NULL;
 
     if (ex) {
         xi_state_ex xe;
@@ -92,26 +91,37 @@ static DWORD xi_read(DWORD port, XBOX_INPUT_STATE *out, uint32_t *extra)
     }
     if (rc != ERROR_SUCCESS)
         return rc;
-    *extra = (g.wButtons & XI_GUIDE) ? XBOX_HOST_GUIDE : 0u;
-    g.wButtons &= (WORD)~XI_GUIDE;
     memcpy(&pad, &g, sizeof pad);
-    out->dwPacketNumber = packet;
-    xbox_PadMapXInput(&pad, &out->Gamepad);
+    pad.wButtons &= (uint16_t)~XI_GUIDE;
+    *packet_out = packet;
+    xbox_PadRawXInput(&pad, (g.wButtons & XI_GUIDE) ? XBOX_HOST_GUIDE : 0u, raw);
     return ERROR_SUCCESS;
 }
 
-static DWORD xi_get_state(DWORD port, XBOX_INPUT_STATE *out)
+/* Always XInputGetStateEx (extras = 1): the guide button costs an
+ * undocumented call, which is only fine because the caller, the flip tick,
+ * reads only while the host actions are armed. A caller that ticks
+ * unarmed would bring it to stock runs. */
+static DWORD xi_read_raw(DWORD port, InputRaw *raw)
 {
-    uint32_t extra = 0;
-    DWORD rc = xi_read(port, out, &extra);
-
-    __atomic_store_n(&g_xi_extra[port], extra, __ATOMIC_RELEASE);
-    return rc;
+    DWORD packet;
+    return xi_get_raw(port, raw, &packet, 1);
 }
 
-static uint32_t xi_host_extra(DWORD port)
+/* XInput cannot tell Steam's virtual pad from a real one, nor the family. */
+static int xi_family(DWORD port)
 {
-    return __atomic_load_n(&g_xi_extra[port], __ATOMIC_ACQUIRE);
+    (void)port;
+    return XBOX_PAD_FAMILY_XBOX;
+}
+
+static int xi_steam_input(DWORD port)
+{
+    const char *id = recomp_env(RENV_STEAM_GAME_ID), *deck = recomp_env(RENV_STEAM_DECK);
+    (void)port;
+    /* Only SteamDeck=1 means a Deck: "0" or anything else does not. */
+    return (id && *id) || (deck && strcmp(deck, "1") == 0) ? XBOX_STEAM_INPUT_MAYBE
+                                                             : XBOX_STEAM_INPUT_OFF;
 }
 
 static DWORD xi_set_state(DWORD port, const XBOX_VIBRATION *v)
@@ -128,8 +138,8 @@ static uint64_t xi_now_ms(void) { return GetTickCount64(); }
  * idle pad for an empty user index. If a Wine/Proton build does that, the
  * connection probe has to move to XInputGetCapabilities. */
 const xbox_input_backend xbox_input_host_backend = {
-    NULL, xi_get_state, xi_set_state, xbox_InputKbmPoll, xi_now_ms,
-    xi_host_extra, xi_read
+    NULL, xi_get_raw, xi_set_state, xbox_InputKbmPoll, xi_now_ms,
+    xi_read_raw, xi_family, xi_steam_input
 };
 
 /* ======================================================================== */
@@ -172,6 +182,8 @@ struct sdl_slot {
     SDL_JoystickID  id;     /* instance id while open */
     SDL_GUID        guid;   /* the last pad held; kept after removal */
     int             had;    /* guid is set */
+    int             family; /* atomic: the last sdl_family/steam_input read, */
+    int             steam;  /* returned while another thread holds the lock */
 };
 static struct sdl_slot  g_slot[XBOX_MAX_CONTROLLERS];
 static pthread_mutex_t  g_slot_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -232,11 +244,17 @@ static bool SDLCALL device_watch(void *ud, SDL_Event *ev)
     return true;
 }
 
+/* What sdl_family and sdl_steam_input answer for a pad (below). */
+static int pad_family(SDL_Gamepad *c);
+static int pad_steam(SDL_Gamepad *c);
+
 /* g_slot_lock held; any thread, as closing goes by pointer. */
 static void close_slot(int port)
 {
     SDL_CloseGamepad(g_slot[port].pad);
     g_slot[port].pad = NULL;
+    __atomic_store_n(&g_slot[port].family, XBOX_PAD_FAMILY_XBOX, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_slot[port].steam, 0, __ATOMIC_RELEASE);
     fprintf(stderr, "[INPUT] host pad removed port=%d\n", port);
     fflush(stderr);
     /* A pad waiting for a free port can take this one at the next poll. */
@@ -268,6 +286,8 @@ static void open_device(SDL_JoystickID id)
     g_slot[port].id   = id;
     g_slot[port].guid = g;
     g_slot[port].had  = 1;
+    __atomic_store_n(&g_slot[port].family, pad_family(c), __ATOMIC_RELEASE);
+    __atomic_store_n(&g_slot[port].steam, pad_steam(c), __ATOMIC_RELEASE);
     name = SDL_GetGamepadName(c);
     fprintf(stderr, "[INPUT] host pad added port=%d \"%s\"\n", port, name ? name : "?");
     fflush(stderr);
@@ -388,8 +408,6 @@ static uint32_t sdl_extra(SDL_Gamepad *c)
     return extra;
 }
 
-static uint32_t g_sdl_extra[XBOX_MAX_CONTROLLERS];  /* atomic */
-
 static void sdl_read_pad(SDL_Gamepad *c, XBOX_HOST_SDL_GAMEPAD *pad)
 {
     for (int b = 0; b < XBOX_SDL_BUTTON_COUNT; b++)
@@ -398,10 +416,11 @@ static void sdl_read_pad(SDL_Gamepad *c, XBOX_HOST_SDL_GAMEPAD *pad)
         pad->axis[a] = SDL_GetGamepadAxis(c, (SDL_GamepadAxis)a);
 }
 
-static DWORD sdl_get_state(DWORD port, XBOX_INPUT_STATE *out)
+static DWORD sdl_get_raw(DWORD port, InputRaw *raw, DWORD *packet, int extras)
 {
     SDL_Gamepad *c;
     XBOX_HOST_SDL_GAMEPAD pad;
+    uint32_t extra;
 
     pthread_mutex_lock(&g_slot_lock);
     if (!g_main_pump && g_ready)
@@ -414,15 +433,16 @@ static DWORD sdl_get_state(DWORD port, XBOX_INPUT_STATE *out)
         c = NULL;
     }
     if (!c) {
-        __atomic_store_n(&g_sdl_extra[port], 0u, __ATOMIC_RELEASE);
         pthread_mutex_unlock(&g_slot_lock);
         return ERROR_DEVICE_NOT_CONNECTED;
     }
     sdl_read_pad(c, &pad);
-    __atomic_store_n(&g_sdl_extra[port], sdl_extra(c), __ATOMIC_RELEASE);
+    /* The buttons past the Duke only when the host actions are armed or the
+     * map names one, as the XInput backend does with Guide. */
+    extra = extras ? sdl_extra(c) : 0u;
     pthread_mutex_unlock(&g_slot_lock);
-    out->dwPacketNumber = ++g_packet[port];
-    xbox_PadMapSdl(&pad, &out->Gamepad);
+    *packet = ++g_packet[port];
+    xbox_PadRawSdl(&pad, extra, raw);
     return ERROR_SUCCESS;
 }
 
@@ -441,19 +461,15 @@ static DWORD sdl_set_state(DWORD port, const XBOX_VIBRATION *v)
     return c ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
 }
 
-static uint32_t sdl_host_extra(DWORD port)
-{
-    return __atomic_load_n(&g_sdl_extra[port], __ATOMIC_ACQUIRE);
-}
-
 /* The flip tick's read, off the poll thread. Only a try: the window thread
  * may hold g_slot_lock across a rescan, and the flip must not wait on it.
  * No SDL_UpdateGamepads here: the pumping thread updates the pads, and a
  * second updater would race it. */
-static DWORD sdl_read_host(DWORD port, XBOX_INPUT_STATE *out, uint32_t *extra)
+static DWORD sdl_read_raw(DWORD port, InputRaw *raw)
 {
     XBOX_HOST_SDL_GAMEPAD pad;
     SDL_Gamepad *c;
+    uint32_t extra;
 
     if (pthread_mutex_trylock(&g_slot_lock) != 0)
         return XBOX_INPUT_BUSY;
@@ -463,16 +479,102 @@ static DWORD sdl_read_host(DWORD port, XBOX_INPUT_STATE *out, uint32_t *extra)
         return ERROR_DEVICE_NOT_CONNECTED;
     }
     sdl_read_pad(c, &pad);
-    *extra = sdl_extra(c);
+    extra = sdl_extra(c);
     pthread_mutex_unlock(&g_slot_lock);
-    out->dwPacketNumber = 0;
-    xbox_PadMapSdl(&pad, &out->Gamepad);
+    xbox_PadRawSdl(&pad, extra, raw);
     return ERROR_SUCCESS;
 }
 
+/* The Deck's built-in pad and Steam's virtual one (Valve, 28de). */
+#define XBOX_VID_VALVE       0x28de
+#define XBOX_PID_DECK        0x1205
+#define XBOX_PID_STEAM_VPAD  0x11ff
+
+/* gamepad-input-ux D5: a table, not detection, so the Deck's own pad is a
+ * steam family whether or not Steam Input is on. */
+static int xbox_sdl_family_of(int type, uint16_t vid, uint16_t pid)
+{
+    if (vid == XBOX_VID_VALVE && pid == XBOX_PID_DECK)
+        return XBOX_PAD_FAMILY_STEAM;
+    switch (type) {
+    case SDL_GAMEPAD_TYPE_STANDARD:
+    case SDL_GAMEPAD_TYPE_XBOX360:
+    case SDL_GAMEPAD_TYPE_XBOXONE:
+        return XBOX_PAD_FAMILY_XBOX;
+    case SDL_GAMEPAD_TYPE_PS3:
+    case SDL_GAMEPAD_TYPE_PS4:
+    case SDL_GAMEPAD_TYPE_PS5:
+        return XBOX_PAD_FAMILY_PLAYSTATION;
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_PRO:
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_LEFT:
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT:
+    case SDL_GAMEPAD_TYPE_NINTENDO_SWITCH_JOYCON_PAIR:
+#if SDL_VERSION_ATLEAST(3, 4, 0)
+    case SDL_GAMEPAD_TYPE_GAMECUBE:
+#endif
+        return XBOX_PAD_FAMILY_NINTENDO;
+#if SDL_VERSION_ATLEAST(3, 4, 0)
+    case SDL_GAMEPAD_TYPE_STEAM:
+        return XBOX_PAD_FAMILY_STEAM;
+#endif
+    default:
+        return XBOX_PAD_FAMILY_GENERIC;
+    }
+}
+
+static int pad_family(SDL_Gamepad *c)
+{
+    return xbox_sdl_family_of(SDL_GetGamepadType(c), SDL_GetGamepadVendor(c),
+                              SDL_GetGamepadProduct(c));
+}
+
+/* Steam's virtual pad: it carries a Steam handle, or is 28de:11ff. The
+ * vendor alone never counts: the Deck's own pad with Steam Input off is
+ * 28de:1205, and its paddles then reach the game. */
+static int pad_steam(SDL_Gamepad *c)
+{
+    return SDL_GetGamepadSteamHandle(c) != 0
+        || (SDL_GetGamepadVendor(c) == XBOX_VID_VALVE
+            && SDL_GetGamepadProduct(c) == XBOX_PID_STEAM_VPAD);
+}
+
+/* Both may be asked from any thread, the flip thread among them (the
+ * glyph strip, gamepad-input-ux I4), and a rescan may hold g_slot_lock
+ * across SDL calls: they only try it, and answer the slot's last value
+ * when it is busy. */
+static int sdl_family(DWORD port)
+{
+    SDL_Gamepad *c;
+    int f = XBOX_PAD_FAMILY_XBOX;
+
+    if (pthread_mutex_trylock(&g_slot_lock) != 0)
+        return __atomic_load_n(&g_slot[port].family, __ATOMIC_ACQUIRE);
+    if ((c = g_slot[port].pad))
+        f = pad_family(c);
+    __atomic_store_n(&g_slot[port].family, f, __ATOMIC_RELEASE);
+    pthread_mutex_unlock(&g_slot_lock);
+    return f;
+}
+
+static int sdl_steam_input(DWORD port)
+{
+    SDL_Gamepad *c;
+    int on = 0;
+
+    if (pthread_mutex_trylock(&g_slot_lock) != 0)
+        on = __atomic_load_n(&g_slot[port].steam, __ATOMIC_ACQUIRE);
+    else {
+        if ((c = g_slot[port].pad))
+            on = pad_steam(c);
+        __atomic_store_n(&g_slot[port].steam, on, __ATOMIC_RELEASE);
+        pthread_mutex_unlock(&g_slot_lock);
+    }
+    return on ? XBOX_STEAM_INPUT_ON : XBOX_STEAM_INPUT_OFF;
+}
+
 const xbox_input_backend xbox_input_host_backend = {
-    sdl_init, sdl_get_state, sdl_set_state, xbox_InputKbmPoll, sdl_now_ms,
-    sdl_host_extra, sdl_read_host
+    sdl_init, sdl_get_raw, sdl_set_state, xbox_InputKbmPoll, sdl_now_ms,
+    sdl_read_raw, sdl_family, sdl_steam_input
 };
 
 #endif /* _WIN32 */

@@ -198,8 +198,9 @@ script merge, `extra`, `connected`, and the backend slot) and the state
 the title is about to get, which it may change. With none set nothing
 changes. The enhancements layer sets `xbox_enhance_pad_filter` (`mod.h`)
 for its host actions (`src/enhance/enhance_actions.c`, `[input.actions]`
-in `docs/runtime/config.md`): it fires actions from keys, host-only
-buttons and pad chords, and only takes presses out of the state (a
+in `docs/runtime/config.md`): it fires actions from keys, host pad
+sources the map leaves to the host and chords of sources (`raw` in
+`struct xbox_host_pad`), and only takes presses out of the state (a
 consumed chord, `guide+a`). It stays disarmed, returning at its first
 test, unless a feature key arms it (`[ENHANCE] actions hook=off` in a
 golden run). A title that reads the pad through its own glue rather than
@@ -390,9 +391,15 @@ player choose their controls, on the same key table as the keyboard map above:
   travel. `xbox_InputMap_PadMapDefaults` is the identity (shoulders as Black
   and White, as `xinput_device.c` maps them) with 15% stick deadzones, a 5%
   trigger threshold and a 50% press threshold; it is an initializer, applied
-  only by a port that calls it. This fork's runtime does not: its pads go
-  through `pad_map.c` (the host controller table above), which maps LB to
-  White and RB to Black, so `PadMapDefaults` is unused here.
+  only by a port that calls it. This fork's backends fill an `InputRaw`
+  from the host pad (`xbox_PadRawFromGamepad`, the table above) and
+  `input_core.c` maps it through the pad setup (`xbox_InputSetPadSetup`,
+  `pad_map.h`): a `PadMap`, an alternate map merged in with `PadMerge`,
+  and Y inversion. With no `[input.pad]` that setup is
+  `xbox_PadSetupIdentity`: `PadMapDefaults`, then White on LB, Black on
+  RB, deadzones and the trigger threshold 0, which `tests/pad_map` checks
+  gives what the old fixed table gave. `xbox_InputHostRaw(slot, &raw)` is
+  the raw pad before the map, which the host actions read.
 - **Deadzones.** `xbox_InputMap_ApplyStick` is radial: inside the deadzone the
   stick is centred, beyond it the range is stretched so full deflection stays
   full and the direction is kept. `xbox_InputMap_ApplyTrigger` zeroes a

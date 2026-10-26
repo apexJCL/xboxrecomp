@@ -21,9 +21,12 @@ extern "C" {
 typedef struct xbox_input_backend {
     /* Called once from xbox_InputInit(); may be NULL. */
     void  (*init)(void);
-    /* Read port's pad. ERROR_SUCCESS with *out filled (already mapped
-     * through pad_map), or ERROR_DEVICE_NOT_CONNECTED. */
-    DWORD (*get_state)(DWORD port, XBOX_INPUT_STATE *out);
+    /* Read port's pad as the host sees it (pad_map.h's adapter fills *raw;
+     * input_core.c applies the pad map). ERROR_SUCCESS with *raw and
+     * *packet filled, or ERROR_DEVICE_NOT_CONNECTED. The host-only buttons
+     * (Guide, the paddles; XInputGetStateEx on Windows) are read only when
+     * extras is nonzero, so a stock run polls as it always did. */
+    DWORD (*get_raw)(DWORD port, InputRaw *raw, DWORD *packet, int extras);
     /* Set port's motors. */
     DWORD (*set_state)(DWORD port, const XBOX_VIBRATION *vib);
     /* Port 0 keyboard, merged on top of the pad when RECOMP_KEYBOARD is on.
@@ -32,13 +35,14 @@ typedef struct xbox_input_backend {
     int   (*keyboard)(XBOX_INPUT_STATE *out);
     /* Monotonic milliseconds. */
     uint64_t (*now_ms)(void);
-    /* The host-only buttons (host_pad.h, XBOX_HOST_*) port's last get_state
-     * saw; NULL when the backend has none. */
-    uint32_t (*host_extra)(DWORD port);
-    /* port's pad and host-only buttons, read off the poll thread (the flip
-     * tick, xbox_input_backend_read_host): ERROR_SUCCESS,
+    /* port's raw pad with its host-only buttons, read off the poll thread
+     * (the flip tick, xbox_input_backend_read_host): ERROR_SUCCESS,
      * ERROR_DEVICE_NOT_CONNECTED or XBOX_INPUT_BUSY. NULL: not connected. */
-    DWORD (*read_host)(DWORD port, XBOX_INPUT_STATE *out, uint32_t *extra);
+    DWORD (*read_raw)(DWORD port, InputRaw *raw);
+    /* The controller family (XBOX_PAD_FAMILY_*) and Steam Input state
+     * (XBOX_STEAM_INPUT_*) of the pad on port; NULL: xbox and off. */
+    int   (*family)(DWORD port);
+    int   (*steam_input)(DWORD port);
 } xbox_input_backend;
 
 /* The host backend this build uses (xinput_device.c). */

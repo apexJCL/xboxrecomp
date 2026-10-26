@@ -3,8 +3,9 @@
  * config.md, "[input.actions]"), so a binding never steals what the title
  * uses:
  *
- *   1. a single guest button is refused; guest buttons only in a chord of
- *      two or more with a hold of at least 200 ms;
+ *   1. a single source the pad map gives the game is refused; sources the
+ *      game uses only in a chord of two or more with a hold of at least
+ *      200 ms;
  *   2. a key the guest receives (the runtime key table, the walk key, the
  *      mouse release key; modifiers count) is refused;
  *   3. a chord is consumed: from the moment all its buttons are down the
@@ -13,10 +14,20 @@
  *      that long after its press;
  *   5. actions read the host pad, never the state a script made;
  *   6. only feature keys arm the hook;
- *   7. a modifier chord (guide+a) needs its host-only member first; a guest
- *      member pressed while it is held is the guest's no more until its
- *      release, even when the modifier is let go first; one pressed before
- *      it passes and does not complete the chord.
+ *   7. a modifier chord (guide+a) needs its unmapped members first; a
+ *      mapped member pressed while they are held is the guest's no more
+ *      until its release, even when a modifier is let go first; one pressed
+ *      before them passes and does not complete the chord.
+ *
+ * Bindings name host sources (input_map.h's names; a guest control's name
+ * means the source the identity gives it), read from the raw host pad
+ * before [input.pad], so a remap never moves a binding (gamepad-input-ux
+ * D4). Which members the game uses depends on the map, so a pad binding's
+ * kind is derived from it at every rebuild: host-only, a guest chord, a
+ * modifier chord (its unmapped members the modifiers), or inactive with a
+ * warning. Masking clears the guest controls a consumed source feeds
+ * through either map, and centres the half of a guest stick axis a
+ * consumed stick direction feeds.
  *
  * Threads: the poll thread runs the filter, the ack thread the flip tick,
  * any thread may rebuild. One poll thread per title is assumed (cat polls
@@ -41,6 +52,7 @@
 #include "enhance_cfg.h"
 #include "input_names.h"
 #include "keyboard.h"
+#include "pad_map.h"
 #include "mod.h"
 #include "mouse.h"
 #include "nv2a_backend_common.h"
@@ -69,8 +81,12 @@
 #define DELAY_MAX_MS  100
 #define STALE_MS      100      /* the tick reads a port not polled for this long */
 #define ANALOG_BIT0   8
-#define HOST_BIT0     16
-#define GUEST_BITS    0xFFFFu
+/* A guest stick's half (up, down, left, right; the left stick first): a
+ * consumed stick direction has no button to clear, so its half of the
+ * axis is centred instead. */
+#define STICK_BIT0    16
+#define GUEST_BITS    0xFFFFFFu
+#define SRC_BITS      32       /* input_map.h's sources, bit i = source i */
 #define ARM_KEYS      8
 #define LOG_PER_SEC   10
 
@@ -123,16 +139,19 @@ static int s_started;
 
 /* ---- bindings ---------------------------------------------------------- */
 
-enum { B_KEY, B_CHORD, B_HOST, B_MOD };
+/* B_PAD: parsed, kind not derived yet; B_OFF: inactive under this map. */
+enum { B_KEY, B_CHORD, B_HOST, B_MOD, B_PAD, B_OFF };
+
+_Static_assert(INPUT_SRC_COUNT <= SRC_BITS, "a source bit each");
 
 struct binding {
     int action, idx;        /* idx: the bit in s_act[action].down */
     int kind;
     unsigned port;
-    uint32_t bits;          /* every pad member: guest bits, host << 16 */
-    uint32_t guest;         /* the guest members */
-    uint32_t modbit;        /* B_MOD: the host-only member */
-    int hold_ms;
+    uint32_t bits;          /* every pad member: bit per source */
+    uint32_t guest;         /* the members the map gives the game */
+    uint32_t modmask;       /* B_MOD: the members it does not (the modifiers) */
+    int hold_ms, has_hold;
     int key;                /* B_KEY */
     int mods[3], nmods;     /* B_KEY: modifier codes, as written */
     char text[TEXT_MAX];
@@ -146,20 +165,21 @@ struct binding {
     int active, fired;
     int held_over;          /* held when the table was built: no fire, not down */
     uint64_t since;
-    uint32_t modpress;      /* B_MOD: guest members pressed with the modifier held */
+    uint32_t modpress;      /* B_MOD: guest members pressed with the modifiers held */
 };
 
 struct table {
     int n;
     int delay_ms;
-    uint32_t chord_members[PORTS];  /* guest bits of B_CHORD, for chord_delay_ms */
+    uint32_t feeds[SRC_BITS];       /* per source, the guest bits it feeds */
+    uint32_t chord_members[PORTS];  /* sources of guest chords, for chord_delay_ms */
     unsigned ports;                 /* bit per port a pad binding reads */
     int keys;                       /* any B_KEY */
     struct binding b[];
 };
 
 struct port_state {
-    uint32_t held, consumed;
+    uint32_t held, consumed;    /* bit per source */
     uint64_t press_ms[32];
     uint64_t last_poll;
     int polled;
@@ -236,24 +256,26 @@ static uint32_t control_bit(int ctl)
     return 0;
 }
 
-/* A pad name: lowercase as written (so "A" stays the key and "a" is the
- * button), a guest control other than a stick direction, or host-only. */
-static uint32_t pad_name_bit(const char *s, int *host)
+/* A pad name to its source, 0 if none: lowercase as written (so "A" stays
+ * the key and "a" is the button), a source name, or a guest control's name
+ * for the source the identity gives it (white is left_shoulder whatever
+ * [input.pad] says), so a binding means the same buttons under any map. */
+static int pad_name_src(const char *s)
 {
-    int ctl, h;
+    xbox_pad_setup id;
+    int src, ctl;
+
     for (const char *p = s; *p; p++)
         if (isupper((unsigned char)*p))
             return 0;
-    *host = 0;
+    src = xbox_InputMap_SourceFromName(s);
+    if (src > INPUT_SRC_NONE)
+        return src;
     ctl = xbox_InputMap_ControlFromName(s);
-    if (ctl >= 0)
-        return control_bit(ctl);
-    h = xbox_InputHostButtonFromName(s);
-    if (h >= 0) {
-        *host = 1;
-        return 1u << (HOST_BIT0 + h);
-    }
-    return 0;
+    if (ctl < 0 || ctl >= INPUT_PAD_CONTROL_COUNT)
+        return 0;
+    xbox_PadSetupIdentity(&id);
+    return id.map.source[ctl];
 }
 
 static int modifier_family(int code)
@@ -323,6 +345,19 @@ static void warn(const char *where, const char *text, const char *fmt, ...)
     fputc('\n', stderr);
 }
 
+static void warn_off(const char *where, const char *text, const char *was,
+                     const char *fmt, ...)
+{
+    va_list ap;
+    fprintf(stderr, "[INPUT] action %s: '%s' inactive: ", where, text);
+    va_start(ap, fmt);
+    vfprintf(stderr, fmt, ap);
+    va_end(ap);
+    if (was)
+        fprintf(stderr, " (was %s)", was);
+    fputc('\n', stderr);
+}
+
 static void trim(char *s)
 {
     size_t n = strlen(s), i = 0;
@@ -337,10 +372,8 @@ static void trim(char *s)
 static int parse_binding(const char *where, const char *text, struct binding *b)
 {
     char buf[TEXT_MAX], *tok[8], *s, *at;
-    int ntok = 0, hold = 0, has_hold = 0;
-    int nhost = 0, nguest = 0, allpad = 1;
-    uint32_t bits[8];
-    int host[8];
+    int ntok = 0, hold = 0, has_hold = 0, allpad = 1;
+    int src[8];
 
     memset(b, 0, sizeof *b);
     if (strlen(text) >= sizeof buf) {
@@ -391,56 +424,23 @@ static int parse_binding(const char *where, const char *text, struct binding *b)
         p = plus + 1;
     }
     for (int i = 0; i < ntok; i++) {
-        bits[i] = pad_name_bit(tok[i], &host[i]);
-        if (!bits[i])
+        src[i] = pad_name_src(tok[i]);
+        if (!src[i])
             allpad = 0;
-        else if (host[i])
-            nhost++;
-        else
-            nguest++;
     }
     b->hold_ms = hold;
+    b->has_hold = has_hold;
 
+    /* A pad binding: its kind waits for the map (classify, at build). */
     if (allpad) {
         for (int i = 0; i < ntok; i++) {
-            if (b->bits & bits[i]) {
+            if (b->bits & (1u << src[i])) {
                 warn(where, text, "'%s' twice", tok[i]);
                 return 0;
             }
-            b->bits |= bits[i];
-            if (!host[i])
-                b->guest |= bits[i];
+            b->bits |= 1u << src[i];
         }
-        if (ntok == 1 && nhost) {
-            b->kind = B_HOST;           /* the title never sees it */
-            return 1;
-        }
-        if (ntok == 1) {
-            warn(where, text, "a single guest button would take it from the game;"
-                 " use a chord of two with a hold (back+left_thumb@400) or a host-only"
-                 " button (guide, paddle1)");
-            return 0;
-        }
-        if (!nguest) {
-            b->kind = B_CHORD;          /* host-only members: nothing to consume */
-            return 1;
-        }
-        if (nhost == 1 && host[0]) {
-            b->kind = B_MOD;
-            b->modbit = bits[0];
-            return 1;
-        }
-        if (nhost) {
-            warn(where, text, "a chord with a host-only button needs it first and"
-                 " only once (guide+a)");
-            return 0;
-        }
-        if (!has_hold || hold < CHORD_MIN_MS) {
-            warn(where, text, "a chord of guest buttons needs a hold of at least"
-                 " %d ms (%s@400)", CHORD_MIN_MS, s);
-            return 0;
-        }
-        b->kind = B_CHORD;
+        b->kind = B_PAD;
         return 1;
     }
 
@@ -448,7 +448,7 @@ static int parse_binding(const char *where, const char *text, struct binding *b)
      * (back+lthumb@400) is an unknown name, not a key misusing '@'. */
     for (int i = 0; i < ntok; i++) {
         int code, is_mouse;
-        if (!bits[i] && !xbox_InputNameToCode(tok[i], &code, &is_mouse)) {
+        if (!src[i] && !xbox_InputNameToCode(tok[i], &code, &is_mouse)) {
             warn(where, text, "unknown name '%s' (keys as in docs/input.md,"
                  " pad buttons in lowercase)", tok[i]);
             return 0;
@@ -494,16 +494,20 @@ static int parse_binding(const char *where, const char *text, struct binding *b)
 
 /* ---- the step ------------------------------------------------------------ */
 
+/* The sources down on the raw host pad. A source counts once its 0..255
+ * reading (PadMap's >> 7) passes the Duke's analog threshold: under the
+ * identity that is exactly when the guest button it feeds reads down, as
+ * the bindings read it before the map existed; a button source is 0 or
+ * 32767. */
 static uint32_t host_bits(const struct xbox_host_pad *h)
 {
-    uint32_t b;
+    uint32_t b = 0;
     if (!h || !h->connected)
         return 0;
-    b = h->pad.Gamepad.wButtons & 0xFFu;
-    for (int i = 0; i < 8; i++)
-        if (h->pad.Gamepad.bAnalogButtons[i] > XBOX_ANALOG_BUTTON_THRESHOLD)
-            b |= 1u << (ANALOG_BIT0 + i);
-    return b | (h->extra & XBOX_HOST_EXTRA_MASK) << HOST_BIT0;
+    for (int i = INPUT_SRC_NONE + 1; i < INPUT_SRC_COUNT; i++)
+        if ((h->raw.src[i] >> 7) > XBOX_ANALOG_BUTTON_THRESHOLD)
+            b |= 1u << i;
+    return b;
 }
 
 /* The key and exactly its modifiers: Ctrl+F6 is not F6, and F6 with Ctrl
@@ -546,7 +550,7 @@ static void step(struct table *t, unsigned port, uint32_t held, int tick, uint64
         struct binding *b = &t->b[i];
         int cond = 0;
 
-        if (b->kind == B_KEY ? port != 0 : b->port != port)
+        if (b->kind == B_OFF || (b->kind == B_KEY ? port != 0 : b->port != port))
             continue;
         if (tick && b->kind == B_CHORD && b->guest)
             continue;
@@ -560,15 +564,17 @@ static void step(struct table *t, unsigned port, uint32_t held, int tick, uint64
             if (cond)
                 ps->consumed |= b->guest;
             break;
-        case B_MOD:
+        case B_MOD: {
+            int mods = (held & b->modmask) == b->modmask;
             b->modpress &= held;
-            if (held & b->modbit) {
+            if (mods) {
                 uint32_t m = fresh & b->guest;
                 b->modpress |= m;
                 ps->consumed |= m;
             }
-            cond = (held & b->modbit) && (b->modpress & b->guest) == b->guest;
+            cond = mods && (b->modpress & b->guest) == b->guest;
             break;
+        }
         }
         if (!cond) {
             b->active = b->fired = b->held_over = 0;
@@ -590,28 +596,51 @@ static void step(struct table *t, unsigned port, uint32_t held, int tick, uint64
     }
 }
 
-/* What the guest does not see on port: the consumed bits, and chord
- * members inside chord_delay_ms of their press. */
+/* What the guest does not see on port: the guest controls fed by the
+ * consumed sources and by chord members inside chord_delay_ms of their
+ * press. */
 static uint32_t guest_mask(const struct table *t, unsigned port, uint64_t now)
 {
     const struct port_state *ps = &s_port[port];
-    uint32_t mask = ps->consumed;
+    uint32_t src = ps->consumed, mask = 0;
 
-    if (t && t->delay_ms) {
-        uint32_t wait = ps->held & t->chord_members[port] & ~mask;
-        for (int i = 0; i < 16; i++)
+    if (!t)
+        return 0;
+    if (t->delay_ms) {
+        uint32_t wait = ps->held & t->chord_members[port] & ~src;
+        for (int i = 0; i < SRC_BITS; i++)
             if ((wait & (1u << i)) && now - ps->press_ms[i] < (uint64_t)t->delay_ms)
-                mask |= 1u << i;
+                src |= 1u << i;
     }
+    for (int i = 0; i < SRC_BITS; i++)
+        if (src & (1u << i))
+            mask |= t->feeds[i];
     return mask & GUEST_BITS;
+}
+
+/* Centre *v when it points the way a masked half does: the other half
+ * still reaches the game, so a consumed "up" never hides a push down. */
+static void mask_axis(int16_t *v, uint32_t mask, int pos_bit, int neg_bit)
+{
+    if (((mask >> pos_bit) & 1u) && *v > 0)
+        *v = 0;
+    if (((mask >> neg_bit) & 1u) && *v < 0)
+        *v = 0;
 }
 
 static void apply_mask(XBOX_INPUT_STATE *st, uint32_t mask)
 {
-    st->Gamepad.wButtons &= (WORD)~(mask & 0xFFu);
+    XBOX_GAMEPAD *g = &st->Gamepad;
+
+    g->wButtons &= (WORD)~(mask & 0xFFu);
     for (int i = 0; i < 8; i++)
         if (mask & (1u << (ANALOG_BIT0 + i)))
-            st->Gamepad.bAnalogButtons[i] = 0;
+            g->bAnalogButtons[i] = 0;
+    /* Up is Y positive, as in InputRaw. */
+    mask_axis(&g->sThumbLY, mask, STICK_BIT0 + 0, STICK_BIT0 + 1);
+    mask_axis(&g->sThumbLX, mask, STICK_BIT0 + 3, STICK_BIT0 + 2);
+    mask_axis(&g->sThumbRY, mask, STICK_BIT0 + 4, STICK_BIT0 + 5);
+    mask_axis(&g->sThumbRX, mask, STICK_BIT0 + 7, STICK_BIT0 + 6);
 }
 
 void enhance_actions_filter(unsigned port, const struct xbox_host_pad *host,
@@ -730,7 +759,10 @@ void enhance_actions_mask_until_release(unsigned port, uint32_t bits)
     if (port >= PORTS)
         return;
     spin_lock(&s_step_lock);
-    s_port[port].consumed |= bits & GUEST_BITS & s_port[port].held;
+    /* The held sources that feed them: the map may give a control two. */
+    for (int i = 0; s_table && i < SRC_BITS; i++)
+        if (s_table->feeds[i] & bits & GUEST_BITS)
+            s_port[port].consumed |= (1u << i) & s_port[port].held;
     spin_unlock(&s_step_lock);
 }
 
@@ -925,9 +957,118 @@ static int config_texts(const struct action *a, const char *texts[ENHANCE_ACTION
     return n;
 }
 
-static struct table *build(void)
+/* What the map gives the game: each source's guest bits (feeds) and the
+ * sources the game reads at all. A physical stick's directions feed the
+ * halves of the guest stick a map selects it for (raw is inverted before
+ * the map, so the directions match the guest's). */
+static uint32_t map_feeds(const xbox_pad_setup *ps, uint32_t feeds[SRC_BITS])
+{
+    const InputPadMap *m[2] = { &ps->map, &ps->alt };
+    uint32_t used = 0;
+
+    memset(feeds, 0, SRC_BITS * sizeof feeds[0]);
+    for (int k = 0; k < 2; k++) {
+        for (int c = 0; c < INPUT_PAD_CONTROL_COUNT; c++) {
+            int src = m[k]->source[c];
+            if (src > INPUT_SRC_NONE && src < INPUT_SRC_COUNT) {
+                feeds[src] |= control_bit(c);
+                used |= 1u << src;
+            }
+        }
+        for (int st = 0; st < 2; st++) {
+            int which = st ? m[k]->right_stick : m[k]->left_stick;
+            int first = which == INPUT_STICK_LEFT ? INPUT_SRC_LSTICK_UP
+                      : which == INPUT_STICK_RIGHT ? INPUT_SRC_RSTICK_UP : 0;
+            for (int d = 0; first && d < 4; d++) {
+                feeds[first + d] |= 1u << (STICK_BIT0 + st * 4 + d);
+                used |= 1u << (first + d);
+            }
+        }
+    }
+    return used;
+}
+
+/* "guide (the game's start), south (a)": who took srcs from the host. */
+static void took(const xbox_pad_setup *ps, uint32_t srcs, char *buf, size_t size)
+{
+    size_t n = 0;
+
+    buf[0] = 0;
+    for (int i = 0; i < SRC_BITS && n < size; i++) {
+        const char *ctl = "a stick";
+        if (!(srcs & (1u << i)))
+            continue;
+        for (int c = 0; c < INPUT_PAD_CONTROL_COUNT; c++)
+            if (ps->map.source[c] == i || ps->alt.source[c] == i) {
+                ctl = xbox_InputMap_ControlName(c);
+                break;
+            }
+        n += (size_t)snprintf(buf + n, size - n, n ? ", %s (%s)" : "%s (the game's %s)",
+                              xbox_InputMap_SourceName(i), ctl);
+    }
+}
+
+static const char *kind_name(const struct binding *b)
+{
+    switch (b->kind) {
+    case B_HOST:  return "host-only";
+    case B_CHORD: return b->guest ? "a guest chord" : "a host-only chord";
+    case B_MOD:   return "a modifier chord";
+    case B_OFF:   return "inactive";
+    }
+    return "a key";
+}
+
+/* The kind of a pad binding under the current map (gamepad-input-ux D4),
+ * with one line when it is inactive or its kind differs from the binding
+ * of the same action and text in old. */
+static void classify(struct binding *b, const char *where, const xbox_pad_setup *ps,
+                     uint32_t used, const struct table *old)
+{
+    const char *was = NULL;
+    uint32_t mapped = b->bits & used, free_ = b->bits & ~used;
+    char who[160];
+    int single = !(b->bits & (b->bits - 1));
+
+    b->guest = mapped;
+    if (single)
+        b->kind = mapped ? B_OFF : B_HOST;
+    else if (!mapped)
+        b->kind = B_CHORD;          /* nothing reaches the game */
+    else if (!free_)
+        b->kind = b->has_hold && b->hold_ms >= CHORD_MIN_MS ? B_CHORD : B_OFF;
+    else {
+        b->kind = B_MOD;
+        b->modmask = free_;
+    }
+    for (int i = 0; old && i < old->n; i++)
+        if (!strcmp(old->b[i].name, b->name) && !strcmp(old->b[i].text, b->text)) {
+            if (strcmp(kind_name(&old->b[i]), kind_name(b)))
+                was = kind_name(&old->b[i]);
+            break;
+        }
+    if (b->kind == B_OFF) {
+        took(ps, mapped, who, sizeof who);
+        if (single)
+            warn_off(where, b->text, was, "%s goes to the game; a single source the game"
+                     " uses would take it from the game; use a chord of two with a hold"
+                     " (back+left_thumb@400) or a source the game does not use (guide,"
+                     " paddle1)", who);
+        else
+            warn_off(where, b->text, was, "every member goes to the game (%s); such a"
+                     " chord needs a hold of at least %d ms (@400)", who, CHORD_MIN_MS);
+    } else if (was) {
+        fprintf(stderr, "[INPUT] action %s: '%s' is now %s (was %s)\n", where, b->text,
+                kind_name(b), was);
+    }
+}
+
+/* Under s_reg_lock; old is the table in use, for the kind changes. */
+static struct table *build(const struct table *old)
 {
     struct table *t;
+    xbox_pad_setup ps;
+    uint32_t used;
     int cap = 1;
 
     for (int i = 0; i < s_nact; i++)
@@ -936,6 +1077,8 @@ static struct table *build(void)
     if (!t)
         return NULL;
     t->delay_ms = s_delay_ms;
+    xbox_InputPadSetup(&ps);
+    used = map_feeds(&ps, t->feeds);
     for (int i = 0; i < s_nact; i++) {
         const char *texts[ENHANCE_ACTION_BINDS];
         char where[96];
@@ -952,12 +1095,14 @@ static struct table *build(void)
             b->action = i;
             b->idx = idx++;
             snprintf(b->name, sizeof b->name, "%s", s_act[i].name);
+            if (b->kind == B_PAD)
+                classify(b, where, &ps, used, old);
             /* A held input must be let go before a new binding fires on it,
              * and does not read as down until then. */
             b->active = b->fired = b->held_over = 1;
             if (b->kind == B_KEY) {
                 t->keys = 1;
-            } else {
+            } else if (b->kind != B_OFF) {
                 t->ports |= 1u << b->port;
                 if (b->kind == B_CHORD)
                     t->chord_members[b->port] |= b->guest;
@@ -1003,12 +1148,15 @@ void enhance_actions_rebuild(void)
 {
     struct table *t, *old;
 
+    /* The registry lock spans the swap: build reads the table in use for
+     * the kind changes, and another rebuild must not free it meanwhile. */
     spin_lock(&s_reg_lock);
     read_delay();
-    t = build();
-    spin_unlock(&s_reg_lock);
-    if (!t)
+    t = build(s_table);
+    if (!t) {
+        spin_unlock(&s_reg_lock);
         return;
+    }
     spin_lock(&s_step_lock);
     old = s_table;
     s_table = t;
@@ -1017,6 +1165,7 @@ void enhance_actions_rebuild(void)
     for (int i = 0; i < ENHANCE_ACTIONS_MAX; i++)
         __atomic_store_n(&s_act[i].down, 0u, __ATOMIC_RELEASE);
     spin_unlock(&s_step_lock);
+    spin_unlock(&s_reg_lock);
     free(old);
 }
 

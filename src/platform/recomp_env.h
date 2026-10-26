@@ -129,7 +129,9 @@ extern "C" {
     X(EXT_VMA,           CONFIG, "RECOMP_EXT_VMA",           NULL, "set: honour reservations at fixed addresses above the RAM mirrors (upstream, default off)") \
     X(KEYBOARD,          CONFIG, "RECOMP_KEYBOARD",          NULL, "1: keyboard drives pad 1") \
     X(MOUSE,             CONFIG, "RECOMP_MOUSE",             NULL, "1: the mouse drives pad 1 (a stick and buttons); 0: off") \
-    X(PAD_DEADZONE,      CONFIG, "RECOMP_PAD_DEADZONE",      NULL, "stick deadzone, 0..32767 (default 0)") \
+    X(PAD_DEADZONE,      CONFIG, "RECOMP_PAD_DEADZONE",      NULL, "stick deadzone, 0..32767 (default 0); input.pad_deadzone_left/_right (percent) win over it") \
+    X(STEAM_GAME_ID,     CONFIG, "SteamGameId",              NULL, "set by Steam, read only: Steam launched the game; on the XInput backend (Windows, Proton) Steam Input may then stand between the pad and the game (xbox_InputSteamInput: maybe)") \
+    X(STEAM_DECK,        CONFIG, "SteamDeck",                NULL, "set by Steam, read only: 1 on a Steam Deck; on the XInput backend Steam Input may then stand between the pad and the game (xbox_InputSteamInput: maybe)") \
     X(STDIO_LOG,         CONFIG, "RECOMP_STDIO_LOG",         NULL, "send stdout/stderr to this file") \
     X(LOG_LEVEL,         CONFIG, "RECOMP_LOG_LEVEL",         "XBOX_LOG_LEVEL", "kernel log level, 0 (error) .. 4 (trace)") \
     X(AUDIO_BUF_SAMPLES, CONFIG, "RECOMP_AUDIO_BUF_SAMPLES", NULL, "audio output buffer size in samples") \

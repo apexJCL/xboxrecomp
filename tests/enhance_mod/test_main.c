@@ -13,6 +13,7 @@
 #include "enhance_input.h"
 #include "input_backend.h"
 #include "input_names.h"
+#include "pad_map.h"
 #include "keyboard.h"
 #include "mod.h"
 #include "mouse.h"
@@ -85,9 +86,22 @@ static DWORD f_get(DWORD p, XBOX_INPUT_STATE *s)
     return ERROR_SUCCESS;
 }
 static DWORD f_set(DWORD p, const XBOX_VIBRATION *v) { (void)p; (void)v; return ERROR_SUCCESS; }
-static const xbox_input_backend k_fake = { NULL, f_get, f_set, xbox_InputKbmPoll, f_clock, NULL, NULL };
+/* The backend reads raw; the fake builds its pad as the Duke would see it
+ * and hands it over through the identity's inverse. */
+static DWORD f_get_raw(DWORD p, InputRaw *raw, DWORD *packet, int extras)
+{
+    XBOX_INPUT_STATE s;
+    DWORD rc = f_get(p, &s);
+    (void)extras;
+    if (rc == ERROR_SUCCESS) {
+        xbox_PadRawFromGamepad(&s.Gamepad, 0, raw);
+        *packet = s.dwPacketNumber;
+    }
+    return rc;
+}
+static const xbox_input_backend k_fake = { NULL, f_get_raw, f_set, xbox_InputKbmPoll, f_clock, NULL, NULL, NULL };
 /* input_core.c's default; never called here. */
-const xbox_input_backend xbox_input_host_backend = { NULL, f_get, f_set, NULL, f_clock, NULL, NULL };
+const xbox_input_backend xbox_input_host_backend = { NULL, f_get_raw, f_set, NULL, f_clock, NULL, NULL, NULL };
 
 static void write_file(const char *path, const char *text)
 {

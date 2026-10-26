@@ -9,26 +9,30 @@
  * from the cache and refreshes it under the same rule, so a pad plugged in
  * later shows up within a second while the title polls the mask every frame.
  *
+ * A backend reads the host pad raw (InputRaw, pad_map.h's adapter); the
+ * pad map ([input.pad], xbox_InputSetPadSetup, the identity by default) is
+ * applied here, so it reaches every title that reads its pads through this
+ * API.
+ *
  * Nothing here calls the platform: the backend (input_backend.h) does, and
  * tests/pad_map swaps in a fake one to count the calls.
  */
 #include "input_backend.h"
 #include "host_pad.h"
 #include "keyboard.h"
+#include "pad_map.h"
 
 #include <stdlib.h>
 #include <string.h>
-#ifdef XBOXRECOMP_ENHANCE
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
-#define last_yield() SwitchToThread()
+#define spin_yield() SwitchToThread()
 #else
 #include <sched.h>
-#define last_yield() sched_yield()
-#endif
+#define spin_yield() sched_yield()
 #endif
 
 static const xbox_input_backend *g_be = &xbox_input_host_backend;
@@ -44,18 +48,110 @@ static int      g_rumbling[XBOX_MAX_CONTROLLERS];
 static uint32_t g_extra[XBOX_MAX_CONTROLLERS];
 /* The host actions' filter (host_pad.h); atomic, NULL when disarmed. */
 static xbox_input_pad_filter_fn g_filter;
+/* input.glyphs (XBOX_PAD_FAMILY_*); atomic. */
+static int g_glyphs = XBOX_PAD_FAMILY_AUTO;
+
+/* Spin locks held for a struct copy. The holder may be preempted, and on a
+ * busy host (Proton's threads plus the guest's) a waiter that never yields
+ * can keep it off the core. */
+static void spin_lock(unsigned char *l)
+{
+    unsigned spins = 0;
+
+    while (__atomic_test_and_set(l, __ATOMIC_ACQUIRE))
+        if (++spins >= 64) {
+            spins = 0;
+            spin_yield();
+        }
+}
+
+static void spin_unlock(unsigned char *l)
+{
+    __atomic_clear(l, __ATOMIC_RELEASE);
+}
+
+/* The raw host pad each slot's last read saw (xbox_InputHostRaw): the poll
+ * and the flip tick write it, a title's glue reads it. */
+static InputRaw g_raw[XBOX_MAX_CONTROLLERS];
+static unsigned char g_raw_lock;   /* the type __atomic_test_and_set is defined on */
+
+static void publish_raw(DWORD slot, const InputRaw *raw)
+{
+    spin_lock(&g_raw_lock);
+    g_raw[slot] = *raw;
+    spin_unlock(&g_raw_lock);
+    __atomic_store_n(&g_extra[slot], xbox_PadRawExtra(raw), __ATOMIC_RELEASE);
+}
+
+/* The pad map in force: NULL is the identity. A setup is never freed once
+ * installed, because a poll on another thread may still be reading it; a
+ * player changes the map by hand, so the few bytes per change stay small. */
+struct pad_cfg {
+    xbox_pad_setup setup;
+    int extras;              /* xbox_PadSetupNeedsExtras */
+};
+static const struct pad_cfg *g_cfg;   /* atomic */
+
+void xbox_InputSetPadSetup(const xbox_pad_setup *s)
+{
+    struct pad_cfg *c = NULL;
+
+    if (s && !xbox_PadSetupIsIdentity(s)) {
+        if (!(c = malloc(sizeof *c)))
+            return;
+        c->setup = *s;
+        c->extras = xbox_PadSetupNeedsExtras(s);
+    }
+    __atomic_store_n(&g_cfg, c, __ATOMIC_RELEASE);
+}
+
+void xbox_InputPadSetup(xbox_pad_setup *out)
+{
+    const struct pad_cfg *c = __atomic_load_n(&g_cfg, __ATOMIC_ACQUIRE);
+
+    if (c)
+        *out = c->setup;
+    else
+        xbox_PadSetupIdentity(out);
+}
+
+/* raw through the setup in force: inverted in place, then mapped. */
+static void map_raw(const struct pad_cfg *c, InputRaw *raw, XBOX_GAMEPAD *out)
+{
+    xbox_pad_setup id;
+    const xbox_pad_setup *s = c ? &c->setup : &id;
+
+    if (!c)
+        xbox_PadSetupIdentity(&id);
+    xbox_PadRawInvert(raw, s->invert_ly, s->invert_ry);
+    xbox_PadSetupApply(s, raw, out);
+}
 
 static void shutdown_atexit(void) { xbox_InputShutdown(); }
 
-static DWORD probe(DWORD port, XBOX_INPUT_STATE *st)
+/* Read port. On success *st is the mapped pad; *raw is always written (zero
+ * when no pad answered). */
+static DWORD probe(DWORD port, XBOX_INPUT_STATE *st, InputRaw *raw)
 {
-    DWORD rc = g_be->get_state(port, st);
+    const struct pad_cfg *c = __atomic_load_n(&g_cfg, __ATOMIC_ACQUIRE);
+    /* The host-only buttons only for the armed host actions or a map that
+     * names one: a stock run keeps the documented XInputGetState. */
+    int extras = xbox_InputPadFilterSet() || (c && c->extras);
+    DWORD packet = 0;
+    DWORD rc;
+
+    memset(raw, 0, sizeof *raw);
+    rc = g_be->get_raw(port, raw, &packet, extras);
     g_last_probe[port] = g_be->now_ms();
     g_probed[port] = 1;
     g_connected[port] = (rc == ERROR_SUCCESS);
-    __atomic_store_n(&g_extra[port],
-                     rc == ERROR_SUCCESS && g_be->host_extra ? g_be->host_extra(port) : 0u,
-                     __ATOMIC_RELEASE);
+    if (rc == ERROR_SUCCESS) {
+        map_raw(c, raw, &st->Gamepad);
+        st->dwPacketNumber = packet;
+    } else {
+        memset(raw, 0, sizeof *raw);
+    }
+    publish_raw(port, raw);
     return rc;
 }
 
@@ -70,6 +166,7 @@ void xbox_InputInit(void)
 {
     static int atexit_done;
     XBOX_INPUT_STATE st;
+    InputRaw raw;
 
     if (g_inited)
         return;
@@ -80,7 +177,7 @@ void xbox_InputInit(void)
      * clock, the backend's, so a test's fake clock drives them too. */
     xbox_InputKbmSetClock(g_be->now_ms);
     for (DWORD p = 0; p < XBOX_MAX_CONTROLLERS; p++)
-        probe(p, &st);
+        probe(p, &st, &raw);
     /* A crash or an exit while the title has the motors on must not leave a
      * pad buzzing. */
     if (!atexit_done && g_be == &xbox_input_host_backend) {
@@ -97,8 +194,10 @@ void xbox_InputSetBackend(const xbox_input_backend *b)
     memset(g_last_probe, 0, sizeof g_last_probe);
     memset(g_probed, 0, sizeof g_probed);
     memset(g_rumbling, 0, sizeof g_rumbling);
-    for (int p = 0; p < XBOX_MAX_CONTROLLERS; p++)
-        __atomic_store_n(&g_extra[p], 0u, __ATOMIC_RELEASE);
+    for (int p = 0; p < XBOX_MAX_CONTROLLERS; p++) {
+        static const InputRaw none;
+        publish_raw((DWORD)p, &none);
+    }
 }
 
 void xbox_InputSetPadFilter(xbox_input_pad_filter_fn fn)
@@ -118,6 +217,63 @@ uint32_t xbox_InputHostExtra(DWORD slot)
     return __atomic_load_n(&g_extra[slot], __ATOMIC_ACQUIRE);
 }
 
+void xbox_InputHostRaw(DWORD slot, InputRaw *raw)
+{
+    if (slot >= XBOX_MAX_CONTROLLERS) {
+        memset(raw, 0, sizeof *raw);
+        return;
+    }
+    spin_lock(&g_raw_lock);
+    *raw = g_raw[slot];
+    spin_unlock(&g_raw_lock);
+}
+
+void xbox_InputSetGlyphFamily(int family)
+{
+    if (family < XBOX_PAD_FAMILY_AUTO || family >= XBOX_PAD_FAMILY_COUNT)
+        family = XBOX_PAD_FAMILY_AUTO;
+    __atomic_store_n(&g_glyphs, family, __ATOMIC_RELEASE);
+}
+
+int xbox_InputPadFamily(DWORD slot)
+{
+    int f = __atomic_load_n(&g_glyphs, __ATOMIC_ACQUIRE);
+
+    if (f != XBOX_PAD_FAMILY_AUTO)
+        return f;
+    if (slot >= XBOX_MAX_CONTROLLERS || !g_be->family)
+        return XBOX_PAD_FAMILY_XBOX;
+    return g_be->family(slot);
+}
+
+int xbox_InputSteamInput(DWORD slot)
+{
+    if (slot >= XBOX_MAX_CONTROLLERS || !g_be->steam_input)
+        return XBOX_STEAM_INPUT_OFF;
+    return g_be->steam_input(slot);
+}
+
+static const char *const k_family[XBOX_PAD_FAMILY_COUNT] = {
+    "xbox", "playstation", "nintendo", "steam", "generic",
+};
+
+const char *xbox_InputPadFamilyName(int family)
+{
+    return family >= 0 && family < XBOX_PAD_FAMILY_COUNT ? k_family[family] : "auto";
+}
+
+int xbox_InputPadFamilyFromName(const char *name)
+{
+    if (!name)
+        return -2;
+    if (!strcmp(name, "auto"))
+        return XBOX_PAD_FAMILY_AUTO;
+    for (int f = 0; f < XBOX_PAD_FAMILY_COUNT; f++)
+        if (!strcmp(name, k_family[f]))
+            return f;
+    return -2;
+}
+
 uint64_t xbox_InputNowMs(void)
 {
     return g_be && g_be->now_ms ? g_be->now_ms() : 0;
@@ -125,36 +281,46 @@ uint64_t xbox_InputNowMs(void)
 
 DWORD xbox_input_backend_read_host(DWORD slot, struct xbox_host_pad *host)
 {
-    XBOX_INPUT_STATE pad;
-    uint32_t extra = 0;
+    InputRaw raw;
     DWORD rc = ERROR_DEVICE_NOT_CONNECTED;
 
     if (slot >= XBOX_MAX_CONTROLLERS || !host)
         return ERROR_DEVICE_NOT_CONNECTED;
-    memset(&pad, 0, sizeof pad);
+    memset(&raw, 0, sizeof raw);
     /* Before the title's first poll the backend is not up, and bringing it
      * up is the poll thread's job (the SDL boot wait). */
-    if (__atomic_load_n(&g_inited, __ATOMIC_ACQUIRE) && g_be->read_host)
-        rc = g_be->read_host(slot, &pad, &extra);
+    if (__atomic_load_n(&g_inited, __ATOMIC_ACQUIRE) && g_be->read_raw)
+        rc = g_be->read_raw(slot, &raw);
     if (rc == XBOX_INPUT_BUSY)
         return rc;
     memset(host, 0, sizeof *host);
     host->slot = (int)slot;
     if (rc == ERROR_SUCCESS) {
-        host->pad = pad;
-        host->extra = extra & XBOX_HOST_EXTRA_MASK;
+        map_raw(__atomic_load_n(&g_cfg, __ATOMIC_ACQUIRE), &raw, &host->pad.Gamepad);
+        host->raw = raw;
+        host->extra = xbox_PadRawExtra(&raw);
         host->connected = 1;
     }
-    __atomic_store_n(&g_extra[slot], host->extra, __ATOMIC_RELEASE);
+    publish_raw(slot, &host->raw);
     return rc;
+}
+
+static DWORD pad_state(DWORD slot, XBOX_INPUT_STATE *pState, InputRaw *raw)
+{
+    xbox_InputInit();
+    if (due(slot))
+        return probe(slot, pState, raw);
+    memset(raw, 0, sizeof *raw);
+    return ERROR_DEVICE_NOT_CONNECTED;
 }
 
 DWORD xbox_InputGetPadState(DWORD slot, XBOX_INPUT_STATE *pState)
 {
+    InputRaw raw;
+
     if (slot >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
-    xbox_InputInit();
-    return due(slot) ? probe(slot, pState) : ERROR_DEVICE_NOT_CONNECTED;
+    return pad_state(slot, pState, &raw);
 }
 
 void xbox_InputMergeKbm(XBOX_INPUT_STATE *pad, const XBOX_INPUT_STATE *kb)
@@ -180,26 +346,10 @@ void xbox_InputMergeKbm(XBOX_INPUT_STATE *pad, const XBOX_INPUT_STATE *kb)
  * guest's frame, so it sits behind a spin lock held for a copy. */
 static XBOX_INPUT_STATE g_last;
 static DWORD g_last_rc = ERROR_DEVICE_NOT_CONNECTED;
-static unsigned char g_last_lock;   /* the type __atomic_test_and_set is defined on */
+static unsigned char g_last_lock;
 
-static void last_lock(void)
-{
-    unsigned spins = 0;
-
-    /* Held for a 20-byte copy, so a spin is short; but the holder may be
-     * preempted, and on a busy host (Proton's threads plus the guest's) a
-     * waiter that never yields can keep it off the core. */
-    while (__atomic_test_and_set(&g_last_lock, __ATOMIC_ACQUIRE))
-        if (++spins >= 64) {
-            spins = 0;
-            last_yield();
-        }
-}
-
-static void last_unlock(void)
-{
-    __atomic_clear(&g_last_lock, __ATOMIC_RELEASE);
-}
+static void last_lock(void)   { spin_lock(&g_last_lock); }
+static void last_unlock(void) { spin_unlock(&g_last_lock); }
 
 static DWORD keep_last(DWORD rc, const XBOX_INPUT_STATE *st)
 {
@@ -257,6 +407,7 @@ static DWORD filtered(DWORD port, DWORD rc, XBOX_INPUT_STATE *st,
 DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 {
     XBOX_INPUT_STATE kb;
+    InputRaw raw;
     DWORD rc;
 #ifdef XBOXRECOMP_ENHANCE
     xbox_input_pad_filter_fn fn;
@@ -265,7 +416,7 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
 
     if (dwPort >= XBOX_MAX_CONTROLLERS || !pState)
         return ERROR_DEVICE_NOT_CONNECTED;
-    rc = xbox_InputGetPadState(dwPort, pState);
+    rc = pad_state(dwPort, pState, &raw);
 #ifdef XBOXRECOMP_ENHANCE
     /* The host pad before the keyboard and the script are merged: a chord is
      * the pad's, a key the keyboard's (the filter reads keys itself). */
@@ -275,7 +426,8 @@ DWORD xbox_InputGetState(DWORD dwPort, XBOX_INPUT_STATE *pState)
         host.slot = (int)dwPort;
         if (rc == ERROR_SUCCESS) {
             host.pad = *pState;
-            host.extra = xbox_InputHostExtra(dwPort);
+            host.raw = raw;
+            host.extra = xbox_PadRawExtra(&raw);
             host.connected = 1;
         }
     }
@@ -325,6 +477,7 @@ void xbox_InputShutdown(void)
 BOOL xbox_InputIsConnected(DWORD dwPort)
 {
     XBOX_INPUT_STATE st;
+    InputRaw raw;
 
     if (dwPort >= XBOX_MAX_CONTROLLERS)
         return FALSE;
@@ -332,7 +485,7 @@ BOOL xbox_InputIsConnected(DWORD dwPort)
     /* Connected ports are refreshed by the title's own reads; only a port
      * not read for a probe interval is asked here. */
     if (g_be->now_ms() - g_last_probe[dwPort] >= XBOX_INPUT_PROBE_MS)
-        probe(dwPort, &st);
+        probe(dwPort, &st, &raw);
     return g_connected[dwPort];
 }
 

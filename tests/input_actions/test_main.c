@@ -5,7 +5,8 @@
  * off what the title uses (docs/runtime/config.md, "[input.actions]"), hold
  * chords and their consumption, guide+a (rule 7), chord_delay_ms, the flip
  * tick that reads a pad the title has stopped polling, arming by feature
- * keys only, the mod API v2 calls, and the pad filter seam in input_core.c.
+ * keys only, the mod API v2 calls, the pad filter seam in input_core.c, and
+ * bindings in host-source space under [input.pad] (gamepad-input-ux D4).
  * Runs in its working directory, where it writes config/config.toml.
  */
 #include "enhance.h"
@@ -15,6 +16,7 @@
 #include "host_pad.h"
 #include "input_backend.h"
 #include "input_names.h"
+#include "pad_map.h"
 #include "keyboard.h"
 #include "mod.h"
 #include "mouse.h"
@@ -100,9 +102,9 @@ static uint64_t s_now = 1000;               /* atomic: the poll and flip threads
 static XBOX_INPUT_STATE f_pad[4];
 static int f_conn[4] = { 1, 0, 0, 0 };
 static uint32_t f_extra[4];
-static int f_reads;                         /* read_host calls */
+static int f_reads;                         /* read_raw calls */
 static int f_busy;
-static void (*f_during_read)(void);         /* runs once inside the next read_host */
+static void (*f_during_read)(void);         /* runs once inside the next read_raw */
 
 static uint64_t f_clock(void) { return __atomic_load_n(&s_now, __ATOMIC_ACQUIRE); }
 static void advance(uint64_t ms) { __atomic_add_fetch(&s_now, ms, __ATOMIC_ACQ_REL); }
@@ -115,16 +117,32 @@ static DWORD f_get(DWORD p, XBOX_INPUT_STATE *s)
     return ERROR_SUCCESS;
 }
 static DWORD f_set(DWORD p, const XBOX_VIBRATION *v) { (void)p; (void)v; return ERROR_SUCCESS; }
-static uint32_t f_host_extra(DWORD p) { return p < 4 ? f_extra[p] : 0; }
-static DWORD f_read_host(DWORD p, XBOX_INPUT_STATE *out, uint32_t *extra)
+/* Like the real backends, the host-only buttons come back only when asked. */
+static DWORD f_get_raw(DWORD p, InputRaw *raw, DWORD *packet, int extras)
+{
+    XBOX_INPUT_STATE s;
+    DWORD rc = f_get(p, &s);
+
+    if (rc == ERROR_SUCCESS) {
+        xbox_PadRawFromGamepad(&s.Gamepad, extras ? f_extra[p] : 0, raw);
+        *packet = s.dwPacketNumber;
+    }
+    return rc;
+}
+/* A pad without Guide or paddles. */
+static DWORD f_get_plain(DWORD p, InputRaw *raw, DWORD *packet, int extras)
+{
+    (void)extras;
+    return f_get_raw(p, raw, packet, 0);
+}
+static DWORD f_read_raw(DWORD p, InputRaw *raw)
 {
     f_reads++;
     if (f_busy)
         return XBOX_INPUT_BUSY;
     if (p >= 4 || !f_conn[p])
         return ERROR_DEVICE_NOT_CONNECTED;
-    *out = f_pad[p];
-    *extra = f_extra[p];
+    xbox_PadRawFromGamepad(&f_pad[p].Gamepad, f_extra[p], raw);
     if (f_during_read) {
         void (*fn)(void) = f_during_read;
         f_during_read = NULL;
@@ -134,13 +152,13 @@ static DWORD f_read_host(DWORD p, XBOX_INPUT_STATE *out, uint32_t *extra)
 }
 
 static const xbox_input_backend k_fake = {
-    NULL, f_get, f_set, xbox_InputKbmPoll, f_clock, f_host_extra, f_read_host };
+    NULL, f_get_raw, f_set, xbox_InputKbmPoll, f_clock, f_read_raw, NULL, NULL };
 /* A backend with no host-only buttons at all (a pad without Guide). */
 static const xbox_input_backend k_plain = {
-    NULL, f_get, f_set, xbox_InputKbmPoll, f_clock, NULL, NULL };
+    NULL, f_get_plain, f_set, xbox_InputKbmPoll, f_clock, NULL, NULL, NULL };
 /* input_core.c's default; never called here. */
 const xbox_input_backend xbox_input_host_backend = {
-    NULL, f_get, f_set, NULL, f_clock, NULL, NULL };
+    NULL, f_get_raw, f_set, NULL, f_clock, NULL, NULL, NULL };
 
 static void pad_clear(void)
 {
@@ -464,12 +482,15 @@ static void test_refusals(void)
         "overlay.stats = [\"Z\", \"F9\", \"mouse1\", \"F2+F8\", \"pad2:F8\","
         " \"guide+a+b\", \"paddle1@5000\", \"F3\", \"F4\"]\n");
 
-    CHECK(strstr(out, "'a' refused: a single guest button") != NULL);
-    CHECK(strstr(out, "'back+left_thumb' refused: a chord of guest buttons needs a hold"
-                 " of at least 200 ms") != NULL);
-    CHECK(strstr(out, "'back+left_thumb@100' refused: a chord of guest buttons") != NULL);
-    CHECK(strstr(out, "'left_thumb+guide' refused: a chord with a host-only button needs"
-                 " it first") != NULL);
+    CHECK(strstr(out, "'a' inactive: south (the game's a) goes to the game; a single"
+                 " source the game uses") != NULL);
+    CHECK(strstr(out, "'back+left_thumb' inactive: every member goes to the game (back"
+                 " (the game's back), left_stick_click (left_thumb)); such a chord needs a"
+                 " hold of at least 200 ms") != NULL);
+    CHECK(strstr(out, "'back+left_thumb@100' inactive: every member goes to the game")
+          != NULL);
+    /* The modifier need not come first: the kind follows the map. */
+    CHECK(strstr(out, "'left_thumb+guide'") == NULL);
     CHECK(strstr(out, "'F6' refused: 'F6' is bound to the guest's") != NULL);
     CHECK(strstr(out, "'F7' refused: 'F7' is the walk key (input.walk_key)") != NULL);
     CHECK(strstr(out, "'Ctrl+F8' refused: 'Ctrl' is bound to the guest's") != NULL);
@@ -791,6 +812,56 @@ static void test_paddle_default(void)
     poll0();
 }
 
+/* A consumed stick direction: guide+left_stick_up takes the left stick's
+ * upper half from the game until the stick comes back; the other halves
+ * and the other stick pass. With the sticks swapped the half moves to the
+ * guest stick the physical one drives. */
+static void test_stick_mask(void)
+{
+    XBOX_INPUT_STATE st;
+
+    start(ARMED "[input.actions]\nmenu.open = [\"guide+left_stick_up\"]\n");
+    hold_extra(XBOX_HOST_GUIDE, 1);
+    poll0();
+    advance(16);
+    f_pad[0].Gamepad.sThumbLY = 32767;
+    f_pad[0].Gamepad.sThumbLX = 20000;
+    f_pad[0].Gamepad.sThumbRY = 12000;
+    st = poll0();
+    CHECK(menu_fires() == 1);
+    CHECK(st.Gamepad.sThumbLY == 0);
+    CHECK(st.Gamepad.sThumbLX == 20000);
+    CHECK(st.Gamepad.sThumbRY == 12000);
+    /* Guide let go: the stick, still up, is still the host's. */
+    hold_extra(XBOX_HOST_GUIDE, 0);
+    advance(16);
+    st = poll0();
+    CHECK(st.Gamepad.sThumbLY == 0);
+    /* Back to centre and down: the lower half was never taken. */
+    f_pad[0].Gamepad.sThumbLY = 0;
+    poll0();
+    advance(16);
+    f_pad[0].Gamepad.sThumbLY = -30000;
+    st = poll0();
+    CHECK(st.Gamepad.sThumbLY == -30000);
+    pad_clear();
+    poll0();
+
+    start(ARMED "[input.pad]\nleft_stick = \"right\"\nright_stick = \"left\"\n"
+          "[input.actions]\nmenu.open = [\"guide+left_stick_up\"]\n");
+    hold_extra(XBOX_HOST_GUIDE, 1);
+    poll0();
+    advance(16);
+    f_pad[0].Gamepad.sThumbLY = 32767;
+    f_pad[0].Gamepad.sThumbRY = 12000;
+    st = poll0();
+    CHECK(menu_fires() == 1);
+    CHECK(st.Gamepad.sThumbRY == 0);
+    CHECK(st.Gamepad.sThumbLY == 12000);
+    pad_clear();
+    poll0();
+}
+
 /* ---- the overlay.stats action toggles the strip ------------------------ */
 
 static void press_paddle(void)
@@ -907,6 +978,7 @@ static void test_tick(void)
         memset(&h, 0, sizeof h);
         h.pad = f_pad[0];
         h.extra = xbox_InputHostExtra(0);
+        xbox_PadRawFromGamepad(&h.pad.Gamepad, h.extra, &h.raw);
         h.connected = 1;
         h.slot = 0;
         st = f_pad[0];
@@ -928,6 +1000,7 @@ static void filter_now(void)
     memset(&h, 0, sizeof h);
     h.pad = f_pad[0];
     h.extra = f_extra[0];
+    xbox_PadRawFromGamepad(&h.pad.Gamepad, h.extra, &h.raw);
     h.connected = 1;
     h.slot = 0;
     st = f_pad[0];
@@ -1201,6 +1274,201 @@ static void test_live_rebuild(void)
 }
 #endif
 
+/* ---- 14. host-space bindings under [input.pad] (gamepad-input-ux D4) ---- */
+
+static void hold_y(int on) { f_pad[0].Gamepad.bAnalogButtons[XBOX_BUTTON_Y] = on ? 255 : 0; }
+
+static void test_host_space(void)
+{
+    XBOX_INPUT_STATE st;
+    xbox_pad_setup ps;
+    const char *out;
+    int id;
+
+    /* Two unmapped members: both are modifiers and both must be held. */
+    start(ARMED "[input.actions]\nmenu.open = [\"guide+paddle1+a\"]\n");
+    hold_extra(XBOX_HOST_GUIDE, 1);
+    poll0();
+    advance(16);
+    hold_a(1);
+    st = poll0();
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255);
+    CHECK(menu_fires() == 0);
+    /* paddle1 joining late does not complete it: A was the game's first. */
+    hold_extra(XBOX_HOST_PADDLE1, 1);
+    advance(16);
+    st = poll0();
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255);
+    CHECK(menu_fires() == 0);
+    hold_a(0);
+    poll0();
+    advance(16);
+    hold_a(1);
+    st = poll0();
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 0);
+    CHECK(menu_fires() == 1);
+    pad_clear();
+    poll0();
+
+    /* guide mapped to Start: guide+a has every member in the game and no
+     * hold, so it goes inactive with a line; the game gets both. paddle1,
+     * still unmapped, keeps working. */
+    out = start(ARMED "[input.pad]\nstart = \"guide\"\n");
+    CHECK(strstr(out, "'guide+a' inactive: every member goes to the game (south (the"
+                 " game's a), guide (start))") != NULL);
+    CHECK(strstr(out, "'paddle1'") == NULL);
+    hold_extra(XBOX_HOST_GUIDE, 1);
+    poll0();
+    advance(16);
+    hold_a(1);
+    st = poll0();
+    CHECK(st.Gamepad.wButtons & XBOX_GAMEPAD_START);
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255);
+    advance(500);
+    poll0();
+    CHECK(menu_fires() == 0);
+    pad_clear();
+    poll0();
+    hold_extra(XBOX_HOST_PADDLE1, 1);
+    poll0();
+    CHECK(menu_fires() == 1);
+    pad_clear();
+    poll0();
+
+    /* A source the map leaves out is free for a single binding: Back once
+     * the player unbinds it. */
+    out = start(ARMED "[input.pad]\nback = []\n[input.actions]\nmenu.open = [\"back\"]\n");
+    CHECK(strstr(out, "'back'") == NULL);
+    hold_btn(XBOX_GAMEPAD_BACK, 1);
+    st = poll0();
+    CHECK(menu_fires() == 1);
+    CHECK(!(st.Gamepad.wButtons & XBOX_GAMEPAD_BACK));
+    pad_clear();
+    poll0();
+
+    /* back+left_thumb@400 with Back unbound: a modifier chord that keeps its
+     * hold. L3 pressed under Back is the host's at once; the fire waits for
+     * the hold. */
+    start(ARMED "[input.pad]\nback = []\n[input.actions]\n"
+          "menu.open = [\"back+left_thumb@400\"]\n");
+    hold_btn(XBOX_GAMEPAD_BACK, 1);
+    poll0();
+    advance(16);
+    hold_btn(XBOX_GAMEPAD_LEFT_THUMB, 1);
+    st = poll0();
+    CHECK(!(st.Gamepad.wButtons & XBOX_GAMEPAD_LEFT_THUMB));
+    advance(399);
+    poll0();
+    CHECK(menu_fires() == 0);
+    advance(1);
+    st = poll0();
+    CHECK(menu_fires() == 1);
+    CHECK(!(st.Gamepad.wButtons & XBOX_GAMEPAD_LEFT_THUMB));
+    pad_clear();
+    poll0();
+    /* L3 first: it reaches the game and Back joining does not fire. */
+    advance(16);
+    hold_btn(XBOX_GAMEPAD_LEFT_THUMB, 1);
+    poll0();
+    advance(16);
+    hold_btn(XBOX_GAMEPAD_BACK, 1);
+    advance(500);
+    st = poll0();
+    CHECK(st.Gamepad.wButtons & XBOX_GAMEPAD_LEFT_THUMB);
+    CHECK(menu_fires() == 0);
+    pad_clear();
+    poll0();
+
+    /* Masking goes through both maps: paddle2 is A's second source, so a
+     * chord that consumes paddle2 takes A from the game, and the button the
+     * menu closed on is masked whichever source holds it. */
+    start(ARMED "[input.pad]\na = [\"south\", \"paddle2\"]\n[input.actions]\n"
+          "menu.open = [\"guide+paddle2\"]\n");
+    hold_extra(XBOX_HOST_GUIDE, 1);
+    poll0();
+    advance(16);
+    hold_extra(XBOX_HOST_PADDLE2, 1);
+    st = poll0();
+    CHECK(menu_fires() == 1);
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 0);
+    pad_clear();
+    poll0();
+    advance(16);
+    hold_extra(XBOX_HOST_PADDLE2, 1);
+    st = poll0();
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255);
+    enhance_actions_mask_until_release(0, A_BIT);
+    advance(16);
+    st = poll0();
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 0);
+    pad_clear();
+    poll0();
+
+    /* paddle1 mapped, remapped and unmapped by a live map change (what the
+     * Controls page does: a new setup, then a rebuild): the kind is derived
+     * at every rebuild, one line per change. */
+    start(ARMED "[input.actions]\nmenu.open = [\"paddle1\", \"paddle1+y\", \"paddle1+b@300\"]\n");
+    id = enhance_action_find("menu.open");
+    CHECK(id >= 0);
+    xbox_PadSetupIdentity(&ps);
+    ps.map.source[INPUT_X] = INPUT_SRC_PADDLE1;
+    xbox_InputSetPadSetup(&ps);
+    capture_begin();
+    enhance_actions_rebuild();
+    out = capture_end();
+    CHECK(strstr(out, "'paddle1' inactive: paddle1 (the game's x) goes to the game")
+          != NULL);
+    CHECK(strstr(out, "(was host-only)\n") != NULL);
+    CHECK(strstr(out, "'paddle1+y' inactive: every member goes to the game") != NULL);
+    CHECK(strstr(out, "(was a modifier chord)\n") != NULL);
+    CHECK(strstr(out, "'paddle1+b@300' is now a guest chord (was a modifier chord)\n")
+          != NULL);
+    hold_extra(XBOX_HOST_PADDLE1, 1);
+    st = poll0();
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_X] == 255);
+    advance(16);
+    hold_y(1);
+    st = poll0();
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_Y] == 255);
+    CHECK(menu_fires() == 0);
+    pad_clear();
+    poll0();
+
+    /* Remapped to Y: still inactive, now naming y; nothing changes kind. */
+    xbox_PadSetupIdentity(&ps);
+    ps.map.source[INPUT_Y] = INPUT_SRC_PADDLE1;
+    xbox_InputSetPadSetup(&ps);
+    capture_begin();
+    enhance_actions_rebuild();
+    out = capture_end();
+    CHECK(strstr(out, "'paddle1' inactive: paddle1 (the game's y) goes to the game")
+          != NULL);
+    CHECK(strstr(out, "'paddle1' inactive: paddle1 (the game's y) goes to the game"
+                 " (was") == NULL);
+    /* paddle1+y: Y's own source (north) is free now, so this is a modifier
+     * chord with north the modifier. */
+    CHECK(strstr(out, "'paddle1+y' is now a modifier chord (was inactive)\n") != NULL);
+    CHECK(strstr(out, "'paddle1+b@300' is now") == NULL);
+
+    /* Unmapped again: back to host-only and a modifier chord. */
+    xbox_InputSetPadSetup(NULL);
+    capture_begin();
+    enhance_actions_rebuild();
+    out = capture_end();
+    CHECK(strstr(out, "'paddle1' is now host-only (was inactive)\n") != NULL);
+    CHECK(strstr(out, "'paddle1+b@300' is now a modifier chord (was a guest chord)\n")
+          != NULL);
+    poll0();    /* a new table fires only on a press it saw start */
+    advance(16);
+    hold_extra(XBOX_HOST_PADDLE1, 1);
+    st = poll0();
+    CHECK(menu_fires() == 1);
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_X] == 0);
+    pad_clear();
+    poll0();
+    remove("config/config.toml");
+}
+
 int main(void)
 {
     MKDIR("config");
@@ -1221,6 +1489,8 @@ int main(void)
     test_tick_race();
     test_mod_api();
     test_seam();
+    test_host_space();
+    test_stick_mask();
 #ifndef _WIN32
     test_live_rebuild();
 #endif

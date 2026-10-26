@@ -16,7 +16,9 @@
  * open and close stays on one thread, and here that is the one attaching
  * the virtual pads.
  */
+#include "host_pad.h"
 #include "input_backend.h"
+#include "pad_map.h"
 
 #include <SDL3/SDL.h>
 #include <pthread.h>
@@ -209,6 +211,8 @@ static void test_boot(void)
 static void test_basic(void)
 {
     XBOX_INPUT_STATE st;
+    InputRaw raw;
+    DWORD packet;
     XBOX_VIBRATION vib = { 1000, 1000 };
     SDL_JoystickID a, b, c;
 
@@ -227,7 +231,7 @@ static void test_basic(void)
     detach(a);
     CHECK(xbox_InputGetState(0, &st) == ERROR_DEVICE_NOT_CONNECTED,
           "port 0 still connected after A was pulled");
-    CHECK(g_be.get_state(0, &st) == ERROR_DEVICE_NOT_CONNECTED, "backend port 0 after A pulled");
+    CHECK(g_be.get_raw(0, &raw, &packet, 0) == ERROR_DEVICE_NOT_CONNECTED, "backend port 0 after A pulled");
     CHECK(xbox_InputSetState(0, &vib) == ERROR_DEVICE_NOT_CONNECTED, "rumble on a pulled pad");
     EXPECT(0x2, 0, 0x1, "A pulled");
     CHECK(port_of(b) == 1, "B moved to port %d when A left", port_of(b));
@@ -297,18 +301,117 @@ static void test_memory(void)
     EXPECT(0x0, 0, 0xF, "all pulled");
 }
 
-/* ── 3. polls on one thread, hot-plug on another ──────────────────────── */
+/* ── 3. family, Steam Input and the paddles (gamepad-input-ux D5, D6) ── */
+
+/* A virtual pad with a vendor and product, and SDL3's whole button set
+ * (MISC1, the four paddles, the touchpad), so SDL's automatic virtual
+ * mapping gives each its own button. */
+static SDL_JoystickID attach_vidpid(Uint16 vendor, Uint16 product)
+{
+    SDL_VirtualJoystickDesc d;
+    SDL_JoystickID id;
+
+    SDL_INIT_INTERFACE(&d);
+    d.type       = SDL_JOYSTICK_TYPE_GAMEPAD;
+    d.naxes      = 6;
+    d.nbuttons   = SDL_GAMEPAD_BUTTON_TOUCHPAD + 1;
+    d.vendor_id  = vendor;
+    d.product_id = product;
+    d.name       = "family test pad";
+    id = SDL_AttachVirtualJoystick(&d);
+    if (!id)
+        printf("FAIL attach %04x:%04x: %s\n", vendor, product, SDL_GetError()), exit(1);
+    return id;
+}
+
+static void test_families(void)
+{
+    static const struct { Uint16 vid, pid; int family, steam; const char *what; } k[] = {
+        { 0x045e, 0x0b12, XBOX_PAD_FAMILY_XBOX, XBOX_STEAM_INPUT_OFF, "Xbox Series" },
+        { 0x054c, 0x09cc, XBOX_PAD_FAMILY_PLAYSTATION, XBOX_STEAM_INPUT_OFF, "DualShock 4" },
+        { 0x054c, 0x0ce6, XBOX_PAD_FAMILY_PLAYSTATION, XBOX_STEAM_INPUT_OFF, "DualSense" },
+        { 0x057e, 0x2009, XBOX_PAD_FAMILY_NINTENDO, XBOX_STEAM_INPUT_OFF, "Switch Pro" },
+        /* The Deck's own pad is steam by the table, Steam Input on or off;
+         * only Steam's virtual pad (11ff) says Steam Input is in between. */
+        { 0x28de, 0x1205, XBOX_PAD_FAMILY_STEAM, XBOX_STEAM_INPUT_OFF, "Deck, Steam Input off" },
+        { 0x28de, 0x11ff, -1, XBOX_STEAM_INPUT_ON, "Steam virtual pad" },
+    };
+    XBOX_INPUT_STATE st;
+
+    for (size_t i = 0; i < sizeof k / sizeof k[0]; i++) {
+        SDL_JoystickID id = attach_vidpid(k[i].vid, k[i].pid);
+        uint32_t ins, rem;
+        int f, s;
+
+        step(&ins, &rem);
+        CHECK(port_of(id) == 0, "%s on port %d, want 0", k[i].what, port_of(id));
+        f = xbox_InputPadFamily(0);
+        s = xbox_InputSteamInput(0);
+        if (k[i].family >= 0)
+            CHECK(f == k[i].family, "%s: family %s, want %s", k[i].what,
+                  xbox_InputPadFamilyName(f), xbox_InputPadFamilyName(k[i].family));
+        CHECK(s == k[i].steam, "%s: steam input %d, want %d", k[i].what, s, k[i].steam);
+        /* input.glyphs wins over the detection, and auto gives it back. */
+        xbox_InputSetGlyphFamily(XBOX_PAD_FAMILY_NINTENDO);
+        CHECK(xbox_InputPadFamily(0) == XBOX_PAD_FAMILY_NINTENDO, "%s: glyph override",
+              k[i].what);
+        xbox_InputSetGlyphFamily(XBOX_PAD_FAMILY_AUTO);
+        CHECK(xbox_InputPadFamily(0) == f, "%s: auto again", k[i].what);
+        detach(id);
+        step(&ins, &rem);
+    }
+
+    /* The paddles reach the host side only, and the game only through a
+     * map that names one: the stock map leaves R4 out. */
+    {
+        SDL_JoystickID id = attach_vidpid(0x28de, 0x1205);
+        SDL_Joystick *j;
+        xbox_pad_setup ps;
+        InputRaw raw;
+        uint32_t ins, rem;
+
+        step(&ins, &rem);
+        j = SDL_GetJoystickFromID(id);
+        CHECK(j != NULL, "Deck pad not opened");
+        SDL_SetJoystickVirtualButton(j, SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1, true);
+        if (g_window)
+            SDL_UpdateGamepads();
+        CHECK(xbox_InputGetState(0, &st) == ERROR_SUCCESS, "Deck pad read");
+        CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 0 && st.Gamepad.wButtons == 0,
+              "R4 reached the game under the stock map");
+        /* Mapped to A: the backend reads the extras for it, with no filter. */
+        xbox_PadSetupIdentity(&ps);
+        ps.map.source[INPUT_A] = INPUT_SRC_PADDLE1;
+        xbox_InputSetPadSetup(&ps);
+        CHECK(xbox_InputGetState(0, &st) == ERROR_SUCCESS, "Deck pad read, mapped");
+        CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255, "R4 mapped to A reads %u",
+              st.Gamepad.bAnalogButtons[XBOX_BUTTON_A]);
+        xbox_InputHostRaw(0, &raw);
+        CHECK(raw.src[INPUT_SRC_PADDLE1] > 0, "the raw snapshot has no paddle1");
+        CHECK(raw.src[INPUT_SRC_PADDLE2] == 0, "paddle2 down in the raw snapshot");
+        xbox_InputSetPadSetup(NULL);
+        SDL_SetJoystickVirtualButton(j, SDL_GAMEPAD_BUTTON_RIGHT_PADDLE1, false);
+        if (g_window)
+            SDL_UpdateGamepads();
+        xbox_InputGetState(0, &st);
+        detach(id);
+        step(&ins, &rem);
+    }
+}
+
+/* ── 4. polls on one thread, hot-plug on another ──────────────────────── */
 
 static volatile int g_stop;
 
 static void *poller(void *arg)
 {
-    XBOX_INPUT_STATE st;
+    InputRaw raw;
+    DWORD packet;
     long n = 0;
     (void)arg;
     while (!g_stop)
         for (DWORD p = 0; p < XBOX_MAX_CONTROLLERS; p++, n++) {
-            g_be.get_state(p, &st);
+            g_be.get_raw(p, &raw, &packet, (int)(n & 1));
             if (!(n & 63)) {
                 XBOX_VIBRATION v = { 0, 0 };
                 g_be.set_state(p, &v);
@@ -321,7 +424,8 @@ static void test_threads(void)
 {
     pthread_t t;
     SDL_JoystickID keep = attach(0x60);
-    XBOX_INPUT_STATE st;
+    InputRaw raw;
+    DWORD packet;
 
     sync_pads();
     pthread_create(&t, NULL, poller, NULL);
@@ -339,7 +443,7 @@ static void test_threads(void)
     /* Settle: the last removals are seen, the kept pad is still player 1. */
     sync_pads();
     for (DWORD p = 0; p < XBOX_MAX_CONTROLLERS; p++)
-        g_be.get_state(p, &st);
+        g_be.get_raw(p, &raw, &packet, 0);
     EXPECT(0x1, 0x1, 0, "after the churn");
     CHECK(port_of(keep) == 0, "kept pad on port %d after the churn", port_of(keep));
     detach(keep);
@@ -380,6 +484,7 @@ int main(void)
     xbox_InputSetMainPump(1);
     test_basic();
     test_memory();
+    test_families();
     test_threads();
     printf("input_hotplug_sdl (SDL %d.%d.%d): %d checks, %d failed\n",
            SDL_VERSIONNUM_MAJOR(v), SDL_VERSIONNUM_MINOR(v), SDL_VERSIONNUM_MICRO(v),

@@ -327,11 +327,24 @@ static int f_kb(XBOX_INPUT_STATE *s)
     return 1;
 }
 static uint64_t f_clock(void) { return f_now; }
+static int f_last_extras = -1;
+static DWORD f_get_raw(DWORD p, InputRaw *raw, DWORD *packet, int extras)
+{
+    XBOX_INPUT_STATE s;
+    DWORD rc = f_get(p, &s);
 
-static const xbox_input_backend k_fake = { f_init, f_get, f_set, f_kb, f_clock, NULL, NULL };
+    f_last_extras = extras;
+    if (rc == ERROR_SUCCESS) {
+        xbox_PadRawFromGamepad(&s.Gamepad, 0, raw);
+        *packet = s.dwPacketNumber;
+    }
+    return rc;
+}
+
+static const xbox_input_backend k_fake = { f_init, f_get_raw, f_set, f_kb, f_clock, NULL, NULL, NULL };
 
 /* input_core.c's default; never called here. */
-const xbox_input_backend xbox_input_host_backend = { NULL, f_get, f_set, NULL, f_clock, NULL, NULL };
+const xbox_input_backend xbox_input_host_backend = { NULL, f_get_raw, f_set, NULL, f_clock, NULL, NULL, NULL };
 
 static void test_cache(void)
 {
@@ -461,6 +474,271 @@ static void test_pad_only(void)
     xbox_InputSetBackend(NULL);
 }
 
+/* ── 6. the identity setup is the old fixed table, bit for bit ─────────── */
+
+static uint32_t s_rng = 0x2545F491u;
+static uint32_t rnd(void)
+{
+    s_rng ^= s_rng << 13;
+    s_rng ^= s_rng >> 17;
+    s_rng ^= s_rng << 5;
+    return s_rng;
+}
+
+static int same_pad(const XBOX_GAMEPAD *a, const XBOX_GAMEPAD *b)
+{
+    return a->wButtons == b->wButtons
+        && !memcmp(a->bAnalogButtons, b->bAnalogButtons, sizeof a->bAnalogButtons)
+        && a->sThumbLX == b->sThumbLX && a->sThumbLY == b->sThumbLY
+        && a->sThumbRX == b->sThumbRX && a->sThumbRY == b->sThumbRY;
+}
+
+static int16_t pick_axis(void)
+{
+    static const int16_t edge[] = { 0, 1, -1, 32767, -32768, -32767, 7849, -7849, 8689 };
+    return (rnd() & 3) ? (int16_t)rnd() : edge[rnd() % (sizeof edge / sizeof edge[0])];
+}
+
+/* Both adapters, then the identity, against xbox_PadMapXInput/Sdl. */
+static int identity_xi(const XBOX_HOST_XINPUT_GAMEPAD *in)
+{
+    xbox_pad_setup id;
+    XBOX_GAMEPAD want, got;
+    InputRaw raw;
+
+    xbox_PadSetupIdentity(&id);
+    xbox_PadMapXInput(in, &want);
+    xbox_PadRawXInput(in, 0, &raw);
+    xbox_PadSetupApply(&id, &raw, &got);
+    return same_pad(&want, &got);
+}
+
+static int identity_sdl(const XBOX_HOST_SDL_GAMEPAD *in)
+{
+    xbox_pad_setup id;
+    XBOX_GAMEPAD want, got;
+    InputRaw raw;
+
+    xbox_PadSetupIdentity(&id);
+    xbox_PadMapSdl(in, &want);
+    xbox_PadRawSdl(in, 0, &raw);
+    xbox_PadSetupApply(&id, &raw, &got);
+    return same_pad(&want, &got);
+}
+
+static void test_identity(void)
+{
+    static const int16_t corner[] = { 32767, -32768, 0, 1, -1 };
+    XBOX_HOST_XINPUT_GAMEPAD xi;
+    XBOX_HOST_SDL_GAMEPAD sdl;
+    int bad;
+
+    /* Every trigger value through both adapters. */
+    bad = 0;
+    for (int t = 0; t < 256; t++) {
+        memset(&xi, 0, sizeof xi);
+        xi.bLeftTrigger = (uint8_t)t;
+        xi.bRightTrigger = (uint8_t)(255 - t);
+        bad += !identity_xi(&xi);
+    }
+    CHECK(!bad, "%d XInput trigger values differ from the old table", bad);
+    bad = 0;
+    for (int v = -1; v <= 32767; v += (v < 300 ? 1 : 97)) {
+        memset(&sdl, 0, sizeof sdl);
+        sdl.axis[XBOX_SDL_AXIS_TRIGGERLEFT] = (int16_t)v;
+        sdl.axis[XBOX_SDL_AXIS_TRIGGERRIGHT] = (int16_t)(v < 0 ? -32768 : 32767 - v);
+        bad += !identity_sdl(&sdl);
+    }
+    CHECK(!bad, "%d SDL trigger values differ from the old table", bad);
+
+    /* Stick corners and -32768 on every axis, at deadzone 0 and with the
+     * RECOMP_PAD_DEADZONE rescale on. */
+    for (int dzi = 0; dzi < 3; dzi++) {
+        static const int dzs[] = { 0, 7849, 30000 };
+        xbox_InputSetDeadzone(dzs[dzi]);
+        bad = 0;
+        for (size_t a = 0; a < 5; a++)
+            for (size_t b = 0; b < 5; b++)
+                for (int stick = 0; stick < 2; stick++) {
+                    memset(&xi, 0, sizeof xi);
+                    memset(&sdl, 0, sizeof sdl);
+                    (stick ? &xi.sThumbRX : &xi.sThumbLX)[0] = corner[a];
+                    (stick ? &xi.sThumbRY : &xi.sThumbLY)[0] = corner[b];
+                    sdl.axis[stick ? XBOX_SDL_AXIS_RIGHTX : XBOX_SDL_AXIS_LEFTX] = corner[a];
+                    sdl.axis[stick ? XBOX_SDL_AXIS_RIGHTY : XBOX_SDL_AXIS_LEFTY] = corner[b];
+                    bad += !identity_xi(&xi) + !identity_sdl(&sdl);
+                }
+        CHECK(!bad, "%d stick corners differ at deadzone %d", bad, dzs[dzi]);
+    }
+
+    /* Random pads, every button, both sticks. */
+    xbox_InputSetDeadzone(0);
+    bad = 0;
+    for (int i = 0; i < 20000; i++) {
+        if (i == 10000)
+            xbox_InputSetDeadzone(7849);
+        xi.wButtons = (uint16_t)(rnd() & 0xF3FF);
+        xi.bLeftTrigger = (uint8_t)rnd();
+        xi.bRightTrigger = (uint8_t)rnd();
+        xi.sThumbLX = pick_axis();
+        xi.sThumbLY = pick_axis();
+        xi.sThumbRX = pick_axis();
+        xi.sThumbRY = pick_axis();
+        bad += !identity_xi(&xi);
+        for (int b = 0; b < XBOX_SDL_BUTTON_COUNT; b++)
+            sdl.button[b] = (uint8_t)(rnd() & 1);
+        for (int a = 0; a < XBOX_SDL_AXIS_COUNT; a++)
+            sdl.axis[a] = pick_axis();
+        bad += !identity_sdl(&sdl);
+    }
+    CHECK(!bad, "%d random pads differ from the old table", bad);
+    xbox_InputSetDeadzone(0);
+
+    {
+        xbox_pad_setup s;
+        xbox_PadSetupIdentity(&s);
+        CHECK(xbox_PadSetupIsIdentity(&s), "the identity is not the identity");
+        CHECK(!xbox_PadSetupNeedsExtras(&s), "the identity asks for the host-only buttons");
+    }
+}
+
+/* ── 7. a setup that is not the identity ───────────────────────────────── */
+
+static void test_setup(void)
+{
+    xbox_pad_setup s;
+    XBOX_HOST_XINPUT_GAMEPAD xi;
+    XBOX_GAMEPAD g;
+    InputRaw raw;
+    SHORT ex, ey;
+
+    /* Swapped sticks: the raw sticks, each under the RECOMP_PAD_DEADZONE
+     * of its new place. */
+    memset(&xi, 0, sizeof xi);
+    xi.sThumbLX = 1000; xi.sThumbLY = -2000; xi.sThumbRX = -32768; xi.sThumbRY = 32767;
+    xbox_PadSetupIdentity(&s);
+    s.map.left_stick = INPUT_STICK_RIGHT;
+    s.map.right_stick = INPUT_STICK_LEFT;
+    CHECK(!xbox_PadSetupIsIdentity(&s), "a swap reads as the identity");
+    xbox_PadRawXInput(&xi, 0, &raw);
+    xbox_PadSetupApply(&s, &raw, &g);
+    CHECK(g.sThumbLX == -32768 && g.sThumbLY == 32767 && g.sThumbRX == 1000 && g.sThumbRY == -2000,
+          "swap: L %d,%d R %d,%d", g.sThumbLX, g.sThumbLY, g.sThumbRX, g.sThumbRY);
+
+    /* A file deadzone goes through upstream's rescale and clamps to the
+     * unit circle; the env deadzone does not apply on top of it. */
+    xbox_InputSetDeadzone(7849);
+    xbox_PadSetupIdentity(&s);
+    s.map.deadzone_left = 20;
+    xi.sThumbLX = 20000; xi.sThumbLY = 20000;
+    xbox_PadRawXInput(&xi, 0, &raw);
+    xbox_PadSetupApply(&s, &raw, &g);
+    xbox_InputMap_ApplyStick(20000, 20000, 20, &ex, &ey);
+    CHECK(g.sThumbLX == ex && g.sThumbLY == ey, "file deadzone: %d,%d want %d,%d",
+          g.sThumbLX, g.sThumbLY, ex, ey);
+    ex = -32768; ey = 32767;
+    xbox_InputApplyDeadzone(&ex, &ey, 7849);
+    CHECK(g.sThumbRX == ex && g.sThumbRY == ey, "the other stick keeps the env deadzone");
+    xbox_InputSetDeadzone(0);
+
+    /* Inversion: -32768 clamps to 32767, the direction sources follow. */
+    memset(&xi, 0, sizeof xi);
+    xi.sThumbLY = -32768; xi.sThumbRY = 5;
+    xbox_PadRawXInput(&xi, 0, &raw);
+    CHECK(raw.src[INPUT_SRC_LSTICK_DOWN] == 32767 && raw.src[INPUT_SRC_LSTICK_UP] == 0,
+          "down source of -32768: %d", raw.src[INPUT_SRC_LSTICK_DOWN]);
+    xbox_PadRawInvert(&raw, 1, 1);
+    CHECK(raw.ly == 32767 && raw.ry == -5, "invert: %d %d", raw.ly, raw.ry);
+    CHECK(raw.src[INPUT_SRC_LSTICK_UP] == 32767 && raw.src[INPUT_SRC_LSTICK_DOWN] == 0
+          && raw.src[INPUT_SRC_RSTICK_DOWN] == 5 && raw.src[INPUT_SRC_RSTICK_UP] == 0,
+          "inverted direction sources");
+
+    /* Direction sources on the four halves. */
+    memset(&xi, 0, sizeof xi);
+    xi.sThumbLX = -300; xi.sThumbRX = 12345; xi.sThumbRY = -32768;
+    xbox_PadRawXInput(&xi, 0, &raw);
+    CHECK(raw.src[INPUT_SRC_LSTICK_LEFT] == 300 && raw.src[INPUT_SRC_LSTICK_RIGHT] == 0
+          && raw.src[INPUT_SRC_RSTICK_RIGHT] == 12345 && raw.src[INPUT_SRC_RSTICK_DOWN] == 32767,
+          "direction sources");
+
+    /* A remap plus a second cell: A on east, the alternate map adds A from
+     * the left trigger past the button threshold. */
+    xbox_PadSetupIdentity(&s);
+    s.map.source[INPUT_A] = INPUT_SRC_EAST;
+    s.map.source[INPUT_B] = INPUT_SRC_NONE;
+    s.alt.source[INPUT_A] = INPUT_SRC_LEFT_TRIGGER;
+    memset(&xi, 0, sizeof xi);
+    xi.bLeftTrigger = 200;
+    xbox_PadRawXInput(&xi, 0, &raw);
+    xbox_PadSetupApply(&s, &raw, &g);
+    CHECK(g.bAnalogButtons[XBOX_BUTTON_A] == 255, "second cell: A %d", g.bAnalogButtons[XBOX_BUTTON_A]);
+    CHECK(g.bAnalogButtons[XBOX_BUTTON_LTRIGGER] == 200, "the trigger still drives LT");
+    xi.wButtons = XBOX_XI_B; xi.bLeftTrigger = 10;
+    xbox_PadRawXInput(&xi, 0, &raw);
+    xbox_PadSetupApply(&s, &raw, &g);
+    CHECK(g.bAnalogButtons[XBOX_BUTTON_A] == 255 && g.bAnalogButtons[XBOX_BUTTON_B] == 0,
+          "remap: A %d B %d", g.bAnalogButtons[XBOX_BUTTON_A], g.bAnalogButtons[XBOX_BUTTON_B]);
+
+    /* Host-only sources: the extras bits round-trip and a map naming one
+     * asks for them. */
+    memset(&xi, 0, sizeof xi);
+    xbox_PadRawXInput(&xi, XBOX_HOST_GUIDE | XBOX_HOST_PADDLE3, &raw);
+    CHECK(xbox_PadRawExtra(&raw) == (XBOX_HOST_GUIDE | XBOX_HOST_PADDLE3), "extras round trip");
+    xbox_PadSetupIdentity(&s);
+    s.alt.source[INPUT_X] = INPUT_SRC_PADDLE1;
+    CHECK(xbox_PadSetupNeedsExtras(&s), "a paddle in the map does not ask for extras");
+    xbox_PadSetupApply(&s, &raw, &g);
+    CHECK(g.bAnalogButtons[XBOX_BUTTON_X] == 0, "paddle 1 not held, X %d", g.bAnalogButtons[XBOX_BUTTON_X]);
+    xbox_PadRawXInput(&xi, XBOX_HOST_PADDLE1, &raw);
+    xbox_PadSetupApply(&s, &raw, &g);
+    CHECK(g.bAnalogButtons[XBOX_BUTTON_X] == 255, "paddle 1 held, X %d", g.bAnalogButtons[XBOX_BUTTON_X]);
+}
+
+/* ── 8. the poll asks the backend for extras only when needed ──────────── */
+
+static void dummy_filter(DWORD port, const struct xbox_host_pad *host, XBOX_INPUT_STATE *st)
+{
+    (void)port; (void)host; (void)st;
+}
+
+static void test_extras_flag(void)
+{
+    XBOX_INPUT_STATE st;
+    xbox_pad_setup s;
+
+    memset(f_plugged, 0, sizeof f_plugged);
+    f_plugged[0] = 1;
+    xbox_InputSetBackend(&k_fake);
+    xbox_InputSetPadSetup(NULL);
+    xbox_InputGetState(0, &st);
+    CHECK(f_last_extras == 0, "stock poll asked for extras");
+    CHECK(st.Gamepad.wButtons == XBOX_GAMEPAD_START, "stock pad");
+
+    xbox_InputSetPadFilter(dummy_filter);
+    xbox_InputGetState(0, &st);
+    CHECK(f_last_extras == 1, "a filter did not ask for extras");
+    xbox_InputSetPadFilter(NULL);
+
+    xbox_PadSetupIdentity(&s);
+    s.map.source[INPUT_BACK] = INPUT_SRC_GUIDE;
+    xbox_InputSetPadSetup(&s);
+    xbox_InputGetState(0, &st);
+    CHECK(f_last_extras == 1, "guide in the map did not ask for extras");
+    CHECK(st.Gamepad.wButtons == XBOX_GAMEPAD_START, "START survives the map: %#x", st.Gamepad.wButtons);
+    {
+        xbox_pad_setup back;
+        xbox_InputPadSetup(&back);
+        CHECK(!memcmp(&back, &s, sizeof s), "the setup in force reads back");
+    }
+
+    /* The identity, handed in, is stored as NULL (the stock path). */
+    xbox_PadSetupIdentity(&s);
+    xbox_InputSetPadSetup(&s);
+    xbox_InputGetState(0, &st);
+    CHECK(f_last_extras == 0, "the identity asked for extras");
+    xbox_InputSetBackend(NULL);
+}
+
 int main(int argc, char **argv)
 {
     xbox_InputSetDeadzone(0);
@@ -469,6 +747,9 @@ int main(int argc, char **argv)
     test_readme(argc > 1 ? argv[1] : "input_README.md");
     test_cache();
     test_pad_only();
+    test_identity();
+    test_setup();
+    test_extras_flag();
     printf("pad_map: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

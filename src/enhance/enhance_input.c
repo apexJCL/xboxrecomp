@@ -10,6 +10,13 @@
  * Controls no file names keep the toolkit's compiled-in table, less the
  * keys a file binds elsewhere.
  *
+ * [input.pad] remaps the host pad onto the Duke the same way: each control
+ * takes up to two host sources (upstream's InputPadMap names, design D3 of
+ * gamepad-input-ux), the highest file that names a control decides it, and
+ * a source a higher file binds is taken off the controls below. With no
+ * [input.pad] the pad is the identity, the fixed table the runtime always
+ * had.
+ *
  * Errors are [INPUT] lines, never fatal, and leave the rest applied: a
  * player's typo in one binding must not cost them the keyboard. The
  * [ENHANCE] lines gain nothing (the golden harness parses those). Docs:
@@ -24,9 +31,12 @@
 
 #include "enhance_actions.h"
 #include "enhance_cfg.h"
+#include "host_pad.h"
 #include "input_names.h"
 #include "keyboard.h"
 #include "mouse.h"
+#include "pad_map.h"
+#include "recomp_env.h"
 
 #define PREFIX     "input.bindings."
 #define NFILES     3            /* enhance_cfg_file: 0 title, 1 user, 2 defaults */
@@ -45,6 +55,8 @@
 
 static const char *const s_look[]    = { "right_stick", "left_stick", "none", NULL };
 static const char *const s_capture[] = { "focus", "click", "never", NULL };
+/* input.glyphs: "auto", then the families in xbox_InputPadFamily order. */
+static const char *const s_glyphs[] = { "auto", "xbox", "playstation", "nintendo", "steam", NULL };
 
 static void say(const recomp_cfg *c, const char *key, const char *fmt, ...)
 {
@@ -362,6 +374,243 @@ static void apply_bindings(int counts[NFILES])
     }
 }
 
+/* ---- the pad map ([input.pad]) -------------------------------------------
+ * The same layering as the bindings, on host sources instead of keys. The
+ * two stick keys pick a whole physical stick and take part in "the highest
+ * file wins" only. */
+
+#define PAD_PREFIX  "input.pad."
+#define PAD_CELLS   2           /* the main map and the alternate map */
+#define PAD_LSTICK  INPUT_PAD_CONTROL_COUNT
+#define PAD_RSTICK  (INPUT_PAD_CONTROL_COUNT + 1)
+#define PAD_KEYS    (INPUT_PAD_CONTROL_COUNT + 2)
+
+typedef struct {
+    unsigned char named;
+    unsigned char n;
+    unsigned char src[PAD_CELLS];   /* a stick key: src[0] is INPUT_STICK_* */
+    int           line[PAD_CELLS];
+} pad_set;
+
+static pad_set s_pad[NFILES][PAD_KEYS];
+static const char *const s_stick[] = { "left", "right", "none", NULL };
+
+static const char *pad_key_name(int k)
+{
+    return k == PAD_LSTICK ? "left_stick" : k == PAD_RSTICK ? "right_stick"
+         : xbox_InputMap_ControlName(k);
+}
+
+static int pad_owner_in_file(int f, int src, int *line)
+{
+    for (int c = 0; c < INPUT_PAD_CONTROL_COUNT; c++)
+        for (int k = 0; k < s_pad[f][c].n; k++)
+            if (s_pad[f][c].src[k] == src) {
+                *line = s_pad[f][c].line[k];
+                return c;
+            }
+    return -1;
+}
+
+static void pad_add(int f, const recomp_cfg *cfg, const char *key, int ctl, const char *name)
+{
+    pad_set *s = &s_pad[f][ctl];
+    int src = xbox_InputMap_SourceFromName(name), other, line;
+
+    if (src < 0) {
+        say(cfg, key, "unknown pad source '%s' in %s (see docs/runtime/config.md); skipped",
+            name, key);
+        return;
+    }
+    if (src == INPUT_SRC_NONE)
+        return;
+    other = pad_owner_in_file(f, src, &line);
+    if (other == ctl)
+        return;
+    if (other >= 0) {
+        say(cfg, key, "'%s' already mapped to " PAD_PREFIX "%s on line %d; ignored here",
+            name, pad_key_name(other), line);
+        return;
+    }
+    if (s->n == PAD_CELLS) {
+        say(cfg, key, "%s has more than %d sources; '%s' ignored", key, PAD_CELLS, name);
+        return;
+    }
+    /* Windows' Game Bar and Steam take Guide before the game sees it. */
+    if (src == INPUT_SRC_GUIDE)
+        say(cfg, key, "%s 'guide': most hosts keep Guide for themselves; mapped anyway", key);
+    s->src[s->n] = (unsigned char)src;
+    s->line[s->n] = recomp_cfg_line(cfg, key);
+    s->n++;
+}
+
+static void pad_scan_stick(int f, const recomp_cfg *cfg, const char *key, int k)
+{
+    const char *v;
+
+    if (recomp_cfg_type_of(cfg, key) != RCFG_STRING) {
+        say(cfg, key, "%s is one of left, right, none (got %s); ignored", key,
+            type_name(recomp_cfg_type_of(cfg, key)));
+        return;
+    }
+    v = recomp_cfg_string(cfg, key, "");
+    for (int i = 0; s_stick[i]; i++)
+        if (!strcmp(v, s_stick[i])) {
+            s_pad[f][k].named = 1;
+            s_pad[f][k].src[0] = (unsigned char)i;   /* INPUT_STICK_LEFT, RIGHT, NONE */
+            return;
+        }
+    say(cfg, key, "%s '%s' is not one of left, right, none; ignored", key, v);
+}
+
+static void pad_scan_file(int f)
+{
+    const recomp_cfg *cfg = enhance_cfg_file(f);
+
+    for (size_t i = 0; i < recomp_cfg_count(cfg); i++) {
+        const char *key = recomp_cfg_key_at(cfg, i), *name;
+        recomp_cfg_type t;
+        int ctl;
+
+        if (strncmp(key, PAD_PREFIX, sizeof PAD_PREFIX - 1) != 0)
+            continue;
+        enhance_cfg_lookup(key);        /* read, for report_unused */
+        name = key + sizeof PAD_PREFIX - 1;
+        if (!strcmp(name, "left_stick") || !strcmp(name, "right_stick")) {
+            pad_scan_stick(f, cfg, key, name[0] == 'l' ? PAD_LSTICK : PAD_RSTICK);
+            continue;
+        }
+        ctl = xbox_InputMap_ControlFromName(name);
+        if (ctl < 0 || ctl >= INPUT_PAD_CONTROL_COUNT) {
+            char controls[512];
+            size_t n = 0;
+            for (int c = 0; c < PAD_KEYS && n < sizeof controls; c++)
+                n += (size_t)snprintf(controls + n, sizeof controls - n, "%s%s", c ? " " : "",
+                                      pad_key_name(c));
+            say(cfg, key, "unknown control '%s' under [input.pad] (controls: %s); ignored",
+                name, controls);
+            continue;
+        }
+        t = recomp_cfg_type_of(cfg, key);
+        if (t == RCFG_STRING) {
+            s_pad[f][ctl].named = 1;
+            pad_add(f, cfg, key, ctl, recomp_cfg_string(cfg, key, ""));
+        } else if (t == RCFG_ARRAY) {
+            size_t n = recomp_cfg_array_len(cfg, key), k;
+            for (k = 0; k < n; k++)
+                if (recomp_cfg_array_type(cfg, key, k) != RCFG_STRING) {
+                    say(cfg, key, "%s is a string or a list of strings (got a list"
+                        " holding %s); ignored", key,
+                        type_name(recomp_cfg_array_type(cfg, key, k)));
+                    break;
+                }
+            if (k < n)
+                continue;
+            s_pad[f][ctl].named = 1;    /* [] unbinds */
+            for (k = 0; k < n; k++)
+                pad_add(f, cfg, key, ctl, recomp_cfg_array_string(cfg, key, k, ""));
+        } else {
+            say(cfg, key, "%s is a string or a list of strings (got %s); ignored",
+                key, type_name(t));
+        }
+    }
+}
+
+static int pad_taken_above(int f, int src)
+{
+    int line;
+    for (int g = 0; g < f; g++)
+        if (pad_owner_in_file(g, src, &line) >= 0)
+            return 1;
+    return 0;
+}
+
+/* One control's cells, less the sources a file above binds elsewhere. */
+static void pad_put(xbox_pad_setup *s, int ctl, const unsigned char *src, int n, int above)
+{
+    int cell = 0;
+    s->map.source[ctl] = s->alt.source[ctl] = INPUT_SRC_NONE;
+    for (int k = 0; k < n; k++)
+        if (src[k] != INPUT_SRC_NONE && !pad_taken_above(above, src[k]))
+            (cell++ ? s->alt.source : s->map.source)[ctl] = src[k];
+}
+
+/* Resolve into s; counts[f] is how many keys file f decided. */
+static void pad_resolve(xbox_pad_setup *s, int counts[NFILES])
+{
+    xbox_pad_setup id;
+
+    xbox_PadSetupIdentity(&id);
+    *s = id;
+    for (int k = 0; k < PAD_KEYS; k++) {
+        int f;
+        for (f = 0; f < NFILES && !s_pad[f][k].named; f++)
+            ;
+        if (k >= INPUT_PAD_CONTROL_COUNT) {
+            if (f < NFILES) {
+                counts[f]++;
+                *(k == PAD_LSTICK ? &s->map.left_stick : &s->map.right_stick) = s_pad[f][k].src[0];
+            }
+            continue;
+        }
+        if (f == NFILES) {
+            unsigned char src = id.map.source[k];
+            pad_put(s, k, &src, 1, NFILES);
+            continue;
+        }
+        counts[f]++;
+        pad_put(s, k, s_pad[f][k].src, s_pad[f][k].n, f);
+    }
+}
+
+static void pad_init(int none)
+{
+    xbox_pad_setup s;
+    int counts[NFILES] = { 0, 0, 0 };
+    int dzl, dzr, glyphs;
+    const char *env_dz = recomp_env(RENV_PAD_DEADZONE);
+
+    memset(s_pad, 0, sizeof s_pad);
+    for (int f = SLOT_DEF; f >= 0; f--)
+        pad_scan_file(f);
+    pad_resolve(&s, counts);
+    /* Percent of full deflection, upstream's units; 0 keeps the raw stick
+     * and RECOMP_PAD_DEADZONE, which stays the stock path's integer. */
+    dzl = knob_int("input.pad_deadzone_left", 0, 95, 0);
+    dzr = knob_int("input.pad_deadzone_right", 0, 95, 0);
+    s.map.deadzone_left = s.alt.deadzone_left = (uint8_t)dzl;
+    s.map.deadzone_right = s.alt.deadzone_right = (uint8_t)dzr;
+    s.map.button_threshold = s.alt.button_threshold =
+        (uint8_t)knob_int("input.pad_threshold", 1, 100, 50);
+    s.invert_ly = (uint8_t)knob_bool("input.pad_invert_ly", 0);
+    s.invert_ry = (uint8_t)knob_bool("input.pad_invert_ry", 0);
+    if (env_dz && *env_dz && (dzl || dzr))
+        fprintf(stderr, "[INPUT] config: input.pad_deadzone_%s wins over"
+                " RECOMP_PAD_DEADZONE=%s on the %s\n",
+                dzl && dzr ? "left/right" : dzl ? "left" : "right", env_dz,
+                dzl && dzr ? "both sticks" : dzl ? "left stick" : "right stick");
+    xbox_InputSetPadSetup(&s);
+
+    glyphs = knob_choice("input.glyphs", s_glyphs, 0);
+    xbox_InputSetGlyphFamily(glyphs ? glyphs - 1 : XBOX_PAD_FAMILY_AUTO);
+
+    if (!none && !xbox_PadSetupIsIdentity(&s)) {
+        int listed = 0;
+        fprintf(stderr, "[INPUT] pad map:");
+        for (int f = SLOT_DEF; f >= 0; f--) {
+            const recomp_cfg *cfg = enhance_cfg_file(f);
+            if (!cfg || !counts[f])
+                continue;
+            fprintf(stderr, listed++ ? " +%d (%s)" : " %d (%s)", counts[f], recomp_cfg_name(cfg));
+        }
+        if (dzl || dzr)
+            fprintf(stderr, " deadzone=%d/%d%%", dzl, dzr);
+        if (s.invert_ly || s.invert_ry)
+            fprintf(stderr, " invert=%s%s", s.invert_ly ? "ly" : "", s.invert_ry ? "ry" : "");
+        fputc('\n', stderr);
+    }
+}
+
 /* The release key and the walk key keep their own job when a control is
  * bound to the same key: one press then does both (frees the cursor and
  * presses the control, or caps the sticks and presses it). Say so rather
@@ -431,6 +680,7 @@ int enhance_input_init(void)
     /* Published as one table the poll swaps in, so a reload never edits
      * what a poll in flight composes from. */
     xbox_InputBindingsCommit();
+    pad_init(none);
     warn_key_clash("input.mouse_release_key", mo.release_key);
     warn_key_clash("input.walk_key", walk_code);
     if (walk_code && walk_code == mo.release_key)

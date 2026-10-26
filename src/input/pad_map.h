@@ -27,6 +27,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include "xinput_xbox.h"
+#include "input_map.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -140,6 +141,74 @@ size_t xbox_PadMapReadmeRow(size_t i, char *buf, size_t size);
 /* The README markers the table sits between. */
 #define XBOX_PAD_MAP_README_BEGIN "<!-- pad_map:begin (generated from src/input/pad_map.c; tests/pad_map checks it) -->"
 #define XBOX_PAD_MAP_README_END   "<!-- pad_map:end -->"
+
+/* ── the InputRaw adapter (upstream's pad map, input_map.h) ──────────────
+ *
+ * The runtime path is host pad -> InputRaw -> xbox_InputMap_PadMap. The
+ * adapter below fills an InputRaw the way #203 asks of "a port that calls
+ * it": every button source 0 or 32767, the triggers 0..32767, the sticks
+ * signed with up and right positive, and the stick directions as the
+ * clamped magnitude of each half-axis (the opposite half reads 0). The
+ * host-only buttons (host_pad.h's XBOX_HOST_* bits in `extra`) become the
+ * guide, misc1, paddle and touchpad sources.
+ *
+ * XInput's triggers are 0..255; they are scaled as (t << 7) | (t >> 1), so
+ * 255 is 32767 and PadMap's >> 7 gives back t exactly. SDL's are already
+ * 0..32767 (negative reads 0). */
+void xbox_PadRawXInput(const XBOX_HOST_XINPUT_GAMEPAD *in, uint32_t extra, InputRaw *out);
+void xbox_PadRawSdl(const XBOX_HOST_SDL_GAMEPAD *in, uint32_t extra, InputRaw *out);
+
+/* The inverse of the identity, for a source that only has a Duke state (a
+ * test's fake backend): buttons, analog buttons past 0, triggers through the
+ * XInput scaling, sticks as they are. */
+void xbox_PadRawFromGamepad(const XBOX_GAMEPAD *g, uint32_t extra, InputRaw *out);
+
+/* input.pad_invert_ly / _ry: negate a host Y axis before the map, so a
+ * swapped stick keeps its own inversion; -32768 becomes 32767. The
+ * direction sources follow. */
+void xbox_PadRawInvert(InputRaw *raw, int invert_ly, int invert_ry);
+
+/* The XBOX_HOST_* bits of the host-only sources in raw. */
+uint32_t xbox_PadRawExtra(const InputRaw *raw);
+
+/* ── the pad map the runtime applies ([input.pad]) ────────────────────── */
+
+typedef struct xbox_pad_setup {
+    InputPadMap map;        /* the primary binding of each control */
+    InputPadMap alt;        /* the second one; every source and stick none
+                               unless [input.pad] gives a control two */
+    uint8_t invert_ly;      /* input.pad_invert_ly / _ry (xbox_PadRawInvert) */
+    uint8_t invert_ry;
+} xbox_pad_setup;
+
+/* The fork's identity: xbox_InputMap_PadMapDefaults, then White = left
+ * shoulder and Black = right shoulder (Microsoft's Xbox 360 convention and
+ * xemu's; upstream's default has them the other way), deadzones 0 and
+ * trigger threshold 0 (the title applies its own), and no alternate map.
+ * Through xbox_PadSetupApply it gives what xbox_PadMapXInput and
+ * xbox_PadMapSdl give, bit for bit (tests/pad_map). */
+void xbox_PadSetupIdentity(xbox_pad_setup *s);
+int  xbox_PadSetupIsIdentity(const xbox_pad_setup *s);
+
+/* Nonzero when a map names a host-only source (guide, misc1, a paddle, the
+ * touchpad), so the backend has to read them on a stock poll too. */
+int  xbox_PadSetupNeedsExtras(const xbox_pad_setup *s);
+
+/* The guest pad for raw (already inverted). Each map goes through
+ * xbox_InputMap_PadMap; a guest stick whose map has deadzone 0 is then
+ * overwritten with the raw physical stick that map selects (the swap
+ * honoured, none centred) and RECOMP_PAD_DEADZONE's xbox_InputApplyDeadzone,
+ * because PadMap's radial rescale clamps to the unit circle even at 0 and
+ * real pads report corners outside it. The alternate map, when it has any
+ * source, is merged with xbox_InputMap_PadMerge. Every field of *out is
+ * written. */
+void xbox_PadSetupApply(const xbox_pad_setup *s, const InputRaw *raw, XBOX_GAMEPAD *out);
+
+/* Install the setup input_core.c applies to every pad read (any thread; a
+ * poll in flight finishes with the one it loaded). NULL restores the
+ * identity. xbox_InputPadSetup copies the current one. */
+void xbox_InputSetPadSetup(const xbox_pad_setup *s);
+void xbox_InputPadSetup(xbox_pad_setup *out);
 
 #ifdef __cplusplus
 }

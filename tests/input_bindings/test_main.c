@@ -9,6 +9,7 @@
  */
 #include "input_backend.h"
 #include "input_names.h"
+#include "pad_map.h"
 #include "keyboard.h"
 #include "mouse.h"
 #include "recomp_env.h"
@@ -717,17 +718,30 @@ static DWORD f_get(DWORD p, XBOX_INPUT_STATE *s)
     memset(s, 0, sizeof *s);
     s->dwPacketNumber = 5;
     s->Gamepad.wButtons = XBOX_GAMEPAD_START;
-    s->Gamepad.bAnalogButtons[XBOX_BUTTON_A] = 50;
-    s->Gamepad.bAnalogButtons[XBOX_BUTTON_B] = 100;
+    s->Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] = 50;
+    s->Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] = 100;
     s->Gamepad.sThumbLX = 1000;
     s->Gamepad.sThumbRY = -5000;
     return ERROR_SUCCESS;
 }
 static DWORD f_set(DWORD p, const XBOX_VIBRATION *v) { (void)p; (void)v; return ERROR_SUCCESS; }
+/* The backend reads raw; the fake builds its pad as the Duke would see it
+ * and hands it over through the identity's inverse. */
+static DWORD f_get_raw(DWORD p, InputRaw *raw, DWORD *packet, int extras)
+{
+    XBOX_INPUT_STATE s;
+    DWORD rc = f_get(p, &s);
+    (void)extras;
+    if (rc == ERROR_SUCCESS) {
+        xbox_PadRawFromGamepad(&s.Gamepad, 0, raw);
+        *packet = s.dwPacketNumber;
+    }
+    return rc;
+}
 
-static const xbox_input_backend k_fake = { NULL, f_get, f_set, xbox_InputKbmPoll, f_clock, NULL, NULL };
+static const xbox_input_backend k_fake = { NULL, f_get_raw, f_set, xbox_InputKbmPoll, f_clock, NULL, NULL, NULL };
 /* input_core.c's default; never called here. */
-const xbox_input_backend xbox_input_host_backend = { NULL, f_get, f_set, NULL, f_clock, NULL, NULL };
+const xbox_input_backend xbox_input_host_backend = { NULL, f_get_raw, f_set, NULL, f_clock, NULL, NULL, NULL };
 
 static void test_merge(void)
 {
@@ -747,7 +761,7 @@ static void test_merge(void)
     CHECK(s.Gamepad.wButtons == (XBOX_GAMEPAD_START | XBOX_GAMEPAD_DPAD_UP), "buttons OR: 0x%04X",
           s.Gamepad.wButtons);
     CHECK(s.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255
-          && s.Gamepad.bAnalogButtons[XBOX_BUTTON_B] == 100, "analog max");
+          && s.Gamepad.bAnalogButtons[XBOX_BUTTON_RTRIGGER] == 100, "analog max");
     CHECK(s.Gamepad.sThumbLX == 32767 && s.Gamepad.sThumbRY == -5000,
           "axes: LX %d RY %d", s.Gamepad.sThumbLX, s.Gamepad.sThumbRY);
     packet = s.dwPacketNumber;
@@ -772,7 +786,8 @@ static void test_merge(void)
     xbox_InputSetBackend(&k_fake);
     xbox_InputKeyEvent(code_of("Space"), 1);
     CHECK(xbox_InputGetState(0, &s) == ERROR_SUCCESS
-          && s.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 50 && s.dwPacketNumber == 5,
+          && s.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 0
+          && s.Gamepad.bAnalogButtons[XBOX_BUTTON_LTRIGGER] == 50 && s.dwPacketNumber == 5,
           "both off: the pad untouched");
     xbox_InputKeysClear();
     xbox_InputSetBackend(NULL);

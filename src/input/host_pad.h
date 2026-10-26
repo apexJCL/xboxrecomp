@@ -16,6 +16,7 @@
 
 #include <stdint.h>
 #include "xinput_xbox.h"
+#include "input_map.h"   /* InputRaw */
 
 #ifdef __cplusplus
 extern "C" {
@@ -35,8 +36,12 @@ extern "C" {
  * keeps what it had. */
 #define XBOX_INPUT_BUSY 170u        /* ERROR_BUSY */
 
+/* struct xbox_host_pad has `raw`; a title's glue fills it under this. */
+#define XBOX_HOST_PAD_RAW 1
+
 struct xbox_host_pad {
-    XBOX_INPUT_STATE pad;   /* the host pad mapped to the Duke, no keyboard */
+    XBOX_INPUT_STATE pad;   /* the host pad mapped to the Duke ([input.pad]),
+                               no keyboard */
     uint32_t extra;         /* XBOX_HOST_* */
     int connected;          /* 0: pad and extra are zero */
     /* The backend slot behind the title's port (xbox_InputGetPadState's), or
@@ -44,6 +49,9 @@ struct xbox_host_pad {
      * polled for a while. input_core.c's ports are their own slots; a title
      * that maps pads to ports itself (cat's pad_slots) says which. */
     int slot;
+    /* The host pad before the map (pad_map.h's adapter, inversion applied):
+     * the host actions name these sources, so a remap never moves them. */
+    InputRaw raw;
 };
 
 /* Called with the title's port, the host pad behind it (connected = 0 when
@@ -64,12 +72,40 @@ int xbox_InputPadFilterSet(void);
 /* The host-only buttons the last poll of slot saw (0 when none). */
 uint32_t xbox_InputHostExtra(DWORD slot);
 
-/* Read slot's host pad off the poll thread (the flip tick): the guest map
- * plus extra. ERROR_SUCCESS, ERROR_DEVICE_NOT_CONNECTED (host zeroed), or
+/* The host pad the last poll of slot saw, before the map (all zero when
+ * none). */
+void xbox_InputHostRaw(DWORD slot, InputRaw *raw);
+
+/* Read slot's host pad off the poll thread (the flip tick): the raw pad, the
+ * guest map of it and extra. ERROR_SUCCESS, ERROR_DEVICE_NOT_CONNECTED (host zeroed), or
  * XBOX_INPUT_BUSY (host untouched). Publishes the extra bits, and clears
  * them when no pad is open, so a modifier held as the pad went away does
  * not stay held. */
 DWORD xbox_input_backend_read_host(DWORD slot, struct xbox_host_pad *host);
+
+/* The controller family of the pad on slot, for glyphs (gamepad-input-ux
+ * D5): XInput says xbox, since it cannot tell a Steam virtual pad from a
+ * real one; SDL3 maps SDL_GetGamepadType, and the Deck's own pad (28de:1205)
+ * is steam. input.glyphs overrides it for every slot
+ * (xbox_InputSetGlyphFamily; XBOX_PAD_FAMILY_AUTO restores detection). */
+enum {
+    XBOX_PAD_FAMILY_XBOX, XBOX_PAD_FAMILY_PLAYSTATION, XBOX_PAD_FAMILY_NINTENDO,
+    XBOX_PAD_FAMILY_STEAM, XBOX_PAD_FAMILY_GENERIC,
+    XBOX_PAD_FAMILY_COUNT,
+    XBOX_PAD_FAMILY_AUTO = -1
+};
+int  xbox_InputPadFamily(DWORD slot);
+void xbox_InputSetGlyphFamily(int family);
+const char *xbox_InputPadFamilyName(int family);
+int  xbox_InputPadFamilyFromName(const char *name);   /* "auto" -> AUTO; -2 unknown */
+
+/* Whether Steam Input stands between the pad and the game (D6). on: an SDL
+ * pad Steam made (SDL_GetGamepadSteamHandle, or its virtual pad 28de:11ff;
+ * the vendor id alone never counts, so a Deck with Steam Input off is off).
+ * maybe: XInput, which cannot tell, under Steam (SteamGameId or SteamDeck
+ * set). */
+enum { XBOX_STEAM_INPUT_OFF, XBOX_STEAM_INPUT_ON, XBOX_STEAM_INPUT_MAYBE };
+int  xbox_InputSteamInput(DWORD slot);
 
 /* The backend's clock (a test's fake one), in milliseconds. */
 uint64_t xbox_InputNowMs(void);

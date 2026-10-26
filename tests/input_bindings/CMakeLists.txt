@@ -13,6 +13,7 @@ set(INPUT_SRC ${CMAKE_CURRENT_LIST_DIR}/../../src/input)
 add_executable(input_bindings_test
     test_main.c
     ${INPUT_SRC}/input_core.c
+    ${INPUT_SRC}/pad_map.c
     ${INPUT_SRC}/keyboard.c
     ${INPUT_SRC}/mouse.c
     ${INPUT_SRC}/input_names.c
