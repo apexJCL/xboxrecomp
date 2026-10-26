@@ -787,6 +787,7 @@ static RenderTarget *surface(void)
                 break;
             rt->last_use = s_tick;
             rt->bpp = surf_color_bytes(g->format);
+            rt->cfmt = g->format & 0xF;
             nv2a_rt_own_drawn(&rt->own, (uint32_t)s_presents);
             return rt;
         }
@@ -813,6 +814,7 @@ static RenderTarget *surface(void)
                 || rt_grow(rt, rt->w > w ? rt->w : w, rt->h > h ? rt->h : h)) {
             rt->last_use = s_tick;
             rt->bpp = surf_color_bytes(g->format);
+            rt->cfmt = g->format & 0xF;
             nv2a_rt_own_drawn(&rt->own, (uint32_t)s_presents);
             return rt;
         }
@@ -878,6 +880,7 @@ static RenderTarget *surface(void)
     free_rt->h = h;
     free_rt->pitch = g->pitch;
     free_rt->bpp = surf_color_bytes(g->format);
+    free_rt->cfmt = g->format & 0xF;
     free_rt->last_use = s_tick;
     if (alias_check_on() && free_rt->pitch)
         nv2a_rt_own_reset(&free_rt->own, (const uint8_t *)xbox_GetMemoryOffset(),
@@ -1789,6 +1792,136 @@ static uint64_t tex_hash_pal(const uint8_t *mem, const Stage *t, uint32_t bytes)
 
 /* The view for a stage's texture, decoded and uploaded if it is new or its
  * bytes changed since it was last checked (once per flip). */
+/* ---- write-back on demand (the Metal backend's rule) ------------------------
+ *
+ * A texture decoded from guest memory that overlaps a render target read the
+ * bytes the CPU path would have drawn there, and this backend had drawn them
+ * only on the GPU: black. Kung Fu Chaos samples its last match frame that way
+ * behind the pause menu, at another pitch than the target's, so rt_texture
+ * cannot bind the target itself. Before such a decode, a target drawn since
+ * its last write-back is read back into guest memory at its own pitch, 32-bit
+ * as BGRA8 (X8R8G8B8's byte order) or 16-bit as R5G6B5. Only unscaled targets
+ * without hor+ padding. RECOMP_D3D11_WRITEBACK=0 turns it off (A/B). */
+static uint64_t s_writebacks;
+static ID3D11Texture2D *s_wb_stage;
+static UINT s_wb_w, s_wb_h;
+
+/* 1 when the guest bytes now hold the target's picture. Only layouts it can
+ * write: 32-bit X8R8G8B8/A8R8G8B8 (formats 4-8), R5G6B5 (3), X1R5G5B5 (1, 2). */
+static int rt_write_back(RenderTarget *rt)
+{
+    uint8_t *dst = (uint8_t *)xbox_GetMemoryOffset() + rt->addr;
+    D3D11_MAPPED_SUBRESOURCE m;
+    D3D11_BOX box;
+    UINT y, x;
+
+    /* render.scale: the target holds n x n host texels per guest pixel; the
+     * guest gets one of them (the top-left), as a nearest downscale. */
+    UINT n = rt->n ? rt->n : 1;
+
+    /* display.aspect: a padded target's guest picture starts pad guest
+     * pixels in; the pads are host-only and never reach guest memory. */
+    UINT px = rt->pad * n;
+
+    if (!rt->pitch || (rt->bpp != 4 && rt->bpp != 2)
+            || rt->pitch < rt->w * rt->bpp
+            || (rt->bpp == 4 && !(rt->cfmt >= 0x4 && rt->cfmt <= 0x8))
+            || (rt->bpp == 2 && !(rt->cfmt >= 0x1 && rt->cfmt <= 0x3)))
+        return 0;
+    if (!s_wb_stage || s_wb_w < rt->w * n || s_wb_h < rt->h * n) {
+        D3D11_TEXTURE2D_DESC td;
+        if (s_wb_stage)
+            ID3D11Texture2D_Release(s_wb_stage);
+        s_wb_stage = NULL;
+        memset(&td, 0, sizeof td);
+        td.Width = s_wb_w = rt->w * n > s_wb_w ? rt->w * n : s_wb_w;
+        td.Height = s_wb_h = rt->h * n > s_wb_h ? rt->h * n : s_wb_h;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_STAGING;
+        td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_wb_stage)))
+            return 0;
+    }
+    box.left = px; box.top = 0; box.front = 0;
+    box.right = px + rt->w * n; box.bottom = rt->h * n; box.back = 1;
+    ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)s_wb_stage, 0, 0, 0, 0,
+                                              (ID3D11Resource *)rt->tex, 0, &box);
+    if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_wb_stage, 0,
+                                       D3D11_MAP_READ, 0, &m)))
+        return 0;
+    for (y = 0; y < rt->h; y++) {
+        const uint32_t *s = (const uint32_t *)((const uint8_t *)m.pData + (size_t)y * n * m.RowPitch);
+        uint8_t *o = dst + (size_t)y * rt->pitch;
+        if (rt->bpp == 4 && n == 1) {
+            memcpy(o, s, (size_t)rt->w * 4);
+        } else if (rt->bpp == 4) {
+            uint32_t *o32 = (uint32_t *)o;
+            for (x = 0; x < rt->w; x++)
+                o32[x] = s[x * n];
+        } else {
+            uint16_t *o16 = (uint16_t *)o;
+            for (x = 0; x < rt->w; x++) {
+                uint32_t c = s[x * n];
+                o16[x] = rt->cfmt == 0x3
+                    ? (uint16_t)(((c >> 8) & 0xF800) | ((c >> 5) & 0x07E0) | ((c >> 3) & 0x001F))
+                    : (uint16_t)(((c >> 9) & 0x7C00) | ((c >> 6) & 0x03E0) | ((c >> 3) & 0x001F));
+            }
+        }
+    }
+    ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_wb_stage, 0);
+    rt->wb_draw = rt->last_draw;
+    if (alias_check_on())
+        nv2a_rt_own_reset(&rt->own, (const uint8_t *)xbox_GetMemoryOffset(),
+                          rt->addr, rt->pitch, rt->h, (uint32_t)s_presents);
+    if (s_writebacks++ < 20)
+        fprintf(stderr, LOGP "write-back: surface 0x%08X %ux%u pitch %u to guest memory"
+                " for a texture over it\n", rt->offset, rt->w, rt->h, rt->pitch);
+    return 1;
+}
+
+/* Every target drawn since its last write-back whose guest bytes overlap
+ * [addr, addr + bytes): to guest memory before the decode reads them. */
+static void bt_sync_for_texture(uint32_t addr, uint32_t bytes);
+
+static void rt_sync_for_texture(uint32_t addr, uint32_t bytes)
+{
+    static int off = -1;
+    int i;
+
+    if (off < 0) {
+        const char *e = getenv("RECOMP_D3D11_WRITEBACK");
+        off = e && e[0] == '0';
+    }
+    if (off || !bytes)
+        return;
+    for (i = 0; i < RT_MAX; i++) {
+        RenderTarget *rt = &s_rt[i];
+        /* Only a target drawn in the last 2 flips: its memory is still its
+         * own. One left over from an earlier screen may sit on memory the
+         * title has since freed and reused (with rt_alias_check=0 nothing
+         * drops it), and writing it back corrupted Kung Fu Chaos's heap on
+         * the way from the menus into a match. */
+        if (rt->tex && rt->last_draw > rt->wb_draw
+                && (uint32_t)s_presents - rt->own.draw_flip <= 2
+                && nv2a_rt_overlap(rt->addr & 0x07FFFFFFu, rt->pitch * rt->h,
+                                   addr & 0x07FFFFFFu, bytes))
+            rt_write_back(rt);
+    }
+    bt_sync_for_texture(addr, bytes);
+}
+
+/* nv2a_pb_backend.sync_guest: the executor is about to read these guest bytes
+ * (a 2D blit's source, a frame dump). Same rule as a texture over a target. */
+static void d3d11_sync_guest(uint32_t offset, uint32_t pitch, uint32_t w, uint32_t h)
+{
+    (void)w;
+    if (s_dev && pitch && h)
+        rt_sync_for_texture(nv2a_pb_dma_resolve(offset), pitch * h);
+}
+
 static ID3D11ShaderResourceView *tex_bind(const Stage *t)
 {
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
@@ -1811,6 +1944,7 @@ static ID3D11ShaderResourceView *tex_bind(const Stage *t)
         }
         return s_magenta_srv ? s_magenta_srv : s_black_srv;
     }
+    rt_sync_for_texture(t->offset, bytes);
     slot = tc_slot(t);
     if (memo_on() && s_tc_hint[slot]) {
         TexEntry *c = &s_tc[s_tc_hint[slot] - 1];
@@ -2183,6 +2317,205 @@ static int rt_no_alpha(uint32_t lin)
     return lin == 0x11 || lin == 0x1C || lin == 0x1E;
 }
 
+/* ---- 2D blits on the GPU ---------------------------------------------------
+ *
+ * An NV09F blit whose source is a render target is done here: the pixels go
+ * GPU to GPU into a texture keyed by the destination, and a texture bound at
+ * that address takes it as a render-to-texture would (rt_texture). Kung Fu
+ * Chaos copies its 640x480 frame to the background texture every frame; the
+ * guest-memory route (write the target back, copy, hash, decode, upload)
+ * cost a stall a frame. The guest bytes at the destination are not written,
+ * which holds while nothing else reads them. A blit from memory the GPU does
+ * not hold falls back to the executor's copy. RECOMP_D3D11_GPU_BLIT=0: off. */
+#define BT_MAX 4
+static RenderTarget s_bt[BT_MAX];
+static uint32_t s_bt_mem[BT_MAX];   /* bt_mem_sample of the guest bytes at the copy */
+static uint8_t  s_bt_dirty[BT_MAX]; /* the copy has not reached guest memory */
+static uint64_t s_gpu_blits;
+
+/* A cheap fingerprint of a blit destination's guest bytes: every 8th row,
+ * every 16th word. Enough to tell whether anything wrote there since. */
+static uint32_t bt_mem_sample(const RenderTarget *b)
+{
+    const uint8_t *m = (const uint8_t *)xbox_GetMemoryOffset() + b->addr;
+    uint32_t h = 2166136261u, y, x;
+    for (y = 0; y < b->h; y += 8)
+        for (x = 0; x + 4 <= b->w * 4u; x += 64)
+            h = (h ^ *(const uint32_t *)(m + (size_t)y * b->pitch + x)) * 16777619u;
+    return h;
+}
+
+/* A texture is about to decode guest bytes a blit copy covers, which rt_texture
+ * did not bind: it is more than 2 flips old, or the texture reads those
+ * bytes another way (format, pitch). The guest bytes never got the copy
+ * (d3d11_on_blit skips them), so they are written now, once per copy, if
+ * nothing else wrote there since. Kung Fu
+ * Chaos's pause copies the match frame once and keeps it as the background:
+ * after 2 flips it decoded the untouched bytes and the background was black. */
+/* Copy i to guest memory if it never got there and nothing has written
+ * there since (then the memory has moved on and wins). Clean afterwards,
+ * unless the write failed. */
+static void bt_flush(int i)
+{
+    RenderTarget *b = &s_bt[i];
+    if (!b->tex || !s_bt_dirty[i])
+        return;
+    if (bt_mem_sample(b) != s_bt_mem[i] || rt_write_back(b))
+        s_bt_dirty[i] = 0;
+}
+
+static void bt_sync_for_texture(uint32_t addr, uint32_t bytes)
+{
+    int i;
+    for (i = 0; i < BT_MAX; i++) {
+        RenderTarget *b = &s_bt[i];
+        if (!b->tex || !s_bt_dirty[i]
+                || !nv2a_rt_overlap(b->addr & 0x07FFFFFFu, b->pitch * b->h,
+                                    addr & 0x07FFFFFFu, bytes))
+            continue;
+        bt_flush(i);
+    }
+}
+
+/* A blit copy is the memory's picture until that memory is drawn into some
+ * other way: as a depth buffer (Kung Fu Chaos's match reuses its menus'
+ * background address for Z, and the last menu frame showed through), or a
+ * blit from memory the GPU does not hold (the executor copies those). A
+ * loading screen that keeps showing the copy without blitting again keeps
+ * it. */
+static void bt_drop_overlap(uint32_t addr, uint32_t bytes)
+{
+    int i;
+    for (i = 0; i < BT_MAX; i++)
+        if (s_bt[i].tex && nv2a_rt_overlap(s_bt[i].addr & 0x07FFFFFFu, s_bt[i].pitch * s_bt[i].h,
+                                           addr & 0x07FFFFFFu, bytes)) {
+            bt_flush(i);   /* what the drop would lose outside the new copy */
+            s_bt_dirty[i] = 0;
+            ID3D11ShaderResourceView_Release(s_bt[i].srv);
+            ID3D11Texture2D_Release(s_bt[i].tex);
+            memset(&s_bt[i], 0, sizeof s_bt[i]);
+        }
+}
+
+static RenderTarget *rt_find_surface(uint32_t offset, uint32_t pitch)
+{
+    uint32_t addr = nv2a_pb_dma_resolve(offset) & 0x07FFFFFFu;
+    int i;
+    for (i = 0; i < RT_MAX; i++)
+        if (s_rt[i].tex && (s_rt[i].addr & 0x07FFFFFFu) == addr && s_rt[i].pitch == pitch)
+            return &s_rt[i];
+    return NULL;
+}
+
+static int d3d11_on_blit(uint32_t src, uint32_t sx, uint32_t sy, uint32_t sp,
+                         uint32_t dst, uint32_t dx, uint32_t dy, uint32_t dp,
+                         uint32_t w, uint32_t h, uint32_t bpp)
+{
+    static int off = -1;
+    RenderTarget *s, *b = NULL;
+    uint32_t daddr, need_w = dx + w, need_h = dy + h;
+    D3D11_BOX box;
+    int i;
+
+    if (off < 0) {
+        const char *e = getenv("RECOMP_D3D11_GPU_BLIT");
+        off = e && e[0] == '0';
+    }
+    daddr = nv2a_pb_dma_resolve(dst);
+    s = (off || !s_dev || bpp != 4) ? NULL : rt_find_surface(src, sp);
+    if (!s || sx + w > s->w || sy + h > s->h) {
+        /* The executor copies this one in guest memory: a GPU copy kept for
+         * the same destination would now be stale and win at bind. */
+        bt_drop_overlap(daddr, dp * need_h);
+        return 0;
+    }
+    {
+        /* Into a render target (Kung Fu Chaos copies a frame it drew elsewhere
+         * onto the display buffer): the copy goes into that target, which is
+         * what presents and what a later texture over it binds. A separate
+         * copy keyed by the address left the target as it was. */
+        RenderTarget *d = rt_find_surface(dst, dp);
+        if (d && d != s && d->n == s->n && need_w <= d->w && need_h <= d->h) {
+            /* Whole rows between two targets with the same hor+ pads: the
+             * pads go too, so the wide picture's sides come along. */
+            UINT ext = (sx == 0 && dx == 0 && w == s->w && s->pad == d->pad) ? s->pad : 0;
+            box.left = (sx + s->pad - ext) * s->n; box.top = sy * s->n; box.front = 0;
+            box.right = (sx + s->pad + w + ext) * s->n; box.bottom = (sy + h) * s->n; box.back = 1;
+            ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)d->tex, 0,
+                                                      (dx + d->pad - ext) * s->n, dy * s->n, 0,
+                                                      (ID3D11Resource *)s->tex, 0, &box);
+            d->last_draw = ++s_seq;
+            nv2a_rt_own_drawn(&d->own, (uint32_t)s_presents);
+            bt_drop_overlap(daddr, dp * need_h);
+            return 1;
+        }
+    }
+    for (i = 0; i < BT_MAX && !b; i++)
+        if (s_bt[i].tex && s_bt[i].addr == daddr && s_bt[i].pitch == dp
+                && s_bt[i].n == s->n && s_bt[i].w >= need_w && s_bt[i].h >= need_h)
+            b = &s_bt[i];
+    if (!b && (dx || dy)) {
+        /* A new texture would hold only the copied rectangle and undefined
+         * texels around it: the executor copies in guest memory instead. */
+        bt_drop_overlap(daddr, dp * need_h);
+        return 0;
+    }
+    if (!b) {
+        D3D11_TEXTURE2D_DESC td;
+        RenderTarget *v = &s_bt[0];
+        for (i = 0; i < BT_MAX; i++) {
+            if (!s_bt[i].tex || s_bt[i].addr == daddr) { v = &s_bt[i]; break; }
+            if (s_bt[i].last_use < v->last_use) v = &s_bt[i];
+        }
+        bt_flush((int)(v - s_bt));   /* evicted: its copy reaches memory first */
+        s_bt_dirty[v - s_bt] = 0;
+        if (v->srv) ID3D11ShaderResourceView_Release(v->srv);
+        if (v->tex) ID3D11Texture2D_Release(v->tex);
+        memset(v, 0, sizeof *v);
+        memset(&td, 0, sizeof td);
+        td.Width = need_w * s->n;
+        td.Height = need_h * s->n;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &v->tex)))
+            return 0;
+        if (FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)v->tex,
+                                                         NULL, &v->srv))) {
+            ID3D11Texture2D_Release(v->tex);
+            v->tex = NULL;
+            return 0;
+        }
+        v->offset = dst;
+        v->addr = daddr;
+        v->pitch = dp;
+        v->w = need_w;
+        v->h = need_h;
+        v->hw = need_w * s->n;
+        v->hh = need_h * s->n;
+        v->n = s->n;
+        v->bpp = 4;
+        v->cfmt = s->cfmt;
+        b = v;
+    }
+    box.left = (sx + s->pad) * s->n; box.top = sy * s->n; box.front = 0;
+    box.right = (sx + s->pad + w) * s->n; box.bottom = (sy + h) * s->n; box.back = 1;
+    ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)b->tex, 0,
+                                              dx * s->n, dy * s->n, 0,
+                                              (ID3D11Resource *)s->tex, 0, &box);
+    b->last_use = ++s_tick;
+    b->last_draw = s_presents;   /* the flip it was copied at: see rt_texture */
+    s_bt_mem[b - s_bt] = bt_mem_sample(b);
+    s_bt_dirty[b - s_bt] = 1;
+    if (s_gpu_blits++ < 5)
+        fprintf(stderr, LOGP "blit on the GPU: 0x%08X %ux%u -> texture at 0x%08X\n",
+                src, w, h, dst);
+    return 1;
+}
+
 static RenderTarget *rt_texture(const Stage *t)
 {
     static int off = -1;
@@ -2194,6 +2527,21 @@ static RenderTarget *rt_texture(const Stage *t)
         off = recomp_env(RENV_D3D11_NO_RTT) != NULL;   /* A/B: decode memory */
     if (off)
         return NULL;
+    /* A blit's destination, as the GPU holds it (d3d11_on_blit), while the
+     * title keeps copying there: one not refreshed for 2 flips is not what
+     * the memory holds any more (Kung Fu Chaos reuses its menus' background
+     * address in a match, and the last menu frame showed through). Dropping
+     * it on depth-tested draws over that memory instead blanked the match:
+     * the title blits there and then draws with Z over it every frame. */
+    if (t->offset && nv2a_tex_texel_bytes(lin) == 4 && !d3d8_format_is_swizzled(t->color))
+        for (i = 0; i < BT_MAX; i++)
+            if (s_bt[i].tex && s_presents - s_bt[i].last_draw <= 2
+                    && !((s_bt[i].addr ^ t->offset) & 0x07FFFFFFu)
+                    && s_bt[i].pitch == t->pitch
+                    && s_bt[i].w >= t->width && s_bt[i].h >= t->height) {
+                s_bt[i].last_use = ++s_tick;
+                return &s_bt[i];
+            }
     if (!t->offset || d3d8_format_dxt_block_bytes(t->color)
             || (nv2a_tex_texel_bytes(lin) != 4 && !rt_16bit(lin)))
         return NULL;
@@ -4247,6 +4595,9 @@ static const struct nv2a_pb_backend s_d3d11_backend = {
     d3d11_on_zpass_clear,
     d3d11_on_report,
     d3d11_on_poll,
+    0,                  /* writes_back: frames are dumped from the swap chain */
+    d3d11_sync_guest,
+    d3d11_on_blit,
 };
 
 /* For tests/d3d11_backend_smoke: the size of the target at a colour offset
