@@ -5199,10 +5199,73 @@ uint32_t xbox_ContiguousInUseBytes(void)
  * pass late (or a cleared one a pass early); the title fills a buffer after
  * naming it and frees it after stopping the voice, so a stale read costs at
  * most one pass of one voice. */
+/* RECOMP_PHYS_ALIAS (default on, =0: off): a heap page named while the
+ * contiguous arena has the same number live gets a number of its own. */
+static int phys_alias_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_PHYS_ALIAS");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/* Aliases: a window page number reserved in the arena (so nothing else is
+ * handed it) that stands for a heap page, both ways. 0 is "none": page 0 is
+ * never free (CONTIG_RESERVED). */
+static volatile uint16_t g_phys_alias[CONTIG_PAGES];   /* window q -> heap page */
+static uint16_t g_heap_alias[CONTIG_PAGES];            /* heap page -> window q */
+
+uint32_t xbox_PhysNameRam(uint32_t va)
+{
+    uint32_t p, q;
+    if (!(va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE))
+        return va;
+    p = va / CONTIG_PAGE;
+    if (g_heap_alias[p])
+        return g_heap_alias[p] * CONTIG_PAGE + (va & (CONTIG_PAGE - 1));
+    /* The arena holds this number live: the title has, say, music streaming
+     * from a contiguous buffer there. A RAM name on top would make the APU
+     * read this heap page for both, and whichever buffer lost played the
+     * other's bytes (Kung Fu Chaos: a sharp noise every 600 ms in the menu
+     * music after leaving a match, in about one run of four). The heap page
+     * gets a free window number instead, which only it answers to. */
+    if (g_contig_used[p] && phys_alias_on()) {
+        contig_lock();
+        for (q = CONTIG_USABLE - 1; q >= CONTIG_LOW_RESERVE_END; q--)
+            if (!g_contig_used[q] && !g_phys_ram_named[q] && !g_phys_alias[q])
+                break;
+        if (q >= CONTIG_LOW_RESERVE_END) {
+            g_contig_used[q] = 1;
+            g_phys_alias[q] = (uint16_t)p;
+            g_heap_alias[p] = (uint16_t)q;
+        }
+        contig_unlock();
+        if (g_heap_alias[p]) {
+            static int said;
+            if (said++ < 8)
+                fprintf(stderr, "  [PHYS] heap page 0x%X is live in the arena too: named 0x%X instead\n",
+                        p, q);
+            return q * CONTIG_PAGE + (va & (CONTIG_PAGE - 1));
+        }
+        /* no free number: the shared name, as before */
+    }
+    g_phys_ram_named[p] = 1;
+    return va;
+}
+
 void xbox_PhysNoteRamName(uint32_t va)
 {
-    if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE)
-        g_phys_ram_named[va / CONTIG_PAGE] = 1;
+    (void)xbox_PhysNameRam(va);
+}
+
+uint32_t xbox_PhysAliasTarget(uint32_t phys)
+{
+    uint32_t q = (phys & 0x0FFFFFFFu) / CONTIG_PAGE;
+    if (q >= CONTIG_PAGES || !g_phys_alias[q])
+        return 0;
+    return g_phys_alias[q] * CONTIG_PAGE + (phys & (CONTIG_PAGE - 1));
 }
 
 /* Heap block m is free (and merged with any free neighbours): its pages name
@@ -5242,8 +5305,17 @@ static void heap_forget_ram_names(int m)
     }
     if (last >= (int64_t)CONTIG_PAGES)
         last = (int64_t)CONTIG_PAGES - 1;
-    for (int64_t p = first; p <= last; p++)
+    for (int64_t p = first; p <= last; p++) {
         g_phys_ram_named[p] = 0;
+        if (g_heap_alias[p]) {
+            uint32_t q = g_heap_alias[p];
+            contig_lock();
+            g_phys_alias[q] = 0;
+            g_contig_used[q] = 0;
+            contig_unlock();
+            g_heap_alias[p] = 0;
+        }
+    }
 }
 
 /* Readers (the APU and OHCI threads) take no lock and no acquire: a mark is

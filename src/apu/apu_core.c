@@ -109,6 +109,12 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
             return g_apu_ram_ptr + a;
         return g_apu_ram_ptr + (a & 0x03FFFFFFu);
     }
+    /* A heap page's own number (xbox_PhysNameRam): the heap page. */
+    {
+        uint32_t h = xbox_PhysAliasTarget(a);
+        if (h)
+            return g_apu_ram_ptr + h;
+    }
     /* A heap page the title named through MmGetPhysicalAddress is RAM, even
      * where the contiguous allocator has handed out the same number as a
      * window page. A title that loads its effect banks and music stream into
@@ -149,6 +155,8 @@ const char *mcpx_apu_phys_class(uint64_t addr)
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
     if (a >= (64u << 20))
         return a < apu_mapped_ram() ? "ram" : "wrap";
+    if (xbox_PhysAliasTarget(a))
+        return "alias";
     if (xbox_PhysRamNameMap()[a >> 12])
         return "named";
     if (xbox_ContiguousPageMap()[a >> 12])

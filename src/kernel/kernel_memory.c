@@ -185,8 +185,7 @@ ULONG_PTR __stdcall xbox_MmGetPhysicalAddress(PVOID BaseAddress)
         return (ULONG_PTR)(va - XBOX_CONTIG_BASE);
     /* The same number can be a window page; record that the title meant RAM
      * (xbox_PhysNoteRamName says why the APU needs to know). */
-    xbox_PhysNoteRamName(va);
-    return (ULONG_PTR)va;
+    return (ULONG_PTR)xbox_PhysNameRam(va);
 }
 
 VOID __stdcall xbox_MmPersistContiguousMemory(PVOID BaseAddress, ULONG NumberOfBytes, BOOLEAN Persist)

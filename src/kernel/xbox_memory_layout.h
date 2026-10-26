@@ -228,6 +228,13 @@ const volatile uint8_t *xbox_ContiguousPageMap(void);
 /* MmGetPhysicalAddress named this VA; recorded if it is a heap page below
  * 64 MB (the image and stacks are not recorded). */
 void xbox_PhysNoteRamName(uint32_t va);
+/* The physical number MmGetPhysicalAddress reports for va: va itself (and
+ * recorded as above), or, for a heap page whose number the arena holds live,
+ * a window number reserved for it alone (an alias, kept until the heap frees
+ * the page). xbox_PhysAliasTarget turns an alias back into the heap VA, 0 for
+ * any other number; the APU and the NV2A resolve through it first. */
+uint32_t xbox_PhysNameRam(uint32_t va);
+uint32_t xbox_PhysAliasTarget(uint32_t phys);
 /* One byte per 4 KB physical page below 64 MB, nonzero while the title holds
  * a RAM name for a heap page there (see xbox_PhysNoteRamName); cleared when
  * no live heap block covers the page any more. Read without a lock; a device

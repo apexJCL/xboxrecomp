@@ -126,6 +126,11 @@ static uint32_t dma_resolve(uint32_t offset)
      * black straight through the guest heap -- which faulted the title three
      * frames later on a pointer that had been overwritten, while the real
      * framebuffer at 0x80A6C000 stayed untouched and the screen stayed black. */
+    {   /* a heap page's own number (xbox_PhysNameRam) */
+        uint32_t h = xbox_PhysAliasTarget(offset);
+        if (h)
+            return h;
+    }
     if (offset < xbox_ContiguousAllocatedBytes())
         return XBOX_CONTIG_BASE + offset;
     if (!surface_hits_image(offset, 1))
