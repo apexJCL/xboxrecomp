@@ -916,6 +916,9 @@ static DepthTarget s_dt[DT_MAX];
 static struct { uint64_t key; ID3D11DepthStencilState *dss; } s_dss[DSS_MAX];
 static int s_dss_count;
 static uint64_t s_zclears, s_draws_z;
+static int poly_offset_on(void);   /* below, with the stage state */
+
+static void bt_drop_overlap(uint32_t addr, uint32_t bytes);   /* 2D blits, below */
 
 static DepthTarget *depth_target(UINT w, UINT h)
 {
@@ -1404,6 +1407,44 @@ static ID3D11RasterizerState *rasterizer_state(int *all)
         if (v->cull_face == 0x405)      c = 1;
         else if (v->cull_face == 0x404) c = 2;
         else if (v->cull_face == 0x408) *all = 1;
+    }
+    /* SET_POLY_OFFSET_FILL_ENABLE with POLYGON_OFFSET_SCALE_FACTOR / BIAS:
+     * D3D11's slope-scaled and constant depth bias, one state per setting met.
+     * Kung Fu Chaos draws its scene thumbnails over the film strip at the same
+     * depth with LEQUAL and an offset of (-1, -4); without it the two fought
+     * and the thumbnails came out torn. NV2A depth maps onto 0..1 unscaled
+     * (vp_scale.z), so the slope carries over, and one unit is one step of a
+     * 24-bit depth, which D32_FLOAT gives at depths of 0.5 and up.
+     * RECOMP_D3D11_NO_POLY_OFFSET=1 leaves it out (A/B). */
+    if (v->poly_offset && (v->poly_factor != 0.0f || v->poly_bias != 0.0f)) {
+        static struct { int c, f; float fac, bias; ID3D11RasterizerState *rs; } po[16];
+        static int npo, next;
+        int i;
+        if (poly_offset_on()) {
+            for (i = 0; i < npo; i++)
+                if (po[i].c == c && po[i].f == f && po[i].fac == v->poly_factor
+                        && po[i].bias == v->poly_bias)
+                    return po[i].rs;
+            {
+                /* Full: the oldest entry makes room (a bound state keeps its
+                 * own reference in the context). */
+                D3D11_RASTERIZER_DESC rd;
+                ID3D11RasterizerState *rs;
+                ID3D11RasterizerState_GetDesc(s_rs_sc[c][f], &rd);
+                rd.DepthBias = (INT)v->poly_bias;
+                rd.SlopeScaledDepthBias = v->poly_factor;
+                rd.DepthBiasClamp = 0.0f;
+                if (SUCCEEDED(ID3D11Device_CreateRasterizerState(s_dev, &rd, &rs))) {
+                    i = npo < 16 ? npo++ : next++ % 16;
+                    if (po[i].rs)
+                        ID3D11RasterizerState_Release(po[i].rs);
+                    po[i].c = c; po[i].f = f;
+                    po[i].fac = v->poly_factor; po[i].bias = v->poly_bias;
+                    po[i].rs = rs;
+                    return rs;
+                }
+            }
+        }
     }
     return s_rs_sc[c][f];
 }
