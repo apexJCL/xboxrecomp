@@ -551,9 +551,11 @@ static unsigned long s_res_desc[RES_N], s_res_data[RES_N];
 static uint32_t bus_resolve(uint32_t addr, unsigned long *count)
 {
     int cls;
-    uint32_t out = addr;
+    uint32_t out = addr, h = xbox_PhysAliasTarget(addr);
 
-    if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
+    if (h)
+        cls = RES_RAMNAME, out = h;   /* a heap page's own number (xbox_PhysNameRam) */
+    else if (addr >= g_xbox_image_lo && addr < g_xbox_image_hi)
         cls = RES_IMAGE;
     else if (addr && addr < (64u << 20) && xbox_PhysRamNameMap()[addr >> 12])
         cls = RES_RAMNAME;
@@ -588,7 +590,8 @@ static uint32_t bus_resolve(uint32_t addr, unsigned long *count)
  * RAM below 64 MB are the same bytes and none of these rules is needed. */
 static uint32_t bus_resolve_desc(uint32_t addr)
 {
-    if (addr && addr < (64u << 20) && xbox_ContiguousPageMap()[addr >> 12]) {
+    if (addr && addr < (64u << 20) && xbox_ContiguousPageMap()[addr >> 12]
+            && !xbox_PhysAliasTarget(addr)) {
         s_res_desc[RES_DESC_WINDOW]++;
         return OHCI_CONTIG_BASE + addr;
     }

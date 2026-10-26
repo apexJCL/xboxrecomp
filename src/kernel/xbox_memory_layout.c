@@ -5233,10 +5233,12 @@ uint32_t xbox_PhysNameRam(uint32_t va)
      * gets a free window number instead, which only it answers to. */
     if (g_contig_used[p] && phys_alias_on()) {
         contig_lock();
-        for (q = CONTIG_USABLE - 1; q >= CONTIG_LOW_RESERVE_END; q--)
-            if (!g_contig_used[q] && !g_phys_ram_named[q] && !g_phys_alias[q])
-                break;
-        if (q >= CONTIG_LOW_RESERVE_END) {
+        q = g_heap_alias[p];   /* another thread may have named it meanwhile */
+        if (!q)
+            for (q = CONTIG_USABLE - 1; q >= CONTIG_LOW_RESERVE_END; q--)
+                if (!g_contig_used[q] && !g_phys_ram_named[q] && !g_phys_alias[q])
+                    break;
+        if (!g_heap_alias[p] && q >= CONTIG_LOW_RESERVE_END) {
             g_contig_used[q] = 1;
             g_phys_alias[q] = (uint16_t)p;
             g_heap_alias[p] = (uint16_t)q;
