@@ -233,7 +233,10 @@ typedef struct {
     uint64_t                last_draw, last_clear;  /* s_seq at the last one */
     uint32_t                pitch;      /* the guest pitch it was made with */
     uint32_t                bpp;        /* bytes per pixel of the surface format drawn */
+    uint32_t                cfmt;       /* SET_SURFACE_FORMAT colour (bits 3:0) drawn with */
     struct nv2a_rt_own      own;        /* is the guest memory under it still its own */
+    uint64_t                wb_draw;    /* last_draw when its pixels last went to guest memory */
+    int                     field_odd;  /* its last draw had the odd field's viewport offset (weave) */
 } RenderTarget;
 
 typedef struct nv2a_stage Stage;
@@ -4004,6 +4007,11 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         }
     }
     rt->last_draw = ++s_seq;
+    {   /* the field this draw is for, by its viewport offset (weave()) */
+        float f = nv2a_pb_vsh_state()->vp_off[1];
+        f -= floorf(f);
+        rt->field_odd = f > 0.02f && f < 0.25f;
+    }
     s_cur = NULL;
     s_draws++;
     if (d->program)
@@ -4364,6 +4372,17 @@ static void present_extent(RenderTarget *rt, UINT *w, UINT *h)
      * grow it (as a larger clip would) rather than show less than the CPU
      * path, which reads the whole frame from guest memory. A failed grow
      * shows what there is. */
+    /* A half-size frame: Kung Fu Chaos, in its field mode, draws a 320x240
+     * target at the display pitch under a 640x480 mode. Growing it showed
+     * that frame in the top-left quarter; keep the half-size extent and let
+     * the blit scale it to the window. */
+    int half = p->offset && p->offset == rt->offset && p->pitch == rt->pitch
+            && p->w == rt->w * 2 && p->h == rt->h * 2;
+    if (half) {
+        *w = rt->w;
+        *h = rt->h;
+        return;
+    }
     if (p->offset && p->offset == rt->offset && p->pitch == rt->pitch && p->w && p->h
             && (p->w > rt->w || p->h > rt->h))
         rt_grow(rt, rt->w > p->w ? rt->w : p->w, rt->h > p->h ? rt->h : p->h);
@@ -4373,6 +4392,176 @@ static void present_extent(RenderTarget *rt, UINT *w, UINT *h)
         if (p->w < *w) *w = p->w;
         if (p->h < *h) *h = p->h;
     }
+}
+
+/* Field deinterlace: a match drawn as 640x240 fields shows one field per
+ * frame, so thin edges flicker as even and odd lines alternate. The current
+ * field and the previous one are woven into a 480-line frame, each on its
+ * own lines, which the field's viewport offset says (XDK D3D: y + 0.53125 on
+ * one field, + 0.03125 on the other, half a field line up). Both modes are the
+ * usual motion-adaptive and blend deinterlacers (emulators such as PCSX2 offer
+ * modes by those names); written here from the description, no code taken
+ * from anywhere. Default, motion adaptive: a line of the other field comes from
+ * the previous field where it fits between the current field's lines above
+ * and below it (nothing moved: full height), and from their average where it
+ * does not (motion: no comb). RECOMP_FIELD_DEINTERLACE=blend: weave then [1 2 1]/4 vertically. Per guest line, at the
+ * render.scale resolution (n host rows a line). The first field after a
+ * frame that is not one is stretched as before.
+ * RECOMP_FIELD_DEINTERLACE=0: each field alone, stretched;
+ * RECOMP_FIELD_PARITY_FLIP=1: the other field on the even lines (A/B). */
+static const char s_weave_ps_src[] =
+    "Texture2D cur : register(t0); Texture2D prv : register(t1);\n"
+    /* n, host rows a field, current field even, mode (1 adaptive, 2 blend) */
+    "cbuffer W : register(b0) { int4 w; };\n"
+    "float3 row(Texture2D t, int x, int fl, int sub) {\n"
+    "    int n = w.x, last = w.y / n - 1;\n"
+    "    return t.Load(int3(x, clamp(fl, 0, last) * n + sub, 0)).rgb;\n"
+    "}\n"
+    /* guest line L of the woven frame: from the field that owns it */
+    "float3 line_(int x, int L, int sub) {\n"
+    "    bool mine = ((L & 1) == 0) == (w.z != 0);\n"
+    "    return mine ? row(cur, x, L >> 1, sub) : row(prv, x, L >> 1, sub);\n"
+    "}\n"
+    "float4 main(float4 p : SV_Position) : SV_Target {\n"
+    "    int x = (int)p.x, y = (int)p.y, n = w.x;\n"
+    "    int L = y / n, sub = y - L * n;\n"
+    "    if (w.w == 2) {\n"
+    "        float3 c = line_(x, L - 1, sub) + 2 * line_(x, L, sub) + line_(x, L + 1, sub);\n"
+    "        return float4(c * 0.25, 1);\n"
+    "    }\n"
+    "    bool mine = ((L & 1) == 0) == (w.z != 0);\n"
+    "    if (mine) return float4(row(cur, x, L >> 1, sub), 1);\n"
+    /* the other field's line: the previous field where nothing moved,
+     * the current field's lines above and below where something did */
+    "    int fl = L >> 1;\n"
+    "    float3 up = row(cur, x, ((L - 1) >> 1), sub), dn = row(cur, x, ((L + 1) >> 1), sub);\n"
+    "    float3 bob = 0.5 * (up + dn), wv = row(prv, x, fl, sub);\n"
+    "    float3 lo = min(up, dn) - 0.01, hi = max(up, dn) + 0.01;\n"
+    /* motion: the old line does not fit between its new neighbours */
+    "    float3 out_ = max(lo - wv, wv - hi);\n"
+    "    float m = saturate(max(out_.r, max(out_.g, out_.b)) * 40.0);\n"
+    "    return float4(lerp(wv, bob, m), 1);\n"
+    "}\n";
+static ID3D11PixelShader *s_weave_ps;
+static ID3D11Buffer *s_weave_cb;
+static ID3D11Texture2D *s_wv_tex, *s_pf_tex;            /* woven frame, previous field */
+static ID3D11RenderTargetView *s_wv_rtv;
+static ID3D11ShaderResourceView *s_wv_srv, *s_pf_srv;
+static UINT s_wv_w, s_wv_h;
+static int s_pf_have, s_pf_odd, s_weave_off = -1, s_weave_flip = -1;   /* s_pf_odd: its parity */
+static int s_weave_mode = 1;   /* 1 adaptive (default), 2 blend */
+
+static void weave_drop(void) { s_pf_have = 0; }
+
+/* Weaves rt's field (fw x fh host texels at its origin) with the previous
+ * one into s_wv_tex; returns 0 when there is nothing to weave with yet. */
+static int weave(RenderTarget *rt, UINT fw, UINT fh)
+{
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_MAPPED_SUBRESOURCE m;
+    D3D11_VIEWPORT vp;
+    D3D11_BOX box;
+    ID3D11ShaderResourceView *srv[2], *none[2] = {NULL, NULL};
+    /* The field's own draws say which one it is: the last offset set before
+     * the flip can be another surface's. */
+    int cur_even = !rt->field_odd;
+
+    if (s_weave_off < 0) {
+        const char *e = getenv("RECOMP_FIELD_DEINTERLACE");
+        s_weave_off = e && e[0] == '0';
+        if (e && !strcmp(e, "blend"))
+            s_weave_mode = 2;
+        e = getenv("RECOMP_FIELD_PARITY_FLIP");
+        s_weave_flip = e && e[0] == '1';
+    }
+    if (s_weave_flip)
+        cur_even = !cur_even;
+    if (s_weave_off || !rt->srv)
+        return 0;
+    if (!s_weave_ps) {
+        ID3DBlob *code = NULL;
+        if (!compile("nv2a_weave_ps", s_weave_ps_src, "ps_5_0", &code)) { s_weave_off = 1; return 0; }
+        ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                                       ID3D10Blob_GetBufferSize(code), NULL, &s_weave_ps);
+        ID3D10Blob_Release(code);
+        s_weave_cb = make_buffer(16, D3D11_BIND_CONSTANT_BUFFER);
+        if (!s_weave_ps || !s_weave_cb) { s_weave_off = 1; return 0; }
+    }
+    ID3D11Texture2D_GetDesc(rt->tex, &td);
+    if (!s_wv_tex || s_wv_w != fw || s_wv_h != fh * 2u) {
+        if (s_wv_rtv) ID3D11RenderTargetView_Release(s_wv_rtv);
+        if (s_wv_srv) ID3D11ShaderResourceView_Release(s_wv_srv);
+        if (s_wv_tex) ID3D11Texture2D_Release(s_wv_tex);
+        if (s_pf_srv) ID3D11ShaderResourceView_Release(s_pf_srv);
+        if (s_pf_tex) ID3D11Texture2D_Release(s_pf_tex);
+        s_wv_rtv = NULL; s_wv_srv = NULL; s_wv_tex = NULL; s_pf_srv = NULL; s_pf_tex = NULL;
+        td.Width = fw; td.Height = fh * 2u;
+        td.MipLevels = 1; td.ArraySize = 1;
+        td.SampleDesc.Count = 1; td.SampleDesc.Quality = 0;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+        td.CPUAccessFlags = 0; td.MiscFlags = 0;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_wv_tex))
+                || FAILED(ID3D11Device_CreateRenderTargetView(s_dev, (ID3D11Resource *)s_wv_tex, NULL, &s_wv_rtv))
+                || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_wv_tex, NULL, &s_wv_srv))) {
+            s_weave_off = 1; return 0;
+        }
+        td.Height = fh;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_pf_tex))
+                || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_pf_tex, NULL, &s_pf_srv))) {
+            s_weave_off = 1; return 0;
+        }
+        s_wv_w = fw; s_wv_h = fh * 2u;
+        s_pf_have = 0;
+    }
+    box.left = 0; box.top = 0; box.front = 0;
+    box.right = fw; box.bottom = fh; box.back = 1;
+    /* Only a field of the other parity is this one's partner: the same one
+     * twice (a repeated or dropped field) is shown alone, and kept. */
+    if (!s_pf_have || s_pf_odd == rt->field_odd) {
+        ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)s_pf_tex, 0, 0, 0, 0,
+                                                  (ID3D11Resource *)rt->tex, 0, &box);
+        s_pf_have = 1;
+        s_pf_odd = rt->field_odd;
+        return 0;
+    }
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_weave_cb, 0,
+                                          D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        int wv[4];
+        wv[0] = (int)(rt->n ? rt->n : 1); wv[1] = (int)fh; wv[2] = cur_even; wv[3] = s_weave_mode;
+        memcpy(m.pData, wv, sizeof wv);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_weave_cb, 0);
+    }
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_blit_cb, 0,
+                                          D3D11_MAP_WRITE_DISCARD, 0, &m))) {
+        float uv[4] = {1.0f, 1.0f, 0.0f, 0.0f};
+        memcpy(m.pData, uv, sizeof uv);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_blit_cb, 0);
+    }
+    ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &s_wv_rtv, NULL);
+    vp.TopLeftX = vp.TopLeftY = 0.0f;
+    vp.Width = (float)fw; vp.Height = (float)(fh * 2u);
+    vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
+    ID3D11DeviceContext_RSSetViewports(s_ctx, 1, &vp);
+    ID3D11DeviceContext_RSSetState(s_ctx, s_rs[0][0]);
+    ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFF);
+    ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, s_ds_off, 0);
+    ID3D11DeviceContext_IASetInputLayout(s_ctx, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(s_ctx, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ID3D11DeviceContext_VSSetShader(s_ctx, s_blit_vs, NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_blit_cb);
+    ID3D11DeviceContext_PSSetShader(s_ctx, s_weave_ps, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(s_ctx, 0, 1, &s_weave_cb);
+    srv[0] = rt->srv; srv[1] = s_pf_srv;
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 2, srv);
+    ID3D11DeviceContext_Draw(s_ctx, 3, 0);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 2, none);
+    /* This field is the next one's partner. */
+    ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)s_pf_tex, 0, 0, 0, 0,
+                                              (ID3D11Resource *)rt->tex, 0, &box);
+    s_pf_odd = rt->field_odd;
+    return 1;
 }
 
 /* rt's present extent into the back buffer at nv2a_present_rect's place,
@@ -4387,7 +4576,7 @@ static void present_blit(RenderTarget *rt, int filter, unsigned overscan, int in
     D3D11_VIEWPORT vp;
     UINT cw, ch, hcw, hch;
     struct nv2a_crop c;
-    int whole;
+    int whole, woven;
 
     if (!s_back || !blit_init())
         return;
@@ -4402,16 +4591,34 @@ static void present_blit(RenderTarget *rt, int filter, unsigned overscan, int in
     hcw = (cw + 2u * rt->pad) * rt->n;
     hch = ch * rt->n;
     nv2a_present_crop(hcw, hch, rt->hw, rt->hh, rt->n, rt->pad, overscan, filter, &c);
-    whole = nv2a_present_rect(c.fit_w, c.fit_h, s_back_w, s_back_h, filter, &r);
+    /* A field (640x240 of a 640x480 mode, present_pick's rule 2) fills the
+     * window, as the CRTC line-doubles it; fitting it by its own aspect left
+     * it in a 640x240 band. By the field's shape, not the window's size: a
+     * render.scale window is larger than 640x480. */
+    if (cw == s_back_w && ch * 2 == s_back_h)
+        whole = nv2a_present_rect(s_back_w, s_back_h, s_back_w, s_back_h, filter, &r);
+    else if (cw * 3u == ch * 8u)
+        whole = nv2a_present_rect(c.fit_w, c.fit_h * 2u, s_back_w, s_back_h, filter, &r);
+    else
+        whole = nv2a_present_rect(c.fit_w, c.fit_h, s_back_w, s_back_h, filter, &r);
     if (overscan && internal) {
         r.x = r.y = 0;
         r.w = (int32_t)s_back_w;
         r.h = (int32_t)s_back_h;
         whole = 1;
     }
+    /* A field: woven with the previous one into a full frame (weave()). */
+    woven = 0;
+    if (cw * 3u == ch * 8u && !rt->pad && !overscan)
+        woven = weave(rt, hcw, hch);
+    else
+        weave_drop();
     {
         D3D11_MAPPED_SUBRESOURCE m;
         float uv[4] = {c.u_scale, c.v_scale, c.u_off, c.v_off};
+        if (woven) {
+            uv[0] = 1.0f; uv[1] = 1.0f; uv[2] = 0.0f; uv[3] = 0.0f;
+        }
         if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_blit_cb, 0,
                                            D3D11_MAP_WRITE_DISCARD, 0, &m)))
             return;
@@ -4435,7 +4642,7 @@ static void present_blit(RenderTarget *rt, int filter, unsigned overscan, int in
     ID3D11DeviceContext_VSSetShader(s_ctx, s_blit_vs, NULL, 0);
     ID3D11DeviceContext_VSSetConstantBuffers(s_ctx, 0, 1, &s_blit_cb);
     ID3D11DeviceContext_PSSetShader(s_ctx, s_blit_ps, NULL, 0);
-    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, &rt->srv);
+    ID3D11DeviceContext_PSSetShaderResources(s_ctx, 0, 1, woven ? &s_wv_srv : &rt->srv);
     /* Point for nearest and whole multiples; linear for linear and for an
      * integer frame that had to shrink to fit. */
     ID3D11DeviceContext_PSSetSamplers(s_ctx, 0, 1,
@@ -4484,6 +4691,11 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
         UINT cw, ch;
         int same;
         present_extent(s_drawn, &cw, &ch);
+        /* A half-size frame (see present_extent) or a field is never stock: a
+         * copy would show it in the top-left quarter or the top half. The
+         * blit scales it to the window. */
+        if (ch * 2 == s_back_h && (cw * 2 == s_back_w || cw == s_back_w))
+            stock = 0;
         s_shown_w = cw;
         s_shown_h = ch;
         if (eo->present_surface == NV2A_PRESENT_SURFACE_INTERNAL)
