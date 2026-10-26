@@ -704,6 +704,53 @@ static void close_present(SDL_Renderer *ren)
         SDL_DestroyRenderer(ren);
 }
 
+/* present.filter changed live on the renderer path (layer mode passes the
+ * filter to fbm_present at each present): the texture's scale mode, and the
+ * logical presentation that integer placement does without. */
+static void present_filter_set(SDL_Renderer *ren, SDL_Texture *tex, uint32_t w, uint32_t h,
+                               int filter)
+{
+    if (!ren)
+        return;
+    if (tex)
+        SDL_SetTextureScaleMode(tex, filter == NV2A_PRESENT_LINEAR ? SDL_SCALEMODE_LINEAR
+                                                                   : SDL_SCALEMODE_NEAREST);
+    if (filter == NV2A_PRESENT_INTEGER)
+        SDL_SetRenderLogicalPresentation(ren, 0, 0, SDL_LOGICAL_PRESENTATION_DISABLED);
+    else if (tex)
+        SDL_SetRenderLogicalPresentation(ren, (int)w, (int)h,
+                                         SDL_LOGICAL_PRESENTATION_LETTERBOX);
+}
+
+#if defined(__APPLE__)
+/* Whether present.fullscreen is a borderless window over the display (as
+ * the D3D11 popup is) rather than a Spaces fullscreen. A Spaces toggle is
+ * an animated transition macOS skips for an app that is not frontmost: it
+ * changes nothing yet SDL reports success, so a live switch (the menu,
+ * opts_at) did nothing. SDL_RaiseWindow before the toggle is not the
+ * fix: whether a background app may come forward is macOS's call (it may
+ * only bounce the Dock icon), and a menu switch should not steal focus.
+ * Stock runs keep Spaces, so the green button and Ctrl-Cmd-F behave as in
+ * any Mac app; only a run that can switch fullscreen itself (fullscreen
+ * configured, the overlay armed for the menu, or opts_at) goes borderless.
+ * The policy for those runs is not settled: MAC_SPACES_OFF_LIVE 0 keeps
+ * Spaces everywhere. SDL_VIDEO_MAC_FULLSCREEN_SPACES in the environment
+ * wins over either (SDL reads the hint's environment variable first). */
+#define MAC_SPACES_OFF_LIVE 1
+static int mac_spaces_off(void)
+{
+    if (!MAC_SPACES_OFF_LIVE)
+        return 0;
+    if (nv2a_host_opts()->fullscreen || recomp_env(RENV_OPTS_AT))
+        return 1;
+#ifdef XBOXRECOMP_ENHANCE
+    if (nv2a_overlay_armed())
+        return 1;
+#endif
+    return 0;
+}
+#endif
+
 int xbox_HostWindowMain(int (*guest_main)(void))
 {
     SDL_Window *win;
@@ -724,6 +771,8 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     uint32_t shown_flip = 0;
     const struct nv2a_host_opts *eo = nv2a_host_opts();
     int filter = eo->present_filter;
+    int full = eo->fullscreen;   /* present.fullscreen as last applied here */
+    uint32_t opts_gen = nv2a_host_opts_gen();
     SDL_FRect dst;               /* integer: where the frame goes */
     int dst_ok = 0, out_w = 0, out_h = 0;
 #ifdef XBOXRECOMP_ENHANCE
@@ -743,6 +792,13 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         return guest_main();
     shot_parse();
 
+#if defined(__APPLE__)
+    if (mac_spaces_off()) {
+        SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0");
+        fprintf(stderr, "[PRESENT] macOS fullscreen: borderless, no Spaces"
+                        " (a live switch is armed)\n");
+    }
+#endif
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD)) {
         fprintf(stderr, "[PRESENT] SDL video unavailable (%s); running headless\n",
                 SDL_GetError());
@@ -877,6 +933,35 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         /* Pads come and go here, on the thread that pumps their events
          * (xinput_device.c says why it cannot be a poll thread). */
         xbox_InputSdlPadSync();
+        /* Live present options (nv2a_host_opts_request): the walker applies
+         * them at a flip and bumps the gen; the window and its renderer are
+         * this thread's, so the change is made here. A new frame wakes the
+         * loop, so it shows within a flip of the apply. */
+        if (nv2a_host_opts_gen() != opts_gen) {
+            opts_gen = nv2a_host_opts_gen();   /* acquire: the fields below are new */
+            if (eo->present_filter != filter) {
+                filter = eo->present_filter;
+                present_filter_set(ren, tex, tex_w, tex_h, filter);
+                dst_ok = 0;
+                dirty = 1;
+            }
+            if (eo->fullscreen != full) {
+                int want = eo->fullscreen;
+                /* NULL mode: borderless desktop, as at creation. A failed
+                 * switch keeps `full`, so the next gen change tries again. */
+                if (want)
+                    SDL_SetWindowFullscreenMode(win, NULL);
+                if (!SDL_SetWindowFullscreen(win, want)) {
+                    fprintf(stderr, "[PRESENT] present.fullscreen=%s failed (%s)\n",
+                            want ? "on" : "off", SDL_GetError());
+                } else {
+                    full = want;
+                    fprintf(stderr, "[PRESENT] present.fullscreen=%s (live)\n",
+                            full ? "on" : "off");
+                }
+                dirty = 1;
+            }
+        }
 
         pthread_mutex_lock(&s_lock);
         seq = s_ready_seq;

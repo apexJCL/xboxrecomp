@@ -307,9 +307,21 @@ buffer and texture (Metal writes a target back
 first, so the next one seeds from it), with one line
 (`render.scale=N from this flip: targets and textures dropped`); a pack
 change makes every texture upload again. The CPU and null backends apply
-too and repeat their "ignored" line on a scale change. `present.filter`
-and `present.fullscreen` change only the stored value so far; the
-presenters read them at start.
+too and repeat their "ignored" line on a scale or overscan change.
+
+The other live keys need nothing at the flip but the stored value:
+`render.aniso` is part of the sampler key at each draw, `display.movie`
+is read at each movie draw, and `display.overscan` at each present (a
+non-zero overscan under a wide `display.aspect` is refused, as at start,
+and the aspect itself is start-only). `present.filter` and
+`present.fullscreen` are the presenter's: the SDL window's thread sees the
+options generation move and sets the texture's scale mode or calls
+`SDL_SetWindowFullscreen`; the D3D11 window, which the walker thread owns,
+swaps its style with `SetWindowPos` in the same on_flip, and the next
+flip resizes the swap chain. `present.pacing` changes through
+`xbox_enhance_set_pacing(mode)` (`enhance.h`), from any thread. Each shows
+within two flips. `RECOMP_DEBUG=opts_at=<flip>:<key>=<value>,...` makes the
+same requests at given flips, to check a switch without the menu.
 
 - **`render.scale = N`** (1..4; outside that it is clamped, with a line).
   Metal and D3D11 allocate every colour and depth target at N times its
@@ -343,8 +355,8 @@ presenters read them at start.
   texture without mips is left alone, since those are render targets read
   back (bloom, blur and composite passes), linear-format movie frames and
   lookup tables: screen-aligned or data, and they shimmer under it. Both
-  backends filter min, mag and mip linearly under it. Read at start; the
-  CPU backend ignores it.
+  backends filter min, mag and mip linearly under it. Live; the CPU
+  backend ignores it.
 - **`present.filter`.** `nearest` is the stock letterbox. `linear` is the
   same letterbox with bilinear filtering. `integer` shows the frame at the
   largest whole multiple that fits, centered on black; a frame larger than
@@ -356,7 +368,13 @@ presenters read them at start.
   not follow these keys yet.
 - **`present.fullscreen`.** A borderless window covering the display at
   start, with no mode change (SDL `SDL_WINDOW_FULLSCREEN` at the desktop mode; D3D11 a `WS_POPUP`
-  the primary monitor's size). There is no hotkey yet.
+  the primary monitor's size). Live: on and off while the game runs (the
+  D3D11 window goes back to the size it had, or to the starting size). The
+  CPU backend's Win32 GDI window does not follow it. On macOS this is not a
+  Spaces fullscreen: the presenter sets `SDL_VIDEO_MAC_FULLSCREEN_SPACES=0`
+  as its default, because a Spaces toggle in an app that is not frontmost
+  does nothing while SDL reports success. Setting that variable to `1` in
+  the environment brings Spaces back.
 - **`present.surface`.** Who scales the frame to the screen. `window` is
   the stock behaviour: the swap chain follows the window, and the game
   scales the frame into it as `present.filter` says. `internal` makes the

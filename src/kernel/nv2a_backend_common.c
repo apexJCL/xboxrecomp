@@ -944,6 +944,12 @@ void nv2a_host_opts_request(const struct nv2a_host_opts *o, unsigned mask)
         s_req_opts.fullscreen = o->fullscreen;
     if (mask & NV2A_OPT_PACK)
         s_req_opts.pack_off = o->pack_off;
+    if (mask & NV2A_OPT_ANISO)
+        s_req_opts.aniso = o->aniso;
+    if (mask & NV2A_OPT_MOVIE)
+        s_req_opts.movie_mode = o->movie_mode;
+    if (mask & NV2A_OPT_OVERSCAN)
+        s_req_opts.overscan = o->overscan;
     s_req_mask |= mask;
     req_unlock();
     atomic_store_explicit(&s_req_pending, 1u, memory_order_release);
@@ -982,14 +988,43 @@ unsigned nv2a_host_opts_apply(void)
         pack_apply_off(r.pack_off);
         changed |= NV2A_OPT_PACK;
     }
+    if (mask & NV2A_OPT_ANISO) {
+        unsigned a = r.aniso < 2 ? 0 : r.aniso > 16 ? 16 : r.aniso;
+        if (a != s_host_opts.aniso) {
+            s_host_opts.aniso = a;
+            changed |= NV2A_OPT_ANISO;
+        }
+    }
+    if ((mask & NV2A_OPT_MOVIE) && (unsigned)r.movie_mode > NV2A_MOVIE_FILL) {
+        fprintf(stderr, "[ENHANCE] display.movie=%d out of range; refused\n",
+                (int)r.movie_mode);
+    } else if ((mask & NV2A_OPT_MOVIE) && r.movie_mode != s_host_opts.movie_mode) {
+        s_host_opts.movie_mode = r.movie_mode;
+        changed |= NV2A_OPT_MOVIE;
+    }
+    if (mask & NV2A_OPT_OVERSCAN) {
+        unsigned ov = r.overscan > NV2A_OVERSCAN_MAX ? NV2A_OVERSCAN_MAX : r.overscan;
+        /* As at start (xbox_enhance_init): under hor+ the 4:3 edges sit
+         * inside the padded frame, where no source rectangle can cut them. */
+        if (ov && s_host_opts.aspect_w) {
+            fprintf(stderr, "[ENHANCE] display.overscan=%u ignored with display.aspect=%u:%u:"
+                    " the 4:3 edges are inside the padded frame\n", ov,
+                    s_host_opts.aspect_w, s_host_opts.aspect_h);
+            ov = s_host_opts.overscan;
+        }
+        if (ov != s_host_opts.overscan) {
+            s_host_opts.overscan = ov;
+            changed |= NV2A_OPT_OVERSCAN;
+        }
+    }
     if (changed)
-        atomic_fetch_add_explicit(&s_opts_gen, 1u, memory_order_relaxed);
+        atomic_fetch_add_explicit(&s_opts_gen, 1u, memory_order_release);
     return changed;
 }
 
 uint32_t nv2a_host_opts_gen(void)
 {
-    return atomic_load_explicit(&s_opts_gen, memory_order_relaxed);
+    return atomic_load_explicit(&s_opts_gen, memory_order_acquire);
 }
 
 const struct nv2a_host_opts *nv2a_host_opts(void)

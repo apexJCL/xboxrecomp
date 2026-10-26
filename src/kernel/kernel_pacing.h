@@ -51,8 +51,10 @@ uint64_t xbox_VblankScheduleLastDue(const XboxVblankSchedule *s);
 /* ── The pacing mode ── */
 enum { XBOX_PACING_SPIN = 0, XBOX_PACING_SLEEP = 1 };
 
-/* Set before the guest starts (the enhancements layer's present.pacing).
- * Without a call the mode is spin. */
+/* Set before the guest starts (the enhancements layer's present.pacing),
+ * and again from any thread while it runs (xbox_enhance_set_pacing): every
+ * pass reads the mode afresh and a sleeping pass is bounded at 1 ms, so a
+ * switch shows from the next pass. Without a call the mode is spin. */
 void xbox_PacingSetMode(int mode);
 int  xbox_PacingMode(void);
 

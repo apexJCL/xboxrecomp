@@ -33,6 +33,7 @@ set(KERNEL_SOURCES
     nv2a_flip_hold.c
     nv2a_kick_wake.c
     nv2a_backend_common.c
+    nv2a_opts_at.c
     nv2a_aspect.c
     nv2a_tex_pack.c
     nv2a_vsh_cpu.c

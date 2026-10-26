@@ -4585,11 +4585,83 @@ static void scale_drop(void)
             nv2a_host_render_scale());
 }
 
+/* present.fullscreen changed live: swap the window's style and size on this
+ * thread, which owns the window. SetWindowPos sends WM_SIZE here at once,
+ * so the next flip's present_resize gives the swap chain the new client
+ * size before it presents; no other thread touches the window, so there is
+ * no resize to race. Borderless over the window's monitor, as at start; the
+ * windowed placement is the one left, or the starting size when the run
+ * began fullscreen. Under present.surface=internal the client size stays the
+ * frame's (the compositor scales it), only the border changes. */
+static void fullscreen_switch(int full)
+{
+    /* The placement, not GetWindowRect: a maximised window comes back
+     * maximised over its restored rectangle, and a minimised one's rect
+     * (off screen) is not where it goes back to. */
+    static WINDOWPLACEMENT s_windowed;
+    static int s_have_windowed;
+    RECT r;
+    int internal = nv2a_host_opts()->present_surface == NV2A_PRESENT_SURFACE_INTERNAL;
+
+    if (!s_hwnd)
+        return;
+    if (full) {
+        MONITORINFO mi;
+
+        s_windowed.length = sizeof s_windowed;
+        if (GetWindowPlacement(s_hwnd, &s_windowed)) {
+            s_have_windowed = 1;
+            if (s_windowed.showCmd == SW_SHOWMINIMIZED)
+                s_windowed.showCmd = (s_windowed.flags & WPF_RESTORETOMAXIMIZED)
+                                   ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+        }
+        mi.cbSize = sizeof mi;
+        if (internal) {
+            r.left = r.top = 0;
+            r.right = (LONG)s_back_w;
+            r.bottom = (LONG)s_back_h;
+        } else if (GetMonitorInfoW(MonitorFromWindow(s_hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+            r = mi.rcMonitor;
+        } else {
+            r.left = r.top = 0;
+            r.right = GetSystemMetrics(SM_CXSCREEN);
+            r.bottom = GetSystemMetrics(SM_CYSCREEN);
+        }
+        SetWindowLongPtrW(s_hwnd, GWL_STYLE, (LONG_PTR)(WS_POPUP | WS_VISIBLE));
+    } else {
+        if (internal || !s_have_windowed) {
+            r.left = r.top = 0;
+            r.right = internal ? (LONG)s_back_w : (LONG)nv2a_host_window_w(640, 480, 1);
+            r.bottom = internal ? (LONG)s_back_h : 480;
+            AdjustWindowRect(&r, WS_OVERLAPPEDWINDOW, FALSE);
+            OffsetRect(&r, 64 - r.left, 64 - r.top);
+        } else {
+            /* The style first, so the placement sizes a framed window. */
+            SetWindowLongPtrW(s_hwnd, GWL_STYLE, (LONG_PTR)(WS_OVERLAPPEDWINDOW | WS_VISIBLE));
+            SetWindowPlacement(s_hwnd, &s_windowed);
+            SetWindowPos(s_hwnd, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER
+                         | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+            r = s_windowed.rcNormalPosition;
+            fprintf(stderr, LOGP "present.fullscreen=off (live): window %ldx%ld%s\n",
+                    (long)(r.right - r.left), (long)(r.bottom - r.top),
+                    s_windowed.showCmd == SW_SHOWMAXIMIZED ? ", maximised" : "");
+            return;
+        }
+        SetWindowLongPtrW(s_hwnd, GWL_STYLE, (LONG_PTR)(WS_OVERLAPPEDWINDOW | WS_VISIBLE));
+    }
+    SetWindowPos(s_hwnd, HWND_TOP, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                 SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+    fprintf(stderr, LOGP "present.fullscreen=%s (live): window %ldx%ld\n",
+            full ? "on" : "off", (long)(r.right - r.left), (long)(r.bottom - r.top));
+}
+
 /* Live options (nv2a_host_opts_request) are applied after the present:
  * the one point where no target is bound and no upload is in flight, and
  * the frame shown was drawn at the old render.scale, which the present
  * sizes its source by (applied first, a 2x frame lowered to 1x would show
- * its top-left quarter for one flip). */
+ * its top-left quarter for one flip). Filter, aniso, movie and overscan
+ * are read where they are used (present_blit, the sampler key, the movie
+ * draw), so storing them is the change. */
 static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
 {
     unsigned changed;
@@ -4597,6 +4669,8 @@ static void d3d11_on_flip(uint32_t surface_offset, uint32_t pitch)
     changed = nv2a_host_opts_apply();
     if ((changed & NV2A_OPT_SCALE) && s_dev)
         scale_drop();
+    if (changed & NV2A_OPT_FULLSCREEN)
+        fullscreen_switch(nv2a_host_opts()->fullscreen);
 }
 
 /* ---- registration ---------------------------------------------------------- */

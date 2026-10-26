@@ -3575,6 +3575,9 @@ static void scale_drop(void)
  * the frame shown was drawn at the old render.scale, which the present
  * sizes its source by (applied first, a 2x frame lowered to 1x would show
  * its top-left quarter for one flip). */
+/* Filter, fullscreen and overscan are the SDL presenter's (fb_present_sdl.c
+ * reads them each present, on its own thread); aniso and movie are read at
+ * each draw, so storing them is the change. */
 static void metal_on_flip(uint32_t surface_offset, uint32_t pitch)
 {
     unsigned changed;

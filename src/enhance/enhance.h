@@ -47,6 +47,12 @@ extern "C" {
  * files and the environment apply). */
 int xbox_enhance_init(const char *root, const char *title);
 
+/* present.pacing changed while the game runs (the in-game menu): mode is
+ * XBOX_PACING_SPIN or XBOX_PACING_SLEEP (kernel_pacing.h), anything else is
+ * ignored. Any thread; logs one line. The other live keys go through
+ * nv2a_host_opts_request (nv2a_backend_common.h). */
+void xbox_enhance_set_pacing(int mode);
+
 #ifdef __cplusplus
 }
 #endif

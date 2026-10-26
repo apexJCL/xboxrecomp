@@ -46,6 +46,7 @@
 #include "nv2a_combiner.h"
 #include "nv2a_pb_state.h"
 #include "nv2a_backend_common.h"
+#include "nv2a_opts_at.h"
 #include "nv2a_tex_pack.h"
 #include "nv2a_zbuf_cache.h"
 #include "../video/video_player.h"   /* xbox_FramebufferWindowFrameStats */
@@ -1154,6 +1155,48 @@ static int present_pitch_ok(int i, uint32_t want)
 static int present_fresh(int i)
 {
     return s_gpu.flips - s_psurf[i].last_flip <= present_stale_flips();
+}
+
+/* RECOMP_DEBUG=opts_at (nv2a_opts_at.h): live option requests made at
+ * given flips, from the walker here, before the flip's apply. Parsed once. */
+static struct nv2a_opts_at s_opts_at[NV2A_OPTS_AT_MAX];
+static int s_opts_at_n = -1;
+
+static void opts_at_parse(void)
+{
+    s_opts_at_n = nv2a_opts_at_parse(recomp_env(RENV_OPTS_AT), s_opts_at);
+    if (s_opts_at_n)
+        fprintf(stderr, "[PB] opts_at: %d live option request(s) armed\n", s_opts_at_n);
+}
+
+static void opts_at_flip(uint32_t flip)
+{
+    int i;
+    if (s_opts_at_n < 0)
+        opts_at_parse();
+    for (i = 0; i < s_opts_at_n; i++) {
+        const struct nv2a_opts_at *e = &s_opts_at[i];
+        struct nv2a_host_opts o;
+        if (e->flip != flip)
+            continue;
+        fprintf(stderr, "[PB] opts_at: flip %u request\n", flip);
+        if (e->pacing >= 0) {
+            /* Not xbox_enhance_set_pacing: this file links without the
+             * enhance layer. The line reads the mode back. */
+            xbox_PacingSetMode(e->pacing);
+            fprintf(stderr, "[PB] opts_at: present.pacing=%s\n",
+                    xbox_PacingMode() == XBOX_PACING_SLEEP ? "sleep" : "spin");
+            continue;
+        }
+        o = *nv2a_host_opts();
+        if (e->mask & NV2A_OPT_SCALE) o.render_scale = e->o.render_scale;
+        if (e->mask & NV2A_OPT_FILTER) o.present_filter = e->o.present_filter;
+        if (e->mask & NV2A_OPT_FULLSCREEN) o.fullscreen = e->o.fullscreen;
+        if (e->mask & NV2A_OPT_ANISO) o.aniso = e->o.aniso;
+        if (e->mask & NV2A_OPT_MOVIE) o.movie_mode = e->o.movie_mode;
+        if (e->mask & NV2A_OPT_OVERSCAN) o.overscan = e->o.overscan;
+        nv2a_host_opts_request(&o, e->mask);
+    }
 }
 
 /* At FLIP_STALL: pick what it presents, into s_present. */
@@ -7088,16 +7131,25 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
          * clear yet), the old answer: the last surface drawn, else the
          * current one. */
         present_pick();
+        if (recomp_env(RENV_OPTS_AT))
+            opts_at_flip(s_gpu.flips);
         /* The GPU backends apply live options (nv2a_host_opts_request) in
          * their on_flip, after the present; these two have none that does,
-         * so it is done here and a request never stays pending. Scale still does not
-         * apply to them, said again as at startup. */
+         * so it is done here and a request never stays pending. Scale and overscan
+         * still do not apply to them, said again as at startup. */
         if (s_backend == &s_cpu_backend || s_backend == &s_null_backend) {
             unsigned changed = nv2a_host_opts_apply();
+            int cpu = s_backend == &s_cpu_backend;
+            const char *why = cpu ? "the CPU rasteriser" : "the null backend";
             if ((changed & NV2A_OPT_SCALE) && nv2a_host_render_scale() > 1)
-                fprintf(stderr, "[ENHANCE] render.scale=%u ignored: the CPU rasteriser"
-                        " draws into guest memory at the guest size\n",
-                        nv2a_host_render_scale());
+                fprintf(stderr, "[ENHANCE] render.scale=%u ignored by %s: %s\n",
+                        nv2a_host_render_scale(), why,
+                        cpu ? "it draws into guest memory at the guest size"
+                            : "it draws nothing");
+            if ((changed & NV2A_OPT_OVERSCAN) && nv2a_host_opts()->overscan)
+                fprintf(stderr, "[ENHANCE] display.overscan=%u ignored by %s: %s\n",
+                        nv2a_host_opts()->overscan, why,
+                        cpu ? "it presents the whole frame" : "it presents nothing");
         }
         if (s_backend->on_flip) {
             uint64_t t0 = rt_now();

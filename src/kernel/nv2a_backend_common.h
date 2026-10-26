@@ -1388,11 +1388,20 @@ struct nv2a_host_opts {
 #define NV2A_PACK_OFF_TEXT  0x4u
 #define NV2A_PACK_OFF_ART   0x8u
 
-/* Field masks for nv2a_host_opts_request / _apply. */
+/* Field masks for nv2a_host_opts_request / _apply. ANISO, MOVIE and
+ * OVERSCAN need nothing from a backend at the flip: the samplers are keyed
+ * on the aniso value, the movie placement is read at each movie draw and the
+ * crop at each present, so the stored value is the whole change. */
 #define NV2A_OPT_SCALE      0x1u
 #define NV2A_OPT_FILTER     0x2u
 #define NV2A_OPT_FULLSCREEN 0x4u
 #define NV2A_OPT_PACK       0x8u
+#define NV2A_OPT_ANISO      0x10u
+#define NV2A_OPT_MOVIE      0x20u
+#define NV2A_OPT_OVERSCAN   0x40u
+/* display.overscan's range (enhance.c clamps the key to it): 10% of a
+ * 640-wide frame a side, past any TV's overscan. */
+#define NV2A_OVERSCAN_MAX   64u
 
 void nv2a_host_opts_set(const struct nv2a_host_opts *o);
 const struct nv2a_host_opts *nv2a_host_opts(void);
@@ -1403,9 +1412,15 @@ void nv2a_host_opts_request(const struct nv2a_host_opts *o, unsigned mask);
 /* At the flip, on the walker thread: apply the pending request. Returns the
  * mask of fields whose value changed (0 when nothing was pending, which costs
  * one atomic load). A PACK change also sets the pack's enable mask and bumps
- * nv2a_tex_pack_gen(), so every backend's texture cache re-uploads. */
+ * nv2a_tex_pack_gen(), so every backend's texture cache re-uploads. Values
+ * are taken as xbox_enhance_init takes them: aniso below 2 is off and above
+ * 16 is 16, overscan above NV2A_OVERSCAN_MAX is that, and a movie mode out
+ * of range or a non-zero overscan with a wide display.aspect is refused
+ * with one line (the latter's 4:3 edges are inside the padded frame). */
 unsigned nv2a_host_opts_apply(void);
-/* Bumped by every apply that changed a field. */
+/* Bumped by every apply that changed a field, after the fields are stored:
+ * a reader on another thread (the SDL presenter) that sees a new gen with
+ * acquire sees the new values. */
 uint32_t nv2a_host_opts_gen(void);
 /* render_scale as a factor: 1 when unset. */
 unsigned nv2a_host_render_scale(void);

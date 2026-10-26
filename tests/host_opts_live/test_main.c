@@ -13,6 +13,10 @@
  *             values changes nothing
  *   race      a thread requesting while the walker applies in a loop: only
  *             requested values are ever seen, and the last request wins
+ *   r1        the R1 bits (aniso, movie, overscan): each waits for the flip
+ *             like the others; aniso below 2 is off and above 16 is 16, a
+ *             movie mode out of range is refused, overscan is clamped to
+ *             NV2A_OVERSCAN_MAX and refused with a wide display.aspect
  */
 #include <pthread.h>
 #include <stdatomic.h>
@@ -206,11 +210,105 @@ static void test_race(void)
     CHECK(nv2a_host_opts_apply() == 0, "pending after the last apply");
 }
 
+static void test_r1(void)
+{
+    struct nv2a_host_opts stock, o;
+    uint32_t g;
+    unsigned m;
+
+    memset(&stock, 0, sizeof stock);
+    nv2a_host_opts_set(&stock);
+
+    /* All three from another thread: nothing before the flip, then one
+     * apply with all three bits and one gen bump. */
+    o = stock;
+    o.aniso = 8;
+    o.movie_mode = NV2A_MOVIE_FIT;
+    o.overscan = 16;
+    request_from_thread(&o, NV2A_OPT_ANISO | NV2A_OPT_MOVIE | NV2A_OPT_OVERSCAN);
+    CHECK(nv2a_host_opts()->aniso == 0 && nv2a_host_opts()->movie_mode == NV2A_MOVIE_BLACK
+          && nv2a_host_opts()->overscan == 0, "R1 bits applied before the flip");
+    g = nv2a_host_opts_gen();
+    m = nv2a_host_opts_apply();
+    CHECK(m == (NV2A_OPT_ANISO | NV2A_OPT_MOVIE | NV2A_OPT_OVERSCAN), "R1 mask %#x", m);
+    CHECK(nv2a_host_opts()->aniso == 8, "aniso %u", nv2a_host_opts()->aniso);
+    CHECK(nv2a_host_opts()->movie_mode == NV2A_MOVIE_FIT, "movie %d", nv2a_host_opts()->movie_mode);
+    CHECK(nv2a_host_opts()->overscan == 16, "overscan %u", nv2a_host_opts()->overscan);
+    CHECK(nv2a_host_opts_gen() == g + 1, "one bump for the R1 apply");
+    CHECK(nv2a_host_opts()->render_scale == 0 && nv2a_host_opts()->present_filter == 0,
+          "an R1 apply wrote another field");
+
+    /* aniso 1 to 16 and back, as the menu steps it: 1 is off (0), 16 the
+     * top, above it 16 again (no change). */
+    o.aniso = 1;
+    nv2a_host_opts_request(&o, NV2A_OPT_ANISO);
+    CHECK(nv2a_host_opts_apply() == NV2A_OPT_ANISO && nv2a_host_opts()->aniso == 0,
+          "aniso 1: %u", nv2a_host_opts()->aniso);
+    o.aniso = 16;
+    nv2a_host_opts_request(&o, NV2A_OPT_ANISO);
+    CHECK(nv2a_host_opts_apply() == NV2A_OPT_ANISO && nv2a_host_opts()->aniso == 16, "aniso 16");
+    o.aniso = 99;
+    nv2a_host_opts_request(&o, NV2A_OPT_ANISO);
+    CHECK(nv2a_host_opts_apply() == 0 && nv2a_host_opts()->aniso == 16, "aniso 99 not 16");
+    o.aniso = 0;
+    nv2a_host_opts_request(&o, NV2A_OPT_ANISO);
+    CHECK(nv2a_host_opts_apply() == NV2A_OPT_ANISO && nv2a_host_opts()->aniso == 0, "aniso off");
+
+    /* A movie mode out of range leaves the current one. */
+    o.movie_mode = 7;
+    nv2a_host_opts_request(&o, NV2A_OPT_MOVIE);
+    CHECK(nv2a_host_opts_apply() == 0 && nv2a_host_opts()->movie_mode == NV2A_MOVIE_FIT,
+          "movie 7: %d", nv2a_host_opts()->movie_mode);
+    o.movie_mode = -1;
+    nv2a_host_opts_request(&o, NV2A_OPT_MOVIE);
+    CHECK(nv2a_host_opts_apply() == 0, "movie -1 applied");
+    o.movie_mode = NV2A_MOVIE_FILL;
+    nv2a_host_opts_request(&o, NV2A_OPT_MOVIE);
+    CHECK(nv2a_host_opts_apply() == NV2A_OPT_MOVIE
+          && nv2a_host_opts()->movie_mode == NV2A_MOVIE_FILL, "movie fill");
+
+    /* Overscan above the range is the range's top; off is 0. */
+    o.overscan = 500;
+    nv2a_host_opts_request(&o, NV2A_OPT_OVERSCAN);
+    CHECK(nv2a_host_opts_apply() == NV2A_OPT_OVERSCAN
+          && nv2a_host_opts()->overscan == NV2A_OVERSCAN_MAX,
+          "overscan 500: %u", nv2a_host_opts()->overscan);
+    o.overscan = 0;
+    nv2a_host_opts_request(&o, NV2A_OPT_OVERSCAN);
+    CHECK(nv2a_host_opts_apply() == NV2A_OPT_OVERSCAN && nv2a_host_opts()->overscan == 0,
+          "overscan off");
+
+    /* With a wide display.aspect (set at start, not live), a non-zero
+     * overscan is refused and stays 0; the other bits of the same request
+     * still apply. */
+    stock.aspect_w = 16;
+    stock.aspect_h = 9;
+    nv2a_host_opts_set(&stock);
+    o = stock;
+    o.overscan = 16;
+    o.aniso = 4;
+    g = nv2a_host_opts_gen();
+    nv2a_host_opts_request(&o, NV2A_OPT_OVERSCAN | NV2A_OPT_ANISO);
+    m = nv2a_host_opts_apply();
+    CHECK(m == NV2A_OPT_ANISO, "wide aspect: mask %#x", m);
+    CHECK(nv2a_host_opts()->overscan == 0, "overscan %u under 16:9", nv2a_host_opts()->overscan);
+    CHECK(nv2a_host_opts()->aniso == 4, "aniso beside a refused overscan");
+    CHECK(nv2a_host_opts_gen() == g + 1, "gen with a refused field");
+    o.aniso = 4;
+    nv2a_host_opts_request(&o, NV2A_OPT_OVERSCAN);
+    CHECK(nv2a_host_opts_apply() == 0 && nv2a_host_opts_gen() == g + 1,
+          "a refused overscan alone bumped the gen");
+
+    memset(&stock, 0, sizeof stock);
+    nv2a_host_opts_set(&stock);
+}
+
 int main(void)
 {
     test_request();
     test_merge();
     test_race();
+    test_r1();
     if (fails) {
         printf("host_opts_live: %d failure(s)\n", fails);
         return 1;

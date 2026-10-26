@@ -19,8 +19,6 @@
 
 #define LOGP "[ENHANCE] "
 #define SCALE_MAX 4
-/* display.overscan: 10% of a 640-wide frame a side, past any TV's overscan */
-#define OVERSCAN_MAX 64
 
 static int path_is_absolute(const char *p)
 {
@@ -156,10 +154,10 @@ int xbox_enhance_init(const char *root, const char *title)
      * left a border its CRT hid. Under hor+ the 4:3 edges sit inside the
      * padded frame, where no source rectangle can cut them: refused. */
     overscan = enhance_cfg_int("display.overscan", 0);
-    if (overscan < 0 || overscan > OVERSCAN_MAX) {
-        long long c = overscan < 0 ? 0 : OVERSCAN_MAX;
-        fprintf(stderr, LOGP "display.overscan=%lld out of range 0..%d; using %lld\n",
-                overscan, OVERSCAN_MAX, c);
+    if (overscan < 0 || overscan > NV2A_OVERSCAN_MAX) {
+        long long c = overscan < 0 ? 0 : NV2A_OVERSCAN_MAX;
+        fprintf(stderr, LOGP "display.overscan=%lld out of range 0..%u; using %lld\n",
+                overscan, NV2A_OVERSCAN_MAX, c);
         overscan = c;
     }
     if (overscan && o.aspect_w) {
@@ -217,4 +215,12 @@ int xbox_enhance_init(const char *root, const char *title)
     /* No enhance_cfg_report_unused() here: the title reads its own keys
      * (game.mode, say) after this, and calls it then. */
     return rc;
+}
+
+void xbox_enhance_set_pacing(int mode)
+{
+    if (mode != XBOX_PACING_SPIN && mode != XBOX_PACING_SLEEP)
+        return;
+    xbox_PacingSetMode(mode);
+    fprintf(stderr, LOGP "present.pacing=%s (live)\n", s_pacing[mode]);
 }
