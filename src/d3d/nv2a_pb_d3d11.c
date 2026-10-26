@@ -112,6 +112,10 @@ static int memo_on(void)
     return s_memo;
 }
 
+/* Low latency (RECOMP_D3D11_LOW_LATENCY=0: off): one frame queued at most, and
+ * with vsync off a tearing present, which skips the compositor's frame. */
+static UINT                    s_swap_flags, s_present_flags;
+
 /* The pipeline state last bound, so a batch binding the same again skips
  * the call. Only state this file alone sets and nothing unbinds behind it;
  * SRVs (which the runtime nulls on a render-target hazard), the vertex and
@@ -634,9 +638,33 @@ static int init(void)
     sd.OutputWindow = s_hwnd;
     sd.Windowed = TRUE;
     sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
+    {
+        const char *e = getenv("RECOMP_D3D11_LOW_LATENCY");
+        if (!(e && e[0] == '0') && !s_sync_interval)
+            sd.Flags = 0x800;   /* DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING */
+    }
     hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
                                        NULL, 0, D3D11_SDK_VERSION, &sd,
                                        &s_swap, &s_dev, &fl, &s_ctx);
+    if (FAILED(hr) && sd.Flags) {       /* no tearing support: as before */
+        sd.Flags = 0;
+        hr = D3D11CreateDeviceAndSwapChain(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0,
+                                           NULL, 0, D3D11_SDK_VERSION, &sd,
+                                           &s_swap, &s_dev, &fl, &s_ctx);
+    }
+    s_swap_flags = sd.Flags;
+    s_present_flags = sd.Flags ? 0x200u : 0u;   /* DXGI_PRESENT_ALLOW_TEARING */
+    if (SUCCEEDED(hr)) {
+        const char *e = getenv("RECOMP_D3D11_LOW_LATENCY");
+        IDXGIDevice1 *d1 = NULL;
+        if (!(e && e[0] == '0')
+                && SUCCEEDED(ID3D11Device_QueryInterface(s_dev, &IID_IDXGIDevice1, (void **)&d1)) && d1) {
+            IDXGIDevice1_SetMaximumFrameLatency(d1, 1);
+            IDXGIDevice1_Release(d1);
+        }
+        fprintf(stderr, LOGP "low latency: %s, tearing present %s\n",
+                (e && e[0] == '0') ? "off" : "frame latency 1", s_present_flags ? "on" : "off");
+    }
     if (FAILED(hr)) {
         fprintf(stderr, LOGP "D3D11CreateDeviceAndSwapChain hr=0x%08lX\n",
                 (unsigned long)hr);
@@ -4270,7 +4298,7 @@ static void swap_resize(UINT cw, UINT ch)
         ID3D11Texture2D_Release(s_back);
         s_back = NULL;
     }
-    hr = IDXGISwapChain_ResizeBuffers(s_swap, 0, cw, ch, DXGI_FORMAT_UNKNOWN, 0);
+    hr = IDXGISwapChain_ResizeBuffers(s_swap, 0, cw, ch, DXGI_FORMAT_UNKNOWN, s_swap_flags);
     if (FAILED(hr))
         fprintf(stderr, LOGP "ResizeBuffers %ux%u hr=0x%08lX\n", cw, ch, (unsigned long)hr);
     IDXGISwapChain_GetBuffer(s_swap, 0, &IID_ID3D11Texture2D, (void **)&s_back);
@@ -4514,7 +4542,7 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
                    : 0xDEADBEEFu;
     s_presents++;
     dump_frame();
-    hr = IDXGISwapChain_Present(s_swap, s_sync_interval, 0);
+    hr = IDXGISwapChain_Present(s_swap, s_sync_interval, s_sync_interval ? 0 : s_present_flags);
     if (FAILED(hr) && s_presents < 4)
         fprintf(stderr, LOGP "Present hr=0x%08lX\n", (unsigned long)hr);
     /* FLIP_DISCARD unbinds the back buffer; the next frame rebinds its own
