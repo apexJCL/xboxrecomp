@@ -90,6 +90,8 @@ static volatile UINT           s_client_w, s_client_h;
 static ID3D11RenderTargetView *s_back_rtv;
 static int                     s_dump_rt;
 static compile_fn              s_compile;
+typedef HRESULT (WINAPI *create_blob_fn)(SIZE_T, ID3DBlob **);
+static create_blob_fn          s_create_blob;   /* D3DCreateBlob, for the shader cache */
 
 static ID3D11Buffer           *s_cb_consts;     /* b1: c[192]            */
 static ID3D11Buffer           *s_cb_vp;         /* b2: viewport, fog, specular */
@@ -339,12 +341,82 @@ static void pump(void)
     xbox_InputMouseWin32Sync(s_hwnd);
 }
 
+/* Shader cache: every HLSL source is compiled the first time a title needs
+ * it, mid-frame, which is a hitch of a few to tens of milliseconds each time
+ * a new combination of render state shows up. The compiled blob is kept on
+ * disk, named by a hash of target + source, and loaded instead the next time
+ * (the next run too). RECOMP_SHADER_CACHE=<dir> picks the folder (default
+ * shadercache\ in the working directory), =0 turns it off. The totals go to
+ * the log every 64 compiles and at exit, to tell hitches from compiles. */
+static uint64_t s_sc_compiles, s_sc_hits;
+static double   s_sc_ms;
+
+static const char *shader_cache_dir(void)
+{
+    static char dir[MAX_PATH];
+    static int init;
+    if (!init) {
+        const char *e = getenv("RECOMP_SHADER_CACHE");
+        init = 1;
+        if (e && e[0] == '0' && !e[1])
+            dir[0] = 0;
+        else {
+            snprintf(dir, sizeof dir, "%s", e && *e ? e : "shadercache");
+            CreateDirectoryA(dir, NULL);
+        }
+    }
+    return dir[0] ? dir : NULL;
+}
+
+static uint64_t fnv64(uint64_t h, const char *p, size_t n)
+{
+    size_t i;
+    for (i = 0; i < n; i++)
+        h = (h ^ (uint8_t)p[i]) * 1099511628211ull;
+    return h;
+}
+
 static int compile(const char *what, const char *src, const char *target,
                    ID3DBlob **code)
 {
     ID3DBlob *err = NULL;
-    HRESULT hr = s_compile(src, strlen(src), what, NULL, NULL, "main", target,
-                           D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, code, &err);
+    const char *dir = s_create_blob ? shader_cache_dir() : NULL;
+    char path[MAX_PATH + 32];
+    size_t n = strlen(src);
+    LARGE_INTEGER t0, t1, fq;
+    HRESULT hr;
+
+    if (dir) {
+        uint64_t h = fnv64(fnv64(14695981039346656037ull, target, strlen(target)), src, n);
+        FILE *f;
+        snprintf(path, sizeof path, "%s\\%016llx.cso", dir, (unsigned long long)h);
+        f = fopen(path, "rb");
+        if (f) {
+            long sz;
+            fseek(f, 0, SEEK_END);
+            sz = ftell(f);
+            fseek(f, 0, SEEK_SET);
+            if (sz > 32 && SUCCEEDED(s_create_blob((SIZE_T)sz, code))
+                    && fread(ID3D10Blob_GetBufferPointer(*code), 1, (size_t)sz, f) == (size_t)sz) {
+                /* DXBC: the magic, and the container's own size at byte 24. */
+                const uint8_t *b = (const uint8_t *)ID3D10Blob_GetBufferPointer(*code);
+                uint32_t total = b[24] | b[25] << 8 | b[26] << 16 | (uint32_t)b[27] << 24;
+                if (!memcmp(b, "DXBC", 4) && total == (uint32_t)sz) {
+                    fclose(f);
+                    s_sc_hits++;
+                    return 1;
+                }
+            }
+            if (*code) { ID3D10Blob_Release(*code); *code = NULL; }
+            fclose(f);
+            remove(path);   /* unreadable or not bytecode: compiled again below */
+        }
+    }
+    QueryPerformanceCounter(&t0);
+    hr = s_compile(src, n, what, NULL, NULL, "main", target,
+                   D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, code, &err);
+    QueryPerformanceCounter(&t1);
+    QueryPerformanceFrequency(&fq);
     if (FAILED(hr)) {
         fprintf(stderr, LOGP "compile %s failed hr=0x%08lX\n%s\n", what,
                 (unsigned long)hr,
@@ -355,6 +427,29 @@ static int compile(const char *what, const char *src, const char *target,
         return 0;
     }
     if (err) ID3D10Blob_Release(err);
+    {
+        double ms = (double)(t1.QuadPart - t0.QuadPart) * 1000.0 / (double)fq.QuadPart;
+        s_sc_ms += ms;
+        if (ms >= 4.0 && s_sc_compiles < 200)
+            fprintf(stderr, LOGP "shader %s compiled in %.1f ms (flip %llu)\n", what, ms,
+                    (unsigned long long)s_presents);
+    }
+    if (++s_sc_compiles % 64 == 0)
+        fprintf(stderr, LOGP "shaders: %llu compiled (%.0f ms), %llu from the cache\n",
+                (unsigned long long)s_sc_compiles, s_sc_ms, (unsigned long long)s_sc_hits);
+    if (dir) {
+        char tmp[MAX_PATH + 40];
+        FILE *f;
+        snprintf(tmp, sizeof tmp, "%s.tmp%lu", path, GetCurrentThreadId());
+        f = fopen(tmp, "wb");
+        if (f) {
+            size_t sz = ID3D10Blob_GetBufferSize(*code);
+            int ok = fwrite(ID3D10Blob_GetBufferPointer(*code), 1, sz, f) == sz;
+            ok &= fclose(f) == 0;
+            if (!ok || !MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING))
+                DeleteFileA(tmp);
+        }
+    }
     return 1;
 }
 
@@ -473,6 +568,8 @@ static int init(void)
     dll = LoadLibraryA("d3dcompiler_47.dll");
     if (dll)
         s_compile = (compile_fn)(void (*)(void))GetProcAddress(dll, "D3DCompile");
+    if (dll)
+        s_create_blob = (create_blob_fn)(void (*)(void))GetProcAddress(dll, "D3DCreateBlob");
     if (!s_compile) {
         fprintf(stderr, LOGP "no D3DCompile in d3dcompiler_47.dll\n");
         return 0;
