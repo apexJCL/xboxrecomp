@@ -256,6 +256,16 @@ typedef struct NV2ACombinerState {
      * (nv2a_aspect_place). A backend flag, set only while display.aspect
      * pads targets, so the stock shader text is unchanged; in the cache key. */
     int rt_offset;
+
+    /* W-buffered depth (SET_CONTROL0 Z_PERSPECTIVE_ENABLE): the pixel's depth
+     * is its clip w over the zeta format's maximum, written as SV_Depth from
+     * SV_Position.w (the rasteriser's perspective-correct w). 0: off; else
+     * the maximum, 16777215 (Z24S8) or 65535 (Z16). A backend flag. */
+    uint32_t w_depth;
+    /* Its polygon offset (SET_POLYGON_OFFSET_*), which D3D11's DepthBias
+     * does not apply to a shader-written depth: factor per guest pixel of
+     * slope (already times the render scale) and units of 1/w_depth. */
+    float w_po_factor, w_po_units;
 } NV2ACombinerState;
 
 /**

@@ -116,7 +116,23 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
             break;
         }
 
-    EMIT("float4 main(PS_IN i) : SV_Target {\n");
+    if (state->w_depth) {
+        /* W-buffer: what NV2A stores is w, linear in eye distance, not z/w.
+         * Kung Fu Chaos's depth of field draws full-screen quads at a w
+         * threshold that only far pixels lie behind; against z/w (~0.97)
+         * every pixel did, and the whole match came out blurred. */
+        EMIT("float4 main(PS_IN i, out float oDepth : SV_Depth) : SV_Target {\n");
+        EMIT("    oDepth = i.pos.w * (1.0 / %u.0);\n", (unsigned)state->w_depth);
+        /* Polygon offset, which D3D11's DepthBias leaves out of a written
+         * depth: the carousel's film strip draws its frames over the strip
+         * at the same depth and tore without it. */
+        if (state->w_po_factor != 0.0f || state->w_po_units != 0.0f)
+            EMIT("    oDepth += %.9g * max(abs(ddx(oDepth)), abs(ddy(oDepth))) + %.9g;\n",
+                 state->w_po_factor, state->w_po_units / (float)state->w_depth);
+        EMIT("    oDepth = saturate(oDepth);\n");
+    } else {
+        EMIT("float4 main(PS_IN i) : SV_Target {\n");
+    }
     for (k = 0; k < 16; k++)
         EMIT("    float4 x%d = 0;\n", k);
     if (state->fog_input)

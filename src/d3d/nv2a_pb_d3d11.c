@@ -1591,6 +1591,35 @@ static Stage s_stage[4];
 static const char   *s_stage_src[4];
 static RenderTarget *s_stage_rt[4];
 
+/* RECOMP_D3D11_NO_POLY_OFFSET=1: the title's polygon offset is left out, in
+ * the rasterizer state and in a W-buffered shader alike (A/B). */
+static int poly_offset_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_D3D11_NO_POLY_OFFSET");
+        on = !(e && e[0] == '1');
+    }
+    return on;
+}
+
+/* W-buffered depth for the batch (SET_CONTROL0 bit 16, Z_PERSPECTIVE_ENABLE):
+ * 2 on a Z24S8 zeta surface, 1 on Z16, 0 when the title asked for z/w.
+ * Only the combiner shaders write it (NV2ACombinerState.w_depth); the XDK
+ * programs the combiners for every draw. RECOMP_D3D11_W_DEPTH=0: z/w. */
+static uint32_t w_depth(void)
+{
+    static int off = -1;
+    const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
+    if (off < 0) {
+        const char *e = getenv("RECOMP_D3D11_W_DEPTH");
+        off = e && e[0] == '0';
+    }
+    if (off || !(v->control0 & 0x10000u))
+        return 0;
+    return ((nv2a_pb_gpu_state()->format >> 4) & 0xF) == 2 ? 2u : 1u;
+}
+
 #define TEX_MAX_TEXELS (2048u * 2048u)
 #define TEX_CACHE 512   /* array bound; entries in use: tex_cache_n() */
 typedef struct {
@@ -2809,13 +2838,13 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
         /* The registers and modes that make the state: the same as the last
          * batch's give the same state and so the same shader. */
         static struct {
-            uint32_t r[38];
+            uint32_t r[40];
             int      key_ok, ps_ok;   /* s_last_rc is r's state; ps is its shader */
             ID3D11PixelShader *ps;
             RcEntry *e;
             uint64_t compiles;
         } memo;
-        uint32_t key[38];
+        uint32_t key[40];
         int hit;
         memcpy(key, v->rc_cicw, 32);
         memcpy(key + 8, v->rc_aicw, 32);
@@ -2826,8 +2855,19 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
         key[34] = v->rc_fcw1;
         key[35] = modes;
         /* render.scale changes at run time: each scale class has its own text */
-        key[36] = (nv2a_host_render_scale() > 1) | (nv2a_host_opts()->aspect_w ? 2u : 0u);
+        key[36] = (nv2a_host_render_scale() > 1) | (nv2a_host_opts()->aspect_w ? 2u : 0u)
+                | (w_depth() << 2);
         key[37] = inputs;
+        {
+            /* W-buffered: the polygon offset goes into the shader text */
+            float fac = 0.0f, units = 0.0f;
+            if (w_depth() && v->poly_offset && poly_offset_on()) {
+                fac = v->poly_factor * (float)nv2a_host_render_scale();
+                units = v->poly_bias;
+            }
+            memcpy(&key[38], &fac, 4);
+            memcpy(&key[39], &units, 4);
+        }
         hit = memo_on() && memo.key_ok && !memcmp(memo.r, key, sizeof key);
         if (!hit) {
             d3d8_combiners_from_regs(v->rc_cicw, v->rc_aicw, v->rc_cocw,
@@ -2835,7 +2875,10 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
                                      v->rc_fcw1, modes, &st);
             st.fog_input = 1;   /* FOG.a is the interpolated vertex fog factor */
             st.rect_snap = (int)(key[36] & 1u);   /* nv2a_snap_uv; in rc_hash via st */
-            st.rt_offset = (int)(key[36] >> 1);    /* hor+: tex_scale.w, nv2a_aspect_place */
+            st.rt_offset = (int)(key[36] >> 1 & 1u);   /* hor+: tex_scale.w, nv2a_aspect_place */
+            st.w_depth = (key[36] >> 2) == 2u ? 16777215u : (key[36] >> 2) == 1u ? 65535u : 0u;
+            memcpy(&st.w_po_factor, &key[38], 4);
+            memcpy(&st.w_po_units, &key[39], 4);
             for (n = 0; n < 4; n++)
                 st.tex_input[n] = (int)((inputs >> (4 * n)) & 0xF);
             st.bump_on = 1;
