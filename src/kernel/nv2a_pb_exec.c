@@ -1115,9 +1115,11 @@ static void present_note(int clear)
 
 /* Whether s_psurf[i] is in use and (with a display mode) at the pitch
  * `want` -- the display's, or twice it for fields. */
+static uint32_t s_present_field_h;  /* in a field mode, a field's height; else 0 */
 static int present_pitch_ok(int i, uint32_t want)
 {
-    return s_psurf[i].offset && (!want || s_psurf[i].pitch == want);
+    return s_psurf[i].offset && (!want || s_psurf[i].pitch == want)
+        && (!s_present_field_h || s_psurf[i].h <= s_present_field_h);
 }
 
 /* Drawn or cleared within the last present_stale flips. */
@@ -1151,14 +1153,26 @@ static void present_pick(void)
     for (i = 0; i < SCANOUT_MAX; i++)
         if (!scanout_live(i))
             s_scanout[i].phys = 0;
+    /* Only a surface as wide as the mode can be what the CRTC scans. Kung Fu
+     * Chaos sets a field mode (pitch 1280) for a match, draws its 640x240
+     * fields at 2560 into the display buffers, and also keeps a 320x240
+     * offscreen target at 1280: counting that one latched the display pitch,
+     * ruled the fields out, and the offscreen frame was shown without the HUD
+     * drawn over the fields. */
     for (i = 0; i < PRESENT_MAX && disp_pitch && s_pitch_seen != disp_pitch; i++)
         if (s_psurf[i].offset && s_psurf[i].pitch == disp_pitch
-                && s_psurf[i].last_flip >= s_mode_flip)
+                && s_psurf[i].last_flip >= s_mode_flip
+                && (!disp_w || s_psurf[i].w >= disp_w))
             s_pitch_seen = disp_pitch;
     if (disp_pitch && s_pitch_seen != disp_pitch)
         want = disp_pitch << 1;
 
     s_present_want = disp ? want : 0;
+    /* At twice the display pitch the CRTC scans fields, each half the mode's
+     * height: a full-height surface at that pitch is offscreen. Kung Fu Chaos's
+     * pause draws one 640x480 quad at 2560 into its blur target, and that was
+     * shown instead of the 640x240 fields with the menu on them. */
+    s_present_field_h = (disp && disp_h && want == disp_pitch << 1) ? disp_h / 2 : 0;
 
     /* Size, pass 0: the largest fresh surface at the display address or a
      * scanout offset, else the largest stale one there (which leaves no
@@ -1166,6 +1180,7 @@ static void present_pick(void)
     for (i = 0; disp && i < PRESENT_MAX; i++) {
         uint64_t a = (uint64_t)s_psurf[i].w * s_psurf[i].h;
         if (!present_pitch_ok(i, want)
+                || (disp_w && s_psurf[i].w < disp_w)   /* narrower than the mode: offscreen */
                 || !present_scanout(dma_resolve(s_psurf[i].offset) & 0x0FFFFFFFu,
                                     disp & 0x0FFFFFFFu))
             continue;
