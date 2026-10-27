@@ -22,7 +22,7 @@ else()
         target_sources(xbox_video PRIVATE fb_present_metal.m)
         target_link_libraries(xbox_video PUBLIC
             "-framework Metal" "-framework QuartzCore" "-framework CoreGraphics"
-            "-framework Foundation")
+            "-framework Foundation" "-framework AppKit")
     endif()
 endif()
 target_include_directories(xbox_video PUBLIC

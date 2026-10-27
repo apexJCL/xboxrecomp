@@ -22,4 +22,10 @@ int   fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
                   uint32_t pad, int filter, const char *shot_path, uint32_t flip,
                   const struct nv2a_ovl_list *const *layers, int nlayers);
 
+/* The window's NSWindow level: above the menu bar and the Dock
+ * (kCGMainMenuWindowLevel + 1, where SDL puts a fullscreen window without
+ * Spaces) when top, else the normal level. Any SDL window, on either
+ * present path. 1 when the level changed. */
+int   fbm_window_level(SDL_Window *win, int top);
+
 #endif

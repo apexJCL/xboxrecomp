@@ -86,6 +86,8 @@ struct nv2a_ovl_image { const uint32_t *px; uint32_t w, h; uint64_t gen; };
  * hook; stock leaves the overlay disarmed. */
 int nv2a_overlay_arm(uint32_t layers, uint32_t out_h);
 int nv2a_overlay_armed(void);
+/* Whether layer l is armed (the menu: menu.enabled at enhance init). */
+int nv2a_overlay_layer_armed(enum nv2a_overlay_layer l);
 
 /* The stats strip shown or hidden (overlay.stats; the action of that
  * name). Arms STATS first if needed; a no-op while disarmed. */

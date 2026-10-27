@@ -724,30 +724,56 @@ static void present_filter_set(SDL_Renderer *ren, SDL_Texture *tex, uint32_t w, 
 
 #if defined(__APPLE__)
 /* Whether present.fullscreen is a borderless window over the display (as
- * the D3D11 popup is) rather than a Spaces fullscreen. A Spaces toggle is
- * an animated transition macOS skips for an app that is not frontmost: it
- * changes nothing yet SDL reports success, so a live switch (the menu,
- * opts_at) did nothing. SDL_RaiseWindow before the toggle is not the
- * fix: whether a background app may come forward is macOS's call (it may
- * only bounce the Dock icon), and a menu switch should not steal focus.
- * Stock runs keep Spaces, so the green button and Ctrl-Cmd-F behave as in
- * any Mac app; only a run that can switch fullscreen itself (fullscreen
- * configured, the overlay armed for the menu, or opts_at) goes borderless.
- * The policy for those runs is not settled: MAC_SPACES_OFF_LIVE 0 keeps
- * Spaces everywhere. SDL_VIDEO_MAC_FULLSCREEN_SPACES in the environment
- * wins over either (SDL reads the hint's environment variable first). */
-#define MAC_SPACES_OFF_LIVE 1
-static int mac_spaces_off(void)
+ * the D3D11 popup is) rather than a Spaces fullscreen. SDL3 defaults
+ * SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES on, which makes every fullscreen
+ * a new Space: a slide animation at start and at every switch, and a
+ * switch macOS skips for an app that is not frontmost while SDL reports
+ * success, so a live switch (the menu, opts_at) did nothing.
+ * SDL_RaiseWindow before the switch is not the fix: whether a background
+ * app may come forward is macOS's call (it may only bounce the Dock
+ * icon), and a menu switch should not steal focus. Without Spaces SDL
+ * makes the same window borderless at the display's size in place, above
+ * the menu bar and the Dock, but the title bar's green button then zooms
+ * instead. So stock runs keep Spaces, and the green button and
+ * Ctrl-Cmd-F behave as in any Mac app; a run that asks for fullscreen
+ * itself (fullscreen configured, the in-game menu armed, or opts_at)
+ * goes borderless. SDL_VIDEO_MAC_FULLSCREEN_SPACES in the environment
+ * wins over either (SDL reads the hint's environment variable first).
+ * SDL caches the hint when Cocoa video starts, so it has to be set
+ * before SDL_Init(SDL_INIT_VIDEO). Returns why the run goes borderless,
+ * for the log, or NULL. */
+static const char *mac_spaces_off(void)
 {
-    if (!MAC_SPACES_OFF_LIVE)
-        return 0;
-    if (nv2a_host_opts()->fullscreen || recomp_env(RENV_OPTS_AT))
-        return 1;
+    if (nv2a_host_opts()->fullscreen)
+        return "present.fullscreen";
+    if (recomp_env(RENV_OPTS_AT))
+        return "opts_at";
 #ifdef XBOXRECOMP_ENHANCE
-    if (nv2a_overlay_armed())
-        return 1;
+    if (nv2a_overlay_layer_armed(NV2A_OVL_MENU))
+        return "the menu can switch it";
 #endif
-    return 0;
+    return NULL;
+}
+
+/* SDL puts a fullscreen window without Spaces above the menu bar and the
+ * Dock and leaves it there when the app loses focus, so after Cmd-Tab the
+ * game would still cover the display while keys go to an app nobody can
+ * see. The D3D11 popup is not topmost, and Alt-Tab uncovers the desktop;
+ * this does the same here: the normal level while the window has no
+ * focus, back above the menu bar when it has. Checked on every pass (the
+ * level is read, not remembered), so SDL raising it again on its own is
+ * undone at once. SDL_HINT_ALLOW_TOPMOST=0 is not the fix: the menu bar
+ * and the Dock would then draw over the focused game. */
+static void mac_fullscreen_level(SDL_Window *win, int full, int spaces_off)
+{
+    int top;
+
+    if (!full || !spaces_off)
+        return;
+    top = (SDL_GetWindowFlags(win) & SDL_WINDOW_INPUT_FOCUS) != 0;
+    if (fbm_window_level(win, top))
+        fprintf(stderr, "[PRESENT] macOS fullscreen: %s\n",
+                top ? "focused, above the menu bar" : "no focus, normal window level");
 }
 #endif
 
@@ -772,6 +798,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     const struct nv2a_host_opts *eo = nv2a_host_opts();
     int filter = eo->present_filter;
     int full = eo->fullscreen;   /* present.fullscreen as last applied here */
+#if defined(__APPLE__)
+    int spaces_off = 0;          /* fullscreen is borderless, not a Space */
+#endif
     uint32_t opts_gen = nv2a_host_opts_gen();
     SDL_FRect dst;               /* integer: where the frame goes */
     int dst_ok = 0, out_w = 0, out_h = 0;
@@ -793,10 +822,17 @@ int xbox_HostWindowMain(int (*guest_main)(void))
     shot_parse();
 
 #if defined(__APPLE__)
-    if (mac_spaces_off()) {
-        SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0");
-        fprintf(stderr, "[PRESENT] macOS fullscreen: borderless, no Spaces"
-                        " (a live switch is armed)\n");
+    {
+        const char *why = mac_spaces_off();
+        /* The environment's value outranks a normal-priority hint, and
+         * SDL_SetHint then fails: say what the run really gets. */
+        if (why && SDL_SetHint(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, "0"))
+            fprintf(stderr, "[PRESENT] macOS fullscreen: borderless, no Spaces (%s)\n",
+                    why);
+        else if (why)
+            fprintf(stderr, "[PRESENT] macOS fullscreen: Spaces kept"
+                            " (SDL_VIDEO_MAC_FULLSCREEN_SPACES in the environment)\n");
+        spaces_off = !SDL_GetHintBoolean(SDL_HINT_VIDEO_MAC_FULLSCREEN_SPACES, true);
     }
 #endif
     if (!SDL_Init(SDL_INIT_VIDEO | SDL_INIT_EVENTS | SDL_INIT_GAMEPAD)) {
@@ -930,6 +966,9 @@ int xbox_HostWindowMain(int (*guest_main)(void))
         /* The capture can change on the poll thread (the release key, a
          * script); relative mode has to be set here, on the window's. */
         xbox_InputSdlMouseSync(win);
+#if defined(__APPLE__)
+        mac_fullscreen_level(win, full, spaces_off);
+#endif
         /* Pads come and go here, on the thread that pumps their events
          * (xinput_device.c says why it cannot be a poll thread). */
         xbox_InputSdlPadSync();

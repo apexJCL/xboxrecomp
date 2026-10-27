@@ -39,6 +39,7 @@
  */
 #if defined(__APPLE__)
 
+#import <AppKit/AppKit.h>
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/CAMetalLayer.h>
@@ -648,6 +649,18 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
         ok = 1;
     }
     return ok;
+}
+
+int fbm_window_level(SDL_Window *win, int top)
+{
+    NSWindow *w = (NSWindow *)SDL_GetPointerProperty(SDL_GetWindowProperties(win),
+                                                     SDL_PROP_WINDOW_COCOA_WINDOW_POINTER, NULL);
+    NSWindowLevel want = top ? kCGMainMenuWindowLevel + 1 : NSNormalWindowLevel;
+
+    if (!w || [w level] == want)
+        return 0;
+    [w setLevel:want];
+    return 1;
 }
 
 #endif /* __APPLE__ */

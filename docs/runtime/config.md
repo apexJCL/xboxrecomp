@@ -372,11 +372,23 @@ same requests at given flips, to check a switch without the menu.
   start, with no mode change (SDL `SDL_WINDOW_FULLSCREEN` at the desktop mode; D3D11 a `WS_POPUP`
   the primary monitor's size). Live: on and off while the game runs (the
   D3D11 window goes back to the size it had, or to the starting size). The
-  CPU backend's Win32 GDI window does not follow it. On macOS this is not a
-  Spaces fullscreen: the presenter sets `SDL_VIDEO_MAC_FULLSCREEN_SPACES=0`
-  as its default, because a Spaces toggle in an app that is not frontmost
-  does nothing while SDL reports success. Setting that variable to `1` in
-  the environment brings Spaces back.
+  CPU backend's Win32 GDI window does not follow it.
+  - *macOS.* A borderless window over the whole display (menu bar row
+    included), with no Space and no slide animation, when fullscreen is
+    configured, the in-game menu is armed or `opts_at` is set: the presenter
+    sets `SDL_VIDEO_MAC_FULLSCREEN_SPACES=0` before `SDL_Init` (a Spaces
+    switch in an app that is not frontmost does nothing). The window drops
+    to the normal level while it has no focus, so Cmd-Tab uncovers the
+    desktop, and the green button zooms. A player config arms the menu, so
+    in practice only stock and golden runs keep Spaces. The variable in the
+    environment overrides either way.
+  - *Linux (native SDL).* SDL's desktop fullscreen, a borderless window at
+    the display mode. Under gamescope (Steam Game Mode) every window already
+    fills the output, so the key makes little difference there; under
+    Proton the D3D11 popup applies.
+  - The mouse capture (`input.mouse_capture`) is SDL's relative mode on the
+    window, which follows the window through a switch; the Win32 cursor
+    clip is re-applied on `WM_SIZE` and `WM_MOVE`.
 - **`present.surface`.** Who scales the frame to the screen. `window` is
   the stock behaviour: the swap chain follows the window, and the game
   scales the frame into it as `present.filter` says. `internal` makes the

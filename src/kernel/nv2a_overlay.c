@@ -172,6 +172,11 @@ int nv2a_overlay_armed(void)
     return __atomic_load_n(&s_armed, __ATOMIC_ACQUIRE);
 }
 
+int nv2a_overlay_layer_armed(enum nv2a_overlay_layer l)
+{
+    return (unsigned)l < NV2A_OVL_COUNT && layer_armed(l);
+}
+
 void nv2a_overlay_set_stats(int on)
 {
     if (!nv2a_overlay_armed())
