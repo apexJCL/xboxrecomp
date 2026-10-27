@@ -549,6 +549,15 @@ static struct {
     uint32_t max, last;
 } s_cap;
 
+/* Every phase change goes through here: while a capture runs the actions
+ * fire nothing, so the input being captured never also does what it is
+ * bound to now. */
+static void cap_phase(int phase)
+{
+    s_cap.phase = phase;
+    enhance_actions_quiet(phase != CAP_OFF);
+}
+
 /* input */
 static uint32_t s_held[PORTS], s_prev_held;
 static unsigned char s_kprev[256];
@@ -1073,7 +1082,7 @@ int enhance_menu_open(uint64_t now_ms)
     }
     s_state = ST_OPEN;
     s_confirm = 0;
-    s_cap.phase = CAP_OFF;
+    cap_phase(CAP_OFF);
     /* One new number for the released pad, far from the real sequence: a
      * pad that changed once while the menu was open would otherwise come
      * back on this same number, and a title that skips a repeated number
@@ -1092,7 +1101,7 @@ void enhance_menu_close(void)
         return;
     s_state = ST_CLOSING;
     s_close_t = s_now;
-    s_cap.phase = CAP_OFF;
+    cap_phase(CAP_OFF);
     s_confirm = 0;
     snapshot_use(0);
     stats_page_use();
@@ -1244,7 +1253,7 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
         }
         case R_BIND:
             if (ok) {
-                s_cap.phase = CAP_RELEASE;
+                cap_phase(CAP_RELEASE);
                 s_cap.id = r->ref;
                 s_cap.t0 = now_ms;
                 s_cap.max = s_cap.last = 0;
@@ -1340,9 +1349,9 @@ static int chord_same(const char *a, const char *b)
 static void capture_finish(const char *text)
 {
     bind_list l;
-    char why[128];
-    int n, id = s_cap.id;
-    s_cap.phase = CAP_OFF;
+    char why[128], bound[ENHANCE_ACTION_TEXT];
+    int n, id = s_cap.id, owner;
+    cap_phase(CAP_OFF);
     if (!enhance_action_check(text, why, sizeof why)) {
         status("%s refused: %s", text, why);
         nv2a_overlay_toast("%s refused: %s", text, why);
@@ -1354,6 +1363,18 @@ static void capture_finish(const char *text)
             status("%s is bound already", text);
             return;
         }
+    /* One input, one action: a key or chord another action has would fire
+     * both (a Deck grip that Steam Input sends as F10, menu.open's). Clear
+     * it there first. */
+    owner = enhance_action_owner(text, id, bound, sizeof bound);
+    if (owner >= 0) {
+        const char *who = enhance_action_label(owner);
+        status("%s refused: %s has it (%s); clear it there first", text,
+               who ? who : "another action", bound);
+        nv2a_overlay_toast("%s refused: %s has it (%s); clear it there first", text,
+                           who ? who : "another action", bound);
+        return;
+    }
     if (n >= ENHANCE_ACTION_BINDS) {
         status("%s refused: %d bindings at most", text, ENHANCE_ACTION_BINDS);
         return;
@@ -1388,14 +1409,14 @@ static int capture_step(uint32_t held, uint64_t now)
     if (s_cap.phase == CAP_OFF)
         return 0;
     if (now - s_cap.t0 >= CAPTURE_MS) {
-        s_cap.phase = CAP_OFF;
+        cap_phase(CAP_OFF);
         status("Capture timed out");
         return 1;
     }
     if (s_cap.phase == CAP_RELEASE) {
         /* The press that started the capture (A, Enter) must go first. */
         if (!held && !any_key_down())
-            s_cap.phase = CAP_ARMED;
+            cap_phase(CAP_ARMED);
         return 1;
     }
     for (int vk = 8; vk < 256; vk++) {
@@ -1405,7 +1426,7 @@ static int capture_step(uint32_t held, uint64_t now)
         if (!down || s_kprev[vk] || is_modifier(vk))
             continue;
         if (vk == 0x1B) {   /* Esc */
-            s_cap.phase = CAP_OFF;
+            cap_phase(CAP_OFF);
             status("Capture cancelled");
             return 1;
         }
@@ -1893,6 +1914,8 @@ void enhance_menu_hook(unsigned port, uint32_t held, XBOX_INPUT_STATE *st, uint6
         }
         break;
     case ST_OPEN:
+        /* Quiet keeps menu.open from firing during a capture; the phase
+         * test stays in case a request was queued before it began. */
         if (enhance_actions_menu_request() && s_cap.phase == CAP_OFF)
             enhance_menu_close();
         else
@@ -2042,6 +2065,7 @@ void enhance_menu_reset_for_test(void)
     s_status_t = s_now = 0;
     s_nrow = 0;
     memset(&s_cap, 0, sizeof s_cap);
+    enhance_actions_quiet(0);
     memset(s_held, 0, sizeof s_held);
     s_prev_held = 0;
     memset(s_kprev, 0, sizeof s_kprev);

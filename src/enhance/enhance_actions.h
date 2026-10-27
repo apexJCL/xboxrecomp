@@ -52,7 +52,8 @@ void enhance_actions_drop_mods(void);
 /* How many times the action fired since the last call (0 for a bad id).
  * Any thread; each fire is counted once. */
 int enhance_action_pressed(int id);
-/* Whether one of the action's bindings is held now, past its hold. */
+/* Whether one of the action's bindings is held now, past its hold. A
+ * binding inside a longer one fires at its release and is never down. */
 int enhance_action_down(int id);
 /* The id of a name, -1 when none; the name of an id, NULL. */
 int enhance_action_find(const char *name);
@@ -110,6 +111,20 @@ int enhance_action_set_bindings(int id, const char *const *texts, int n);
  * its kind in why ("host-only", "a guest chord"...), 0 with the reason the
  * log would give. Logs nothing. */
 int enhance_action_check(const char *text, char *why, size_t n);
+
+/* The action other than except whose binding in effect takes the same
+ * input as text (the same key and modifiers, or the same pad members on
+ * the same port, whatever the hold), with that binding's text in bound;
+ * -1 when none. One input fires one action: the menu's capture refuses
+ * what another action owns, and a rebuild keeps one of two such bindings
+ * (menu.open's, else the written one over a default, else the first
+ * registered). */
+int enhance_action_owner(const char *text, int except, char *bound, size_t n);
+/* While on (the menu's capture), nothing fires: an input held meanwhile
+ * fires only after its release. Turning it off takes effect one port-0
+ * step later for keys and port 0 (at once for other ports), so a key that ended the capture before any step saw it held
+ * does not fire either. */
+void enhance_actions_quiet(int on);
 
 /* Called after every step (the pad filter's, on the poll thread, with st;
  * the flip tick's for port 0 when the title has stopped polling, st NULL),

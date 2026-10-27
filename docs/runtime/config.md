@@ -806,6 +806,48 @@ gets one line and the rest of the action's bindings stand:
    `guide+a`. A used member pressed before the modifiers goes to the game
    and does not complete the chord. The button that closes the menu stays
    masked after the close until it is let go.
+8. One input fires one action. Two bindings take the same input when they
+   are the same key with the same modifiers (`LAlt` and `RAlt` are two,
+   `Alt` matches either), or the same pad sources on the same port
+   whatever their holds. Of two such bindings, `menu.open`'s always keeps
+   the input, since the menu is the one place to repair a binding and on
+   the Deck under Proton F10 is the one way into it. Of any other two,
+   one written in a file or the menu beats a default, and otherwise the
+   action registered first keeps it (the toolkit's before the mods'); the
+   other is dropped with a line. So `overlay.stats = "F10"` leaves F10 on
+   `menu.open`:
+
+   ```
+   [INPUT] action overlay.stats: 'F10' refused: menu.open has it ('F10'); one input fires one action
+   ```
+
+   To move F10 to another action, give `menu.open` other bindings first
+   (`menu.open = ["guide+a", "paddle1"]`). A written binding that takes
+   the default of an action registered before it logs the default's side.
+   With a mod `zoom` whose `zoom.toggle` defaults to F6, registered before
+   the camera mod, `"camera.toggle" = "F6"` gives:
+
+   ```
+   [INPUT] action zoom.toggle (default): 'F6' gives way to camera.toggle ('F6')
+   ```
+
+   The menu's capture refuses such a binding outright, naming the owner
+   (`F10 refused: Open the menu has it (F10); clear it there first`). A
+   key and a pad source are never one binding: a Steam Input grip mapped
+   to F10 stays a key.
+9. The longest match fires. A pad binding whose sources all belong to a
+   longer binding on the same port (`guide` beside `guide+a`) waits: it
+   fires when it is let go after its hold, and only if no longer binding
+   was held whole meanwhile, whether or not that one fired. So holding
+   `back+start` past its hold, adding `left_thumb` and letting all go
+   before `back+start+left_thumb@400`'s hold fires neither: one press,
+   one action. Such a binding never reads as held down. A binding with no
+   longer one beside it fires on its press as before.
+10. Nothing fires while the menu captures a binding, nor on the first
+    keyboard step after it ends, which the key that ended it may reach
+    first. The keys
+    and buttons held during a capture stay spent until they are let go,
+    so the press being captured never fires its old action.
 
 The game may stop polling the pad (a loading screen). The flip then reads
 the host pad itself when a port has not been polled for 100 ms, so keys,

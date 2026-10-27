@@ -540,6 +540,31 @@ static void test_capture_duplicate(void)
     open_menu();
 }
 
+/* A key another action owns is refused, naming the owner: the
+ * Deck grip Steam Input sends as F10 must not land on the stats strip
+ * while F10 still opens the menu, or one press fires both. The capture
+ * itself fires nothing, so the menu stays open through it. */
+static void test_capture_owned(void)
+{
+    char before[128];
+    start_with(ARMED, k_mods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Controls"));
+    CHECK(enhance_menu_select_row("Stats strip"));
+    CHECK(row_value("Stats strip") != NULL);
+    snprintf(before, sizeof before, "%s", row_value("Stats strip") ? s_val : "");
+    tap(0x0D);
+    CHECK(enhance_menu_capturing());
+    tap(VK_F10);
+    CHECK(!enhance_menu_capturing());
+    CHECK(enhance_menu_is_open());
+    CHECK(strstr(enhance_menu_status(), "F10 refused: Open the menu has it (F10); clear it there first") != NULL);
+    CHECK(row_value("Stats strip") && !strcmp(s_val, before));
+    CHECK(enhance_menu_unsaved() == 0);
+    open_menu();
+    CHECK(!enhance_menu_is_open());
+}
+
 /* ---- 4. Controls: capture, refusal, clear; 5. Save ----------------------- */
 
 static void test_capture_and_save(void)
@@ -846,6 +871,7 @@ int main(int argc, char **argv)
     test_mods();
     test_capture_and_save();
     test_capture_duplicate();
+    test_capture_owned();
     test_mouse();
     test_snapshot();
     test_pages();

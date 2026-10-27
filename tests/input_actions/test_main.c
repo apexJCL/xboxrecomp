@@ -869,10 +869,10 @@ static void test_stick_mask(void)
 
 static void press_paddle(void)
 {
-    hold_extra(XBOX_HOST_PADDLE1, 1);
+    hold_extra(XBOX_HOST_PADDLE2, 1);
     poll0();
     advance(16);
-    hold_extra(XBOX_HOST_PADDLE1, 0);
+    hold_extra(XBOX_HOST_PADDLE2, 0);
     poll0();
     advance(16);
 }
@@ -889,7 +889,7 @@ static void test_stats_toggle(void)
     CHECK(strstr(out, "overlay.stats=off\n") != NULL);
 
     /* A feature key arms both layers, the strip hidden; each fire flips it. */
-    out = start(ARMED "[input.actions]\n\"overlay.stats\" = \"paddle1\"\n");
+    out = start(ARMED "[input.actions]\n\"overlay.stats\" = \"paddle2\"\n");
     CHECK(s_ovl_layers == ((1u << NV2A_OVL_STATS) | (1u << NV2A_OVL_TOAST)));
     CHECK(s_ovl_stats == 0);
     press_paddle();
@@ -899,7 +899,7 @@ static void test_stats_toggle(void)
 
     /* overlay.stats on: armed by its own key, shown at start, then off. */
     s_ovl_layers = 0;
-    out = start("[overlay]\nstats = true\n[input.actions]\n\"overlay.stats\" = \"paddle1\"\n");
+    out = start("[overlay]\nstats = true\n[input.actions]\n\"overlay.stats\" = \"paddle2\"\n");
     CHECK(s_ovl_layers == ((1u << NV2A_OVL_STATS) | (1u << NV2A_OVL_TOAST)));
     CHECK(strstr(out, "overlay.stats=on\n") != NULL);
     CHECK(strstr(out, "actions hook=on (overlay.stats)\n") != NULL);
@@ -1465,11 +1465,485 @@ static void test_host_space(void)
     advance(16);
     hold_extra(XBOX_HOST_PADDLE1, 1);
     st = poll0();
-    CHECK(menu_fires() == 1);
+    /* paddle1 is inside paddle1+b@300 and paddle1+y: the longest match
+     * wins, so paddle1 alone fires at its release. */
+    CHECK(menu_fires() == 0);
     CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_X] == 0);
     pad_clear();
     poll0();
+    CHECK(menu_fires() == 1);
     remove("config/config.toml");
+}
+
+/* ---- one input, one action ---------------------------------------------- */
+
+static int stats_fires(void)
+{
+    return enhance_action_pressed(enhance_action_find("overlay.stats"));
+}
+
+static void tap_key(int vk)
+{
+    xbox_InputKeyEvent(vk, 1);
+    poll0();
+    advance(16);
+    xbox_InputKeyEvent(vk, 0);
+    poll0();
+    advance(16);
+}
+
+/* The Deck case: a capture saved overlay.stats = "F10" beside menu.open's
+ * default F10, and every F10 fired both. Now one binding keeps the input:
+ * menu.open's, else the written one over a default, else the first
+ * registered. */
+static void test_one_input(void)
+{
+    static const struct xbox_mod *const mods[] = { &k_probe, &k_v2, NULL };
+    char bound[ENHANCE_ACTION_TEXT];
+    const char *out;
+    int menu, stats;
+
+    /* menu.open never gives way, even to a written binding: under Proton
+     * the Deck's grip (F10) is the one way into the menu. */
+    out = start(ARMED "[input.actions]\n\"overlay.stats\" = \"F10\"\n");
+    CHECK(strstr(out, "[INPUT] action overlay.stats: 'F10' refused: menu.open has it"
+                 " ('F10'); one input fires one action\n") != NULL);
+    CHECK(strstr(out, "gives way") == NULL);
+    tap_key(VK_F10);
+    CHECK(menu_fires() == 1);
+    CHECK(stats_fires() == 0);
+
+    /* Any other pair: the written one beats a default. probe.go and
+     * camera.toggle both default to F6, and the first registered keeps it;
+     * menu.open keeps paddle1 from probe.go. */
+    out = start_with(ARMED, &k_fake, mods);
+    poll0();
+    CHECK(strstr(out, "[INPUT] action camera.toggle: 'F6' refused: probe.go has it ('F6')")
+          != NULL);
+    CHECK(strstr(out, "[INPUT] action probe.go: 'paddle1' refused: menu.open has it") != NULL);
+    tap_key(VK_F6);
+    CHECK(enhance_action_pressed(s_probe_id) == 1);
+    CHECK(enhance_action_pressed(s_cam_id) == 0);
+    hold_extra(XBOX_HOST_PADDLE1, 1);
+    poll0();
+    hold_extra(XBOX_HOST_PADDLE1, 0);
+    poll0();
+    CHECK(menu_fires() == 1);
+    CHECK(enhance_action_pressed(s_probe_id) == 0);
+    /* The toolkit's written binding takes a mod's default. */
+    out = start_with(ARMED "[input.actions]\n\"overlay.stats\" = \"F6\"\n", &k_fake, mods);
+    poll0();
+    CHECK(strstr(out, "[INPUT] action probe.go: 'F6' refused: overlay.stats has it") != NULL);
+    CHECK(strstr(out, "[INPUT] action camera.toggle: 'F6' refused: overlay.stats has it")
+          != NULL);
+    tap_key(VK_F6);
+    CHECK(stats_fires() == 1);
+    CHECK(enhance_action_pressed(s_probe_id) == 0);
+    CHECK(enhance_action_pressed(s_cam_id) == 0);
+    /* A mod's written binding takes another mod's default, though that one
+     * was registered first. */
+    out = start_with(ARMED "[input.actions]\n\"camera.toggle\" = \"F6\"\n", &k_fake, mods);
+    poll0();
+    CHECK(strstr(out, "[INPUT] action probe.go (default): 'F6' gives way to"
+                 " camera.toggle ('F6')\n") != NULL);
+    tap_key(VK_F6);
+    CHECK(enhance_action_pressed(s_cam_id) == 1);
+    CHECK(enhance_action_pressed(s_probe_id) == 0);
+    /* Both written beside a default: the first written keeps it, and no
+     * line says the second one won anything. */
+    out = start_with(ARMED "[input.actions]\n\"overlay.stats\" = \"F6\"\n"
+                     "\"camera.toggle\" = \"F6\"\n", &k_fake, mods);
+    poll0();
+    CHECK(strstr(out, "[INPUT] action camera.toggle: 'F6' refused: overlay.stats has it") != NULL);
+    CHECK(strstr(out, "gives way to camera.toggle") == NULL);
+    tap_key(VK_F6);
+    CHECK(stats_fires() == 1);
+    CHECK(enhance_action_pressed(s_cam_id) == 0);
+    xbox_mod_shutdown();
+    xbox_mod_register_table(NULL);
+
+    /* Modifiers by side, as key_cond reads them: LAlt+F7 and RAlt+F7 are
+     * two inputs, Alt+F7 is either. */
+    out = start(ARMED "[input.actions]\n\"overlay.stats\" = [\"LAlt+F7\"]\n"
+                "\"shot.window\" = [\"RAlt+F7\"]\n");
+    CHECK(strstr(out, "refused") == NULL);
+    out = start(ARMED "[input.actions]\n\"overlay.stats\" = [\"LAlt+F7\"]\n"
+                "\"shot.window\" = [\"Alt+F7\"]\n");
+    CHECK(strstr(out, "'Alt+F7' refused: overlay.stats has it") != NULL);
+
+    /* Both written: menu.open was registered first and keeps it. The same
+     * key with a modifier is another input and stays. */
+    out = start(ARMED "[input.actions]\nmenu.open = [\"F10\"]\n"
+                "\"overlay.stats\" = [\"F10\", \"Alt+F10\"]\n");
+    CHECK(strstr(out, "[INPUT] action overlay.stats: 'F10' refused: menu.open has it"
+                 " ('F10'); one input fires one action\n") != NULL);
+    CHECK(strstr(out, "'Alt+F10' refused") == NULL);
+    tap_key(VK_F10);
+    CHECK(menu_fires() == 1);
+    CHECK(stats_fires() == 0);
+    xbox_InputKeyEvent(XBOX_VK_LMENU, 1);
+    tap_key(VK_F10);
+    xbox_InputKeysClear();
+    poll0();
+    CHECK(menu_fires() == 0);
+    CHECK(stats_fires() == 1);
+
+    /* A pad chord with another hold is the same input; its order and the
+     * hold do not matter. */
+    out = start(ARMED "[input.actions]\nmenu.open = [\"left_trigger+right_trigger@400\"]\n"
+                "\"overlay.stats\" = [\"right_trigger+left_trigger@200\"]\n");
+    CHECK(strstr(out, "'right_trigger+left_trigger@200' refused: menu.open has it") != NULL);
+
+    /* What the menu's capture asks. */
+    start(ARMED);
+    menu = enhance_action_find("menu.open");
+    stats = enhance_action_find("overlay.stats");
+    CHECK(enhance_action_owner("F10", stats, bound, sizeof bound) == menu);
+    CHECK(!strcmp(bound, "F10"));
+    CHECK(enhance_action_owner("a+guide", stats, bound, sizeof bound) == menu);
+    CHECK(!strcmp(bound, "guide+a"));
+    CHECK(enhance_action_owner("paddle1", stats, NULL, 0) == menu);
+    CHECK(enhance_action_owner("F10", menu, bound, sizeof bound) == -1);
+    CHECK(bound[0] == 0);
+    CHECK(enhance_action_owner("Alt+F10", stats, NULL, 0) == -1);
+    CHECK(enhance_action_owner("guide", stats, NULL, 0) == -1);
+    CHECK(enhance_action_owner("pad2:paddle1", stats, NULL, 0) == -1);
+    CHECK(enhance_action_owner("nonsense+", stats, NULL, 0) == -1);
+}
+
+/* The longest match: guide inside guide+a fires at its release, and not at
+ * all when guide+a fired while it was held. */
+static void test_longest_match(void)
+{
+    XBOX_INPUT_STATE st;
+    int stats;
+
+    start(ARMED "[input.actions]\nmenu.open = [\"guide+a\"]\n"
+          "\"overlay.stats\" = [\"guide\"]\n");
+    stats = enhance_action_find("overlay.stats");
+    /* Guide, then A: only menu.open. */
+    hold_extra(XBOX_HOST_GUIDE, 1);
+    poll0();
+    CHECK(stats_fires() == 0);
+    advance(16);
+    hold_a(1);
+    st = poll0();
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 0);
+    CHECK(menu_fires() == 1);
+    CHECK(!enhance_action_down(stats));
+    advance(16);
+    pad_clear();
+    poll0();
+    CHECK(stats_fires() == 0);
+    CHECK(menu_fires() == 0);
+
+    /* Guide alone: overlay.stats at the release, never down. */
+    advance(16);
+    hold_extra(XBOX_HOST_GUIDE, 1);
+    poll0();
+    advance(500);
+    poll0();
+    CHECK(stats_fires() == 0);
+    CHECK(!enhance_action_down(stats));
+    hold_extra(XBOX_HOST_GUIDE, 0);
+    poll0();
+    CHECK(stats_fires() == 1);
+    CHECK(menu_fires() == 0);
+
+    /* Both in one poll, and released in one: still only the longer. */
+    advance(16);
+    hold_extra(XBOX_HOST_GUIDE, 1);
+    hold_a(1);
+    poll0();
+    advance(16);
+    pad_clear();
+    poll0();
+    CHECK(menu_fires() == 1);
+    CHECK(stats_fires() == 0);
+
+    /* Guest chords with holds: back+start@400 inside a longer chord fires
+     * at its release, only after its hold, and not when the longer fired. */
+    start(ARMED "[input.actions]\nmenu.open = [\"back+start+left_thumb@400\"]\n"
+          "\"overlay.stats\" = [\"back+start@400\"]\n");
+    hold_btn(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_START, 1);
+    poll0();
+    advance(100);
+    hold_btn(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_START, 0);
+    poll0();
+    CHECK(stats_fires() == 0);      /* let go before its hold */
+    advance(16);
+    hold_btn(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_START, 1);
+    poll0();
+    advance(400);
+    poll0();
+    CHECK(stats_fires() == 0);
+    advance(16);
+    hold_btn(XBOX_GAMEPAD_LEFT_THUMB, 1);
+    poll0();
+    advance(400);
+    poll0();
+    CHECK(menu_fires() == 1);
+    hold_btn(0xFFFF, 0);
+    poll0();
+    CHECK(stats_fires() == 0);
+    advance(16);
+    hold_btn(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_START, 1);
+    poll0();
+    advance(400);
+    poll0();
+    hold_btn(0xFFFF, 0);
+    poll0();
+    CHECK(stats_fires() == 1);
+    CHECK(menu_fires() == 0);
+}
+
+/* A longer chord held whole takes the press, fired or not: let go before
+ * its hold, neither it nor the shorter one inside fires. */
+static void test_longest_spent(void)
+{
+    static const struct xbox_mod *const mods[] = { &k_probe, NULL };
+    XBOX_INPUT_STATE st;
+    int probe, stats;
+
+    start(ARMED "[input.actions]\nmenu.open = [\"back+start+left_thumb@400\"]\n"
+          "\"overlay.stats\" = [\"back+start@400\"]\n");
+    hold_btn(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_START, 1);
+    poll0();
+    advance(400);
+    poll0();
+    advance(16);
+    hold_btn(XBOX_GAMEPAD_LEFT_THUMB, 1);
+    poll0();
+    advance(200);
+    poll0();
+    hold_btn(0xFFFF, 0);
+    poll0();
+    CHECK(menu_fires() == 0);
+    CHECK(stats_fires() == 0);
+
+    /* Three deep: guide inside guide+a inside guide+a+b. */
+    start_with(ARMED "[input.actions]\nmenu.open = [\"guide+a+b\"]\n"
+               "\"overlay.stats\" = [\"guide+a\"]\n\"probe.go\" = [\"guide\"]\n",
+               &k_fake, mods);
+    poll0();
+    probe = s_probe_id;
+    stats = enhance_action_find("overlay.stats");
+    /* All three in one poll and let go in one: only the longest. */
+    hold_extra(XBOX_HOST_GUIDE, 1);
+    hold_a(1);
+    hold_b(1);
+    st = poll0();
+    CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_B] == 0);
+    advance(16);
+    pad_clear();
+    poll0();
+    CHECK(menu_fires() == 1);
+    CHECK(stats_fires() == 0);
+    CHECK(enhance_action_pressed(probe) == 0);
+    /* guide+a let go in one poll: the longer of the two inside guide+a+b. */
+    advance(16);
+    hold_extra(XBOX_HOST_GUIDE, 1);
+    hold_a(1);
+    poll0();
+    advance(500);
+    poll0();
+    CHECK(!enhance_action_down(stats));
+    pad_clear();
+    poll0();
+    CHECK(stats_fires() == 1);
+    CHECK(enhance_action_pressed(probe) == 0);
+    CHECK(menu_fires() == 0);
+    xbox_mod_shutdown();
+    xbox_mod_register_table(NULL);
+
+    /* A rebuild while a shadowed binding is held past its hold: its
+     * release fires nothing. */
+    start(ARMED "[input.actions]\nmenu.open = [\"guide+a\"]\n"
+          "\"overlay.stats\" = [\"guide\"]\n");
+    hold_extra(XBOX_HOST_GUIDE, 1);
+    poll0();
+    advance(500);
+    poll0();
+    enhance_actions_rebuild();
+    advance(16);
+    poll0();
+    hold_extra(XBOX_HOST_GUIDE, 0);
+    poll0();
+    CHECK(stats_fires() == 0);
+}
+
+/* Ports apart: a binding on pad 2 is neither shadowed by nor the same
+ * input as one on pad 1. */
+static void test_longest_ports(void)
+{
+    XBOX_INPUT_STATE st;
+    const char *out;
+    int menu, stats;
+
+    out = start(ARMED "[input.actions]\nmenu.open = [\"guide+a\"]\n"
+                "\"overlay.stats\" = [\"pad2:guide+a\", \"pad2:guide\"]\n");
+    CHECK(strstr(out, "refused") == NULL);
+    menu = enhance_action_find("menu.open");
+    stats = enhance_action_find("overlay.stats");
+    CHECK(enhance_action_owner("pad2:guide+a", menu, NULL, 0) == stats);
+    CHECK(enhance_action_owner("guide+a", stats, NULL, 0) == menu);
+    /* pad2:guide is inside pad2:guide+a, and only that one. */
+    f_conn[1] = 1;
+    advance(1000);              /* past the probe interval of an empty port */
+    memset(&st, 0, sizeof st);
+    CHECK(xbox_InputGetState(1, &st) == ERROR_SUCCESS);
+    advance(16);
+    f_extra[1] = XBOX_HOST_GUIDE;
+    xbox_InputGetState(1, &st);
+    CHECK(stats_fires() == 0);
+    advance(500);
+    xbox_InputGetState(1, &st);
+    f_extra[1] = 0;
+    xbox_InputGetState(1, &st);
+    CHECK(stats_fires() == 1);
+    /* Guide on pad 1 fires nothing of pad 2's. */
+    advance(16);
+    hold_extra(XBOX_HOST_GUIDE, 1);
+    poll0();
+    advance(16);
+    hold_a(1);
+    poll0();
+    CHECK(menu_fires() == 1);
+    CHECK(stats_fires() == 0);
+    pad_clear();
+    poll0();
+    f_conn[1] = 0;
+}
+
+/* The flip tick, with a title that never polls, follows rules 9 and 10. */
+static void test_tick_rules(void)
+{
+    start_with(ARMED "[input.actions]\nmenu.open = [\"guide+a\", \"paddle1\"]\n"
+               "\"overlay.stats\" = [\"guide\"]\n", &k_fake, NULL);
+    xbox_InputInit();
+    pad_clear();
+    nv2a_flip_hook_run();
+    advance(16);
+    /* Guide alone: at the release. */
+    hold_extra(XBOX_HOST_GUIDE, 1);
+    nv2a_flip_hook_run();
+    advance(500);
+    nv2a_flip_hook_run();
+    CHECK(stats_fires() == 0);
+    advance(16);
+    hold_extra(XBOX_HOST_GUIDE, 0);
+    nv2a_flip_hook_run();
+    CHECK(stats_fires() == 1);
+    /* Guide, then A: only menu.open. */
+    advance(16);
+    hold_extra(XBOX_HOST_GUIDE, 1);
+    nv2a_flip_hook_run();
+    advance(16);
+    hold_a(1);
+    nv2a_flip_hook_run();
+    CHECK(menu_fires() == 1);
+    advance(16);
+    pad_clear();
+    nv2a_flip_hook_run();
+    CHECK(stats_fires() == 0);
+    /* Quiet: paddle1 held through a capture fires only once let go and
+     * pressed again. */
+    advance(16);
+    enhance_actions_quiet(1);
+    hold_extra(XBOX_HOST_PADDLE1, 1);
+    nv2a_flip_hook_run();
+    advance(16);
+    nv2a_flip_hook_run();
+    enhance_actions_quiet(0);
+    advance(16);
+    nv2a_flip_hook_run();
+    CHECK(menu_fires() == 0);
+    advance(16);
+    hold_extra(XBOX_HOST_PADDLE1, 0);
+    nv2a_flip_hook_run();
+    CHECK(menu_fires() == 0);
+    advance(16);
+    hold_extra(XBOX_HOST_PADDLE1, 1);
+    nv2a_flip_hook_run();
+    CHECK(menu_fires() == 1);
+    pad_clear();
+    advance(16);
+    nv2a_flip_hook_run();
+}
+
+/* The menu's capture: nothing fires while it runs, and an input held
+ * through its end fires only after a release. */
+static void test_quiet(void)
+{
+    start(ARMED);
+    enhance_actions_quiet(1);
+    xbox_InputKeyEvent(VK_F10, 1);
+    poll0();
+    advance(16);
+    poll0();
+    CHECK(menu_fires() == 0);
+    enhance_actions_quiet(0);
+    advance(16);
+    poll0();
+    CHECK(menu_fires() == 0);
+    xbox_InputKeyEvent(VK_F10, 0);
+    poll0();
+    CHECK(menu_fires() == 0);
+    tap_key(VK_F10);
+    CHECK(menu_fires() == 1);
+
+    /* A tap of a shorter binding released during a capture is spent too. */
+    start(ARMED "[input.actions]\nmenu.open = [\"guide+a\"]\n"
+          "\"overlay.stats\" = [\"guide\"]\n");
+    hold_extra(XBOX_HOST_GUIDE, 1);
+    poll0();
+    enhance_actions_quiet(1);
+    advance(16);
+    hold_extra(XBOX_HOST_GUIDE, 0);
+    poll0();
+    enhance_actions_quiet(0);
+    CHECK(stats_fires() == 0);
+    xbox_InputKeysClear();
+
+    /* A key that went down after the last step and ended the capture
+     * (the menu reads keys after the step): the step after quiet still
+     * drops it. */
+    start(ARMED);
+    enhance_actions_quiet(1);
+    poll0();
+    xbox_InputKeyEvent(VK_F10, 1);
+    enhance_actions_quiet(0);
+    advance(16);
+    poll0();
+    CHECK(menu_fires() == 0);
+    xbox_InputKeyEvent(VK_F10, 0);
+    poll0();
+    CHECK(menu_fires() == 0);
+    tap_key(VK_F10);
+    CHECK(menu_fires() == 1);
+    /* Off when it was not on takes effect at once. */
+    enhance_actions_quiet(0);
+    tap_key(VK_F10);
+    CHECK(menu_fires() == 1);
+
+    /* The drain is port 0's: with port 0 never stepped, pad 2 fires at
+     * once after the capture. */
+    start(ARMED "[input.actions]\n\"overlay.stats\" = [\"pad2:paddle1\"]\n");
+    {
+        XBOX_INPUT_STATE st;
+        f_conn[1] = 1;
+        advance(1000);          /* past the probe interval of an empty port */
+        CHECK(xbox_InputGetState(1, &st) == ERROR_SUCCESS);
+        enhance_actions_quiet(1);
+        enhance_actions_quiet(0);
+        advance(16);
+        f_extra[1] = XBOX_HOST_PADDLE1;
+        xbox_InputGetState(1, &st);
+        CHECK(stats_fires() == 1);
+        f_extra[1] = 0;
+        xbox_InputGetState(1, &st);
+        f_conn[1] = 0;
+    }
 }
 
 int main(void)
@@ -1497,6 +1971,12 @@ int main(void)
 #ifndef _WIN32
     test_live_rebuild();
 #endif
+    test_one_input();
+    test_longest_match();
+    test_longest_spent();
+    test_longest_ports();
+    test_tick_rules();
+    test_quiet();
     xbox_mod_shutdown();
     enhance_actions_reset();
     remove("config/config.toml");

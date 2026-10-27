@@ -18,6 +18,17 @@
  *      mapped member pressed while they are held is the guest's no more
  *      until its release, even when a modifier is let go first; one pressed
  *      before them passes and does not complete the chord.
+ *   8. one input fires one action: of two bindings that take the same
+ *      input, menu.open's keeps it, else the written one (the menu, a
+ *      file) beats a default, else the first registered; the other is
+ *      refused with a line;
+ *   9. the longest match wins: a pad binding whose members all belong to
+ *      a longer binding on its port fires at its release, and not at all
+ *      once the longer one was held whole, fired or not (guide, then
+ *      guide+a, fires only guide+a);
+ *  10. nothing fires during the menu's capture (enhance_actions_quiet),
+ *      nor on port 0's next step after it, which the key a capture ended
+ *      on may reach first.
  *
  * Bindings name host sources (input_map.h's names; a guest control's name
  * means the source the identity gives it), read from the raw host pad
@@ -165,9 +176,16 @@ struct binding {
      * Until then a fire may count on the reused slot; the next step on the
      * new table no longer does. */
     char name[NAME_MAX_];
+    int explicit_;          /* from the menu or a file, not the action's defaults */
+    /* A longer binding on the same port holds all of its members: this one
+     * fires at its release, and only when no longer one fired meanwhile
+     * (one press, one action). */
+    int shadowed;
     /* state, under the step lock */
     int active, fired;
     int held_over;          /* held when the table was built: no fire, not down */
+    int ready;              /* shadowed: its hold passed, it fires at release */
+    int want;               /* fires in this step, unless a longer one does */
     uint64_t since;
     uint32_t modpress;      /* B_MOD: guest members pressed with the modifiers held */
 };
@@ -217,6 +235,9 @@ static int s_menu_act = -1;
  * step lock, and a menu.open fire is a request it takes there. */
 static enhance_menu_hook_fn s_menu_hook;
 static int s_menu_req;
+/* The menu's capture: what is pressed meanwhile is the capture's, and
+ * fires nothing (enhance_actions_quiet). */
+static int s_quiet;
 
 static void toolkit_fire(int action)
 {
@@ -566,13 +587,46 @@ static int key_cond(const struct binding *b)
     return 1;
 }
 
+/* Whether pad binding a is a strict part of pad binding c: the same port,
+ * every member of a in c, and c longer. */
+static int pad_inside(const struct binding *a, const struct binding *c)
+{
+    return a->kind != B_KEY && c->kind != B_KEY && a->kind != B_OFF && c->kind != B_OFF
+        && a->port == c->port && (a->bits & c->bits) == a->bits && a->bits != c->bits;
+}
+
+static void fire(const struct binding *b, uint64_t now)
+{
+    __atomic_add_fetch(&s_act[b->action].pressed, 1, __ATOMIC_ACQ_REL);
+    fire_log(b, now);
+    toolkit_fire(b->action);
+}
+
 /* One step of port's bindings with the host pad's bits. tick: the flip's
- * step, which leaves guest chords alone (only a poll can consume them). */
+ * step, which leaves guest chords alone (only a poll can consume them).
+ *
+ * Two passes, so the order of the table never decides which of two
+ * bindings fires: the first finds what would fire, the second fires the
+ * longest of them. A binding inside a longer one (guide inside guide+a)
+ * waits for its release, and a longer one firing first takes the press
+ * from it. */
 static void step(struct table *t, unsigned port, uint32_t held, int tick, uint64_t now)
 {
     struct port_state *ps = &s_port[port];
     uint32_t fresh = held & ~ps->held;
+    int quiet = __atomic_load_n(&s_quiet, __ATOMIC_ACQUIRE), wants = 0;
 
+    /* Port 0's step after a capture is still quiet: the menu reads its
+     * keys after this step, so a key that went down in between ended the
+     * capture unseen here and must not fire now. Keys step on port 0 only;
+     * the pad hands the menu the same held this step saw, so the other
+     * ports need no drain and must not wait for port 0's step (a title
+     * that polls no port 0 on a loading screen). */
+    if (quiet == 2 && port == 0)
+        __atomic_compare_exchange_n(&s_quiet, &quiet, 0, 0, __ATOMIC_ACQ_REL,
+                                    __ATOMIC_ACQUIRE);
+    else if (quiet == 2)
+        quiet = 0;
     ps->held = held;
     ps->consumed &= held;
     for (int i = 0; i < 32; i++)
@@ -584,6 +638,7 @@ static void step(struct table *t, unsigned port, uint32_t held, int tick, uint64
         struct binding *b = &t->b[i];
         int cond = 0;
 
+        b->want = 0;
         if (b->kind == B_OFF || (b->kind == B_KEY ? port != 0 : b->port != port))
             continue;
         if (tick && b->kind == B_CHORD && b->guest)
@@ -611,19 +666,63 @@ static void step(struct table *t, unsigned port, uint32_t held, int tick, uint64
         }
         }
         if (!cond) {
-            b->active = b->fired = b->held_over = 0;
+            /* A shorter binding's tap: let go after its hold, nothing
+             * longer took it. */
+            if (b->shadowed && b->active && b->ready && !b->fired && !quiet)
+                b->want = 1;
+            b->active = b->fired = b->held_over = b->ready = 0;
         } else if (!b->active) {
             b->active = 1;
             b->fired = 0;
             b->since = now;
         }
+        /* Held during a capture: the capture's, and it stays spent until
+         * released, as a binding held when its table was built. */
+        if (quiet && b->active)
+            b->fired = b->held_over = 1;
         if (b->active && !b->fired && now - b->since >= (uint64_t)b->hold_ms) {
-            b->fired = 1;
-            __atomic_add_fetch(&s_act[b->action].pressed, 1, __ATOMIC_ACQ_REL);
-            fire_log(b, now);
-            toolkit_fire(b->action);
+            if (b->shadowed)
+                b->ready = 1;
+            else
+                b->want = 1;
         }
-        if (b->active && b->fired && !b->held_over)
+        wants |= b->want;
+    }
+    /* A longer binding held whole takes the press from those inside it,
+     * whether or not it fires: let go before its hold, it fires nothing,
+     * and neither does the shorter one (one press, one action). */
+    for (int i = 0; i < t->n; i++) {
+        const struct binding *c = &t->b[i];
+        if (!c->active || c->kind == B_KEY || c->kind == B_OFF || c->port != port)
+            continue;
+        for (int k = 0; k < t->n; k++)
+            if (t->b[k].active && pad_inside(&t->b[k], c))
+                t->b[k].fired = 1;
+    }
+    for (int i = 0; wants && i < t->n; i++) {
+        struct binding *b = &t->b[i];
+        int longer = 0;
+
+        if (!b->want)
+            continue;
+        for (int k = 0; k < t->n && !longer; k++)
+            longer = t->b[k].want && pad_inside(b, &t->b[k]);
+        if (b->active)
+            b->fired = 1;
+        if (longer)
+            continue;
+        fire(b, now);
+        /* The shorter bindings held with it are spent until released. */
+        for (int k = 0; k < t->n; k++)
+            if (t->b[k].active && pad_inside(&t->b[k], b))
+                t->b[k].fired = 1;
+    }
+    for (int i = 0; i < t->n; i++) {
+        struct binding *b = &t->b[i];
+        if (b->kind == B_OFF || (b->kind == B_KEY ? port != 0 : b->port != port))
+            continue;
+        /* A shorter binding is a tap: it never reads as down. */
+        if (b->active && b->fired && !b->held_over && !b->shadowed)
             __atomic_or_fetch(&s_act[b->action].down, 1u << b->idx, __ATOMIC_ACQ_REL);
         else
             __atomic_and_fetch(&s_act[b->action].down, ~(1u << b->idx), __ATOMIC_ACQ_REL);
@@ -967,14 +1066,18 @@ int enhance_action_down(int id)
 /* ---- building the table ------------------------------------------------ */
 
 /* The bindings of one action from the highest file that names it (all of
- * them: an empty list unbinds), else its defaults. *n is how many texts. */
+ * them: an empty list unbinds), else its defaults. Returns how many texts;
+ * *explicit_ (when not NULL) is 0 for the defaults. */
 static int config_texts(const struct action *a, const char *texts[ENHANCE_ACTION_BINDS],
-                        char where[96])
+                        char where[96], int *explicit_)
 {
     char key[sizeof PREFIX + NAME_MAX_];
     const recomp_cfg *c;
-    int n = 0;
+    int n = 0, dummy;
 
+    if (!explicit_)
+        explicit_ = &dummy;
+    *explicit_ = 1;
     if (a->has_ovr) {
         snprintf(where, 96, "%s (menu)", a->name);
         for (int i = 0; i < a->novr; i++)
@@ -1011,6 +1114,7 @@ static int config_texts(const struct action *a, const char *texts[ENHANCE_ACTION
                 " the defaults\n", where);
     }
     snprintf(where, 96, "%s (default)", a->name);
+    *explicit_ = 0;
     for (int i = 0; i < a->ndefs; i++)
         texts[n++] = a->defs[i];
     return n;
@@ -1122,6 +1226,81 @@ static void classify(struct binding *b, const char *where, const xbox_pad_setup 
     }
 }
 
+/* Whether each of a's modifiers is one of b's, as key_cond reads them:
+ * an either-side modifier matches either side, LCtrl never RCtrl. */
+static int mods_within(const struct binding *a, const struct binding *b)
+{
+    for (int i = 0; i < a->nmods; i++) {
+        int found = 0;
+        for (int k = 0; k < b->nmods && !found; k++)
+            found = same_key(a->mods[i], b->mods[k]);
+        if (!found)
+            return 0;
+    }
+    return 1;
+}
+
+/* Whether two bindings take the same input: the same key with the same
+ * modifiers, or the same pad members on the same port whatever their
+ * holds. Either way both would fire on one press. */
+static int same_input(const struct binding *a, const struct binding *b)
+{
+    if (a->kind == B_OFF || b->kind == B_OFF)
+        return 0;
+    if (a->kind == B_KEY || b->kind == B_KEY)
+        return a->kind == b->kind && same_key(a->key, b->key) && mods_within(a, b)
+            && mods_within(b, a);
+    return a->port == b->port && a->bits == b->bits;
+}
+
+/* A binding's claim on its input. menu.open's never gives way: the menu is
+ * the only way in the game to repair a binding, and on the Deck under
+ * Proton F10 (a grip through Steam Input) is the one way to reach it, so a
+ * written binding that took F10 would lock the player out. */
+static int claim(const struct binding *b)
+{
+    return b->action == s_menu_act ? 2 : b->explicit_ ? 1 : 0;
+}
+
+/* One input, one action: of two bindings that take the same input, the
+ * stronger claim keeps it (menu.open's, then one written in the menu or a
+ * file over an action's default), else the first registered (the
+ * toolkit's before the mods'). The loser goes with a line; the menu's
+ * capture refuses such a binding up front (enhance_action_owner). A
+ * binding is judged against every kept one before it takes any input, so
+ * no line says a binding won that is then refused. */
+static int dedup(struct table *t)
+{
+    int n = 0;
+
+    for (int i = 0; i < t->n; i++) {
+        struct binding *b = &t->b[i];
+        const struct binding *o = NULL;
+        for (int k = 0; k < n && !o; k++)
+            if (same_input(&t->b[k], b) && claim(&t->b[k]) >= claim(b))
+                o = &t->b[k];
+        if (o) {
+            fprintf(stderr, "[INPUT] action %s: '%s' refused: %s has it ('%s');"
+                    " one input fires one action\n", b->name, b->text, o->name, o->text);
+            continue;
+        }
+        for (int k = 0; k < n; k++) {
+            struct binding *w = &t->b[k];
+            if (!same_input(w, b))
+                continue;
+            fprintf(stderr, "[INPUT] action %s%s: '%s' gives way to %s ('%s')\n", w->name,
+                    w->explicit_ ? "" : " (default)", w->text, b->name, b->text);
+            memmove(w, w + 1, (size_t)(n - k - 1) * sizeof *w);
+            n--;
+            k--;
+        }
+        if (n != i)
+            t->b[n] = *b;
+        n++;
+    }
+    return n;
+}
+
 /* Under s_reg_lock; old is the table in use, for the kind changes. */
 static struct table *build(const struct table *old)
 {
@@ -1141,10 +1320,10 @@ static struct table *build(const struct table *old)
     for (int i = 0; i < s_nact; i++) {
         const char *texts[ENHANCE_ACTION_BINDS];
         char where[96];
-        int n, idx = 0;
+        int n, expl;
         if (!s_act[i].live)
             continue;
-        n = config_texts(&s_act[i], texts, where);
+        n = config_texts(&s_act[i], texts, where, &expl);
         for (int k = 0; k < n; k++) {
             struct binding *b = &t->b[t->n];
             if (!texts[k] || !*texts[k])
@@ -1152,21 +1331,30 @@ static struct table *build(const struct table *old)
             if (!parse_binding(where, texts[k], b))
                 continue;
             b->action = i;
-            b->idx = idx++;
+            b->explicit_ = expl;
             snprintf(b->name, sizeof b->name, "%s", s_act[i].name);
             if (b->kind == B_PAD)
                 classify(b, where, &ps, used, old);
-            /* A held input must be let go before a new binding fires on it,
-             * and does not read as down until then. */
-            b->active = b->fired = b->held_over = 1;
-            if (b->kind == B_KEY) {
-                t->keys = 1;
-            } else if (b->kind != B_OFF) {
-                t->ports |= 1u << b->port;
-                if (b->kind == B_CHORD)
-                    t->chord_members[b->port] |= b->guest;
-            }
             t->n++;
+        }
+    }
+    t->n = dedup(t);
+    for (int i = 0, idx = 0; i < t->n; i++) {
+        struct binding *b = &t->b[i];
+        if (i && b->action != t->b[i - 1].action)
+            idx = 0;
+        b->idx = idx++;
+        for (int k = 0; k < t->n && !b->shadowed; k++)
+            b->shadowed = pad_inside(b, &t->b[k]);
+        /* A held input must be let go before a new binding fires on it,
+         * and does not read as down until then. */
+        b->active = b->fired = b->held_over = 1;
+        if (b->kind == B_KEY) {
+            t->keys = 1;
+        } else if (b->kind != B_OFF) {
+            t->ports |= 1u << b->port;
+            if (b->kind == B_CHORD)
+                t->chord_members[b->port] |= b->guest;
         }
     }
     return t;
@@ -1361,7 +1549,7 @@ int enhance_action_bindings(int id, char out[][ENHANCE_ACTION_TEXT], int max)
         spin_unlock(&s_reg_lock);
         return 0;
     }
-    k = config_texts(&s_act[id], texts, where);
+    k = config_texts(&s_act[id], texts, where, NULL);
     for (int i = 0; i < k && n < max; i++)
         if (texts[i] && *texts[i])
             snprintf(out[n++], ENHANCE_ACTION_TEXT, "%s", texts[i]);
@@ -1429,6 +1617,46 @@ int enhance_action_check(const char *text, char *why, size_t n)
     if (ok)
         snprintf(why, n, "%s", kind_name(&b));
     return ok;
+}
+
+int enhance_action_owner(const char *text, int except, char *bound, size_t n)
+{
+    struct binding b;
+    xbox_pad_setup ps;
+    uint32_t feeds[SRC_BITS], used;
+    char why[8];
+    int owner = -1;
+
+    if (bound && n)
+        bound[0] = 0;
+    s_why = why;
+    s_why_n = sizeof why;
+    if (!parse_binding("check", text, &b)) {
+        s_why = NULL;
+        return -1;
+    }
+    if (b.kind == B_PAD) {
+        xbox_InputPadSetup(&ps);
+        used = map_feeds(&ps, feeds);
+        classify(&b, "check", &ps, used, NULL);
+    }
+    s_why = NULL;
+    spin_lock(&s_step_lock);
+    for (int i = 0; s_table && i < s_table->n && owner < 0; i++)
+        if (s_table->b[i].action != except && same_input(&s_table->b[i], &b)) {
+            owner = s_table->b[i].action;
+            if (bound && n)
+                snprintf(bound, n, "%s", s_table->b[i].text);
+        }
+    spin_unlock(&s_step_lock);
+    return owner;
+}
+
+void enhance_actions_quiet(int on)
+{
+    /* Off drains through one more quiet step (2), see step(). */
+    int was = __atomic_load_n(&s_quiet, __ATOMIC_ACQUIRE);
+    __atomic_store_n(&s_quiet, on ? 1 : was ? 2 : 0, __ATOMIC_RELEASE);
 }
 
 void enhance_actions_set_menu_hook(enhance_menu_hook_fn fn)
@@ -1505,4 +1733,5 @@ void enhance_actions_reset(void)
     spin_unlock(&s_step_lock);
     s_log_sec = 0;
     s_log_n = s_log_dropped = 0;
+    __atomic_store_n(&s_quiet, 0, __ATOMIC_RELEASE);
 }

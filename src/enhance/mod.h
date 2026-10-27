@@ -117,7 +117,10 @@ struct xbox_mod_api {
      * the id, or -1 with a line (duplicate, bad name, full). */
     int (*action_register)(const char *name, const char *label,
                            const char *const *defaults);
-    /* Fires since the last call (any thread); held now past its hold. */
+    /* Fires since the last call (any thread); held now past its hold. A
+     * binding inside a longer one on its port (guide in guide+a, whoever
+     * owns that) fires at its release instead and never reads as down, so
+     * a hold-to-act action needs a binding no other one contains. */
     int (*action_pressed)(int id);
     int (*action_down)(int id);
     /* Init only. An item (enhance_menu.h) on the mod's own sub-page of the
