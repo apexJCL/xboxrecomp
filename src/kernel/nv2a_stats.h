@@ -75,6 +75,9 @@ struct nv2a_stats_snap {
     float ms_avg, ms_max;
 };
 void nv2a_stats_read(struct nv2a_stats_snap *s, uint64_t now_ns);
+/* The newest frame times of the ring, in ms, oldest first (the Stats
+ * page's graph); returns how many, at most n and 128. */
+unsigned nv2a_stats_frames(float *ms, unsigned n);
 
 /* ctest only. */
 void nv2a_stats_reset_for_test(void);

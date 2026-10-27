@@ -79,6 +79,9 @@ void nv2a_overlay_set_stats(int on) { s_ovl_stats = on; }
 int nv2a_overlay_stats(void) { return s_ovl_stats; }
 static int s_toasts;
 static char s_toast[128];
+/* The menu (tests/enhance_menu has it): enhance.c starts it. */
+void enhance_menu_start(void);
+void enhance_menu_start(void) {}
 void nv2a_overlay_toast(const char *fmt, ...)
 {
     va_list ap;
@@ -774,7 +777,7 @@ static void test_paddle_default(void)
     CHECK(strstr(out, "[ACTION] menu.open via paddle1\n") != NULL);
     /* Until the menu lands, each fire is a toast. */
     CHECK(s_toasts == toasts + 1);
-    CHECK(strcmp(s_toast, "Menu: not in this build yet") == 0);
+    CHECK(strcmp(s_toast, "Menu is off (menu.enabled)") == 0);
     /* Nothing of the game's is taken: A, held with it, still passes. */
     CHECK(st.Gamepad.bAnalogButtons[XBOX_BUTTON_A] == 255);
     advance(16);

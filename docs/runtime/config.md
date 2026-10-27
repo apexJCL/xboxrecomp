@@ -167,6 +167,8 @@ the stock settings, `present.pacing = "spin"` included.
 | `textures.font` | string | `"on"`, `"off"`: the pack's font-atlas entries | `"on"` | `RECOMP_TEXTURES_FONT` |
 | `textures.text` | string | `"on"`, `"off"`: the pack's baked-text entries | `"on"` | `RECOMP_TEXTURES_TEXT` |
 | `overlay.stats` | bool | the stats strip in the window's top right corner: fps, frame ms (average and worst of the last second), pacing, scale and backend, at 2 Hz; never in a frame dump | `false` | `RECOMP_OVERLAY_STATS` |
+| `menu.enabled` | bool | the in-game menu, opened by the `menu.open` action ([In-game menu](#in-game-menu-menuenabled)) | `false` | `RECOMP_MENU` |
+| `mods.<name>` | bool | a mod ([Mods](#mods)) runs; `false` leaves its init out at start. The menu's Mods page writes it | `true` | none |
 
 A title adds its own tables (`[fps]`, `[fx]`, ...) in the same files, and
 lists them with their stock values in its `config.default.toml`. The
@@ -709,7 +711,7 @@ The toolkit's actions:
 
 | Action | Default bindings | Does |
 |---|---|---|
-| `menu.open` | `F10`, `guide+a`, `paddle1` | opens and closes the menu (until the menu lands, a toast: "Menu: not in this build yet") |
+| `menu.open` | `F10`, `guide+a`, `paddle1` | opens and closes the menu when `menu.enabled` is on |
 | `overlay.stats` | none | toggles the stats strip |
 | `shot.window` | none | a window shot (a log line for now) |
 
@@ -886,6 +888,87 @@ paddles and the DualSense Edge's back and Fn buttons show as `paddle1`
 profile that copies a face button reports the face button instead,
 which is a guest button.
 
+### In-game menu (menu.enabled)
+
+`menu.enabled = true` (or `RECOMP_MENU=1`) arms a menu drawn by the
+overlay over the game. Off, nothing of it runs: the start log says
+`[ENHANCE] menu.enabled=off` and the `menu.open` action is disarmed with
+the rest of the hook unless another feature key arms it. On, the log names
+the bindings that open it:
+
+```
+[ENHANCE] menu.enabled=on (F10, guide+a, paddle1)
+```
+
+`menu.open` opens and closes it. While it is open the game keeps running
+(there is no pause) but reads a released pad with a frozen packet number,
+so it sees no input at all; the keys go to the menu. A button still held
+as the menu closes reaches the game only after it is let go, for at most
+a second after the close.
+
+| Pad | Keyboard | Does |
+|---|---|---|
+| D-pad, left stick | arrows | move; left and right change the value. Held: a repeat after 150 ms, then every 60 ms |
+| A | Enter, Space | toggle, enter a list, start a capture, run an action |
+| B | Esc, Backspace | leave a list or a capture, else close |
+| LB, RB | Q, E, PgUp, PgDn | the previous or next page |
+| Y | F5 | Save |
+| X | Delete | clear an action's bindings |
+
+The pages are Render, Pack, Game (a title's own items, from
+`enhance_menu_add`), Mods, Stats, Controls, Debug and Save.
+
+- **Controls** lists every action with its bindings. A on a row captures a
+  new one: the next key, or the pad buttons held together for 400 ms (one
+  button, a two-button chord, or a modifier chord such as `guide+a`). It
+  is checked by the rules above: a key or a single button the game uses is
+  refused with the reason in the footer, as at load. The binding is live
+  at once and is added to the row's list; X clears the list (`menu.open`
+  always keeps one). Esc or 10 s without input cancels. A Mouse group
+  ends the page: `input.mouse_capture` as a choice, the release key and
+  the free keys as information, and the capture state now (`captured`,
+  `free: click to capture`, `free: F9`).
+- **Mods** has one row per mod: its `mods.<name>` toggle, and, entered
+  with A, the items the mod added. A mod that gave `on_enable` turns off
+  and on at once; one that did not shows "applies at restart". Turning a
+  mod off stops nothing by itself: its frame hooks and armed actions keep
+  running, and the mod gates them while off.
+- **Pack** shows the pack loaded, its toggles and the last misses, a copy
+  of the miss ring taken at the flip while the page is shown.
+- **Stats** and **Debug** show live numbers: frame rate and time, the
+  presenter, the host-option generation, the extra buttons seen in the last
+  second, the atlas, and the `RECOMP_TRACE` channels (read only: a trace
+  is set at start).
+- **Save** writes the changes to the player's file
+  (`enhance_cfg_user_path()`, the `config/config.toml` above) and nothing
+  else: a key whose value equals `config.default.toml`'s, or the code
+  default when that file has none, is removed instead. The file's other
+  keys and its comments stay, and so do the comments between a binding
+  list's items while the list keeps its length; a list that grows or
+  shrinks is written on one line and loses the comments inside it. A
+  comment line right above a removed key stays (it may be the table's).
+  The file is flushed to the disk before it replaces the old one, and a
+  `config.toml` that is a symlink is written at its target. The log says
+  `[ENHANCE] menu: saved 2 keys to ./config/config.toml`. Under
+  `RECOMP_CONFIG=none` Save is off. "Reset to defaults" asks once, then
+  puts every item and binding back to its default; Save keeps that.
+
+A value forced by an environment variable shows "(environment)" and is
+read only. Each item takes effect at one of four points, its live class;
+the footer names the selected row's:
+
+| Class | Takes effect | Items |
+|---|---|---|
+| live | at the next flip | `render.aniso`, `present.filter`, `present.pacing`, `display.overscan`, `display.movie`, `overlay.stats`, `input.mouse_capture`, every action binding, a mod with `on_enable` |
+| at the flip | at the next flip, rebuilding the targets or the texture cache | `render.scale`, `present.fullscreen`, `textures.pack`, `textures.font`, `textures.text` |
+| next stage | at a later game point (a title's item) | none of the toolkit's |
+| at restart | at the next start; the change is saved, not applied | `display.aspect`, `present.surface`, a mod without `on_enable` |
+
+The `textures.pack` toggle turns the loaded pack off for this session only
+and is never saved (the key names the pack's file). A title's items and a
+mod's items give their own class. Tests: `tests/enhance_menu` (ctest
+`enhance_menu`).
+
 ### Naming rule
 
 - Tables group keys by feature: `[render]`, `[present]`, `[display]`, and a title's own.
@@ -916,6 +999,7 @@ exist only when the layer is built (`RECOMP_ENV_HAVE_ENHANCE_KEYS`):
 | `RECOMP_TEXTURES_FONT` | overrides `textures.font` |
 | `RECOMP_TEXTURES_TEXT` | overrides `textures.text` |
 | `RECOMP_OVERLAY_STATS` | overrides `overlay.stats` |
+| `RECOMP_MENU` | overrides `menu.enabled` |
 | `RECOMP_KEYBOARD` | overrides `input.keyboard` (an older name, outside the naming rule) |
 | `RECOMP_MOUSE` | overrides `input.mouse` |
 
@@ -1020,17 +1104,25 @@ The title's glue calls two entries:
 - `xbox_mod_input_captured()` from its pad read. While it returns true, the
   title must see a released pad.
 
-`struct xbox_mod_api` (version 1, `XBOX_MOD_API_VERSION`) holds:
+`struct xbox_mod_api` (version 2, `XBOX_MOD_API_VERSION`) holds:
 
 | Member | What it gives |
 | --- | --- |
 | `mem`, `XBOX_MOD_MEM32(api, va)`, `XBOX_MOD_MEMF(api, va)` | The guest's memory. It is valid from the first `on_frame` or filter call; it is 0 during init. |
-| `cfg_string`, `cfg_int`, `cfg_float`, `cfg_bool`, `cfg_choice`, `cfg_bind_env` | The getters above. A mod's keys go under `[mods.<name>]` by convention and count as used. |
+| `cfg_string`, `cfg_int`, `cfg_float`, `cfg_bool`, `cfg_choice`, `cfg_bind_env` | The getters above. A mod's keys start with its name (`camera.free_speed` for `camera.free`) and count as used. Not under `[mods.<name>]`: `[mods]` holds the enable bools, and a table of the same name would clash with `mods.<name>`. |
 | `log(mod, fmt, ...)` | One `[MOD <name>]` line. |
 | `on_frame(fn, user)` | Called from `xbox_mod_frame`, in table order. Init only; up to `XBOX_MOD_MAX_FRAME`. |
 | `input_state(out)` | The title's last port-0 read (the keyboard merged), and the mouse's raw counts and buttons while captured. A mod never polls, because a poll would move the keyboard's stick ramp. |
 | `input_capture(on)` | Takes port 0. While captured, the mouse's motion goes to the mod instead of the look stick, and the title's pad glue releases the pad. Either edge drops the motion gathered so far. |
 | `batch_filter(fn, user)` | Asked before each Metal or D3D11 draw, on the render thread, with the program hash and draw state (`struct nv2a_batch_info`). If any filter returns non-zero, the batch is skipped. `present_offset` is the surface the last flip presented, to tell a back buffer from an offscreen target. A skipped batch inside a visibility test counts as occluded. Init only; up to `XBOX_MOD_MAX_FILTER`. The CPU rasteriser does not ask. |
+| `menu_add(item)` | An item (`enhance_menu.h`) on the mod's own list on the menu's Mods page. Kept, not copied, so it must be static; its key persists through Save. Init only; up to `XBOX_MOD_MAX_ITEMS`. |
+| `on_enable(fn, user)` | `fn(on, user)` when the Mods page turns the mod off (0) or on (1). The toolkit calls it from the next `xbox_mod_frame`, on the guest's thread, never from the menu's. Only the last toggle before a frame is sent, so `fn` can be called with the state the mod is already in and must be idempotent. The toolkit keeps calling the mod's frame hooks and actions while it is off: the mod gates its own. A mod without one is switched at the next start. Init only. |
+
+`mods.<name> = false` leaves a mod's init out at start; the Mods page
+writes the key. The toolkit keeps each mod's state (`xbox_mod_state`:
+on, off, failed, or a change waiting for the restart). The keys of a mod
+left out this way (those starting with its name) count as used, so they
+print no `unused key` line.
 
 A failed init leaves nothing behind. Its registrations are dropped and the
 capture goes back to what the earlier mods left. Shutdown runs in reverse

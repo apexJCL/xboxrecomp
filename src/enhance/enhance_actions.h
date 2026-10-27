@@ -21,6 +21,7 @@
 #ifndef ENHANCE_ACTIONS_H
 #define ENHANCE_ACTIONS_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include "host_pad.h"
@@ -31,6 +32,7 @@ extern "C" {
 
 #define ENHANCE_ACTIONS_MAX   64
 #define ENHANCE_ACTION_BINDS  8     /* bindings per action */
+#define ENHANCE_ACTION_TEXT   48    /* a binding's text, with its NUL */
 
 /* Register an action. name is "<owner>.<verb>" in lowercase ASCII,
  * label what a menu shows, defaults a NULL-terminated list of bindings (or
@@ -92,6 +94,33 @@ void enhance_actions_tick(void);
 /* The pad filter's work (xbox_enhance_pad_filter calls it when armed). */
 void enhance_actions_filter(unsigned port, const struct xbox_host_pad *host,
                             XBOX_INPUT_STATE *st);
+
+/* The in-game menu (enhance_menu.c). */
+int enhance_action_count(void);             /* ids are 0..count-1; dropped ones name NULL */
+const char *enhance_action_label(int id);
+/* The bindings in effect: the menu's (set_bindings), else the highest file's
+ * [input.actions] entry, else the defaults. Returns how many. */
+int enhance_action_bindings(int id, char out[][ENHANCE_ACTION_TEXT], int max);
+int enhance_action_default_bindings(int id, char out[][ENHANCE_ACTION_TEXT], int max);
+/* Bind the action to these n texts at once, over the files (n 0 unbinds;
+ * n -1 drops the menu's list, back to the files and defaults), and
+ * rebuild. Each text should have passed enhance_action_check. */
+int enhance_action_set_bindings(int id, const char *const *texts, int n);
+/* Whether text is a binding the rules accept under the current map: 1 with
+ * its kind in why ("host-only", "a guest chord"...), 0 with the reason the
+ * log would give. Logs nothing. */
+int enhance_action_check(const char *text, char *why, size_t n);
+
+/* Called after every step (the pad filter's, on the poll thread, with st;
+ * the flip tick's for port 0 when the title has stopped polling, st NULL),
+ * outside the step lock, so it may call enhance_actions_mask_until_release.
+ * held: the host sources down, bit per input_map.h source. While a hook is
+ * set, a menu.open fire is a request (enhance_actions_menu_request takes
+ * it) instead of the "Menu is off" toast. */
+typedef void (*enhance_menu_hook_fn)(unsigned port, uint32_t held,
+                                     XBOX_INPUT_STATE *st, uint64_t now_ms);
+void enhance_actions_set_menu_hook(enhance_menu_hook_fn fn);
+int enhance_actions_menu_request(void);
 
 /* Disarm, clear the registry, the bindings and the per-port state (tests). */
 void enhance_actions_reset(void);

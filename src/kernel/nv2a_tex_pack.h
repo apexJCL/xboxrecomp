@@ -138,6 +138,20 @@ void nv2a_tex_pack_miss(uint64_t hash, uint32_t w, uint32_t h, uint32_t color,
                         uint32_t levels);
 /* Copy up to n misses, most counted first; returns how many. */
 unsigned nv2a_tex_pack_misses(struct nv2a_tex_pack_miss *out, unsigned n);
+/* Every miss so far, from any thread (the stats). */
+uint64_t nv2a_tex_pack_miss_total(void);
+
+/* The ring is the upload path's (the walker thread), written without a
+ * lock; a reader on another thread (the in-game menu's Pack and Debug
+ * pages) reads a copy the walker takes at the flip. snapshot_want(1) while
+ * a reader is shown, (0) when it is gone: with no users the flip's call is
+ * one load. misses_snapshot copies up to n of the last copy, most counted
+ * first; 0 when none was taken yet, or the walker was writing it each of
+ * the few times the reader looked (it keeps what it drew). */
+void nv2a_tex_pack_snapshot_want(int on);
+void nv2a_tex_pack_snapshot(void);
+unsigned nv2a_tex_pack_misses_snapshot(struct nv2a_tex_pack_miss *out, unsigned n);
+
 /* Print the misses (RECOMP_TRACE=tex_pack), one "[TEXPACK] miss" line
  * each, to stderr, tagged " (text off)", " (pack off)" or " (entry
  * refused)" when the pack holds the texture. The backends call it every

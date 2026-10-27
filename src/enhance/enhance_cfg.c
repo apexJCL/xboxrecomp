@@ -59,6 +59,7 @@ static void bind_builtins(void)
     enhance_cfg_bind_env("textures.font", RENV_TEXTURES_FONT);
     enhance_cfg_bind_env("textures.text", RENV_TEXTURES_TEXT);
     enhance_cfg_bind_env("overlay.stats", RENV_OVERLAY_STATS);
+    enhance_cfg_bind_env("menu.enabled", RENV_MENU);
 #endif
 }
 
@@ -550,6 +551,23 @@ enhance_cfg_source enhance_cfg_source_of(const char *key)
         if (recomp_cfg_find(s_file[i], key) >= 0)
             return i == SLOT_DEFAULTS ? ENHANCE_SRC_DEFAULTS : ENHANCE_SRC_FILE;
     return ENHANCE_SRC_DEFAULT;
+}
+
+void enhance_cfg_mark_read_prefix(const char *prefix)
+{
+    size_t n = prefix ? strlen(prefix) : 0, k;
+    int i;
+    if (!n)
+        return;
+    for (i = 0; i < ENHANCE_FILES; i++)
+        for (k = 0; s_flags[i] && k < recomp_cfg_count(s_file[i]); k++)
+        {
+            /* Only at a boundary: mod "fx" owns fx.glow and fx_speed but
+             * not fxaa, which stays a typo the report can name. */
+            const char *key = recomp_cfg_key_at(s_file[i], k);
+            if (!strncmp(key, prefix, n) && (!key[n] || key[n] == '.' || key[n] == '_'))
+                s_flags[i][k] |= 1;
+        }
 }
 
 int enhance_cfg_report_unused(void)

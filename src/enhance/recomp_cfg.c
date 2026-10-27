@@ -15,6 +15,16 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef _WIN32
+#include <io.h>
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <limits.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
+
 typedef struct {
     recomp_cfg_type type;
     union { char *s; long long i; double f; int b; } v;
@@ -26,6 +36,11 @@ typedef struct {
     Val val;          /* type RCFG_ARRAY: items below */
     Val *items;
     size_t n_items;
+    /* Where it sits in the text, for recomp_cfg_patch: the line's start,
+     * the value's bytes, and the start of the line after it (past any
+     * comment and the newline); the [header] it sits under, or -1. */
+    size_t lbeg, vbeg, vend, lnext;
+    long tab;
 } Entry;
 
 struct recomp_cfg {
@@ -33,13 +48,15 @@ struct recomp_cfg {
     size_t n, cap;
     char **tables;    /* [headers] seen, to refuse a second [render] */
     size_t n_tables, cap_tables;
+    size_t *tab_at;   /* the start of each header's line, by index */
+    size_t cap_tab_at;
     char **dotted;    /* tables made by dotted keys (a.b = 1 makes a) */
     size_t n_dotted, cap_dotted;
     char *name;
 };
 
 typedef struct {
-    const char *p, *end;
+    const char *base, *p, *end;
     int line;
     recomp_cfg *cfg;
     char *err;
@@ -244,9 +261,10 @@ static int parse_string(P *ps, Buf *out)
 
 /* Tables whose keys are names with dots in them, stored flat: under
  * [input.actions], "menu.open" = [...] (what a TOML writer emits for that
- * key) and menu.open = [...] are the same entry. Only a last key part may
+ * key) and menu.open = [...] are the same entry; so are [mods]
+ * "camera.free" and camera.free (a mod's name is its key). Only a last key part may
  * quote a dot, and only directly under one of these. */
-static const char *const flat_tables[] = { "input.actions." };
+static const char *const flat_tables[] = { "input.actions.", "mods." };
 
 static int flat_quoted(const Buf *out, size_t before)
 {
@@ -587,9 +605,17 @@ static int check_key(P *ps, const char *key)
     return 1;
 }
 
+/* The start of the line `p` is on. */
+static size_t line_start(const P *ps, const char *p)
+{
+    while (p > ps->base && p[-1] != '\n')
+        p--;
+    return (size_t)(p - ps->base);
+}
+
 static int parse_table_header(P *ps, Buf *table)
 {
-    size_t i;
+    size_t i, at = line_start(ps, ps->p);
     ps->p++;   /* '[' */
     if (ps->p < ps->end && *ps->p == '[')
         return fail(ps, "arrays of tables are not supported");
@@ -608,6 +634,15 @@ static int parse_table_header(P *ps, Buf *table)
         if (is_prefix(ps->cfg->e[i].key, table->b))
             return fail(ps, "'%s' is a value (line %d), not a table",
                         ps->cfg->e[i].key, ps->cfg->e[i].line);
+    if (ps->cfg->n_tables == ps->cfg->cap_tab_at) {
+        size_t nc = ps->cfg->cap_tab_at ? ps->cfg->cap_tab_at * 2 : 8;
+        size_t *na = (size_t *)realloc(ps->cfg->tab_at, nc * sizeof *na);
+        if (!na)
+            return fail(ps, "out of memory");
+        ps->cfg->tab_at = na;
+        ps->cfg->cap_tab_at = nc;
+    }
+    ps->cfg->tab_at[ps->cfg->n_tables] = at;
     if (!list_add(&ps->cfg->tables, &ps->cfg->n_tables, &ps->cfg->cap_tables,
                   table->b, table->n))
         return fail(ps, "out of memory");
@@ -621,6 +656,8 @@ static int parse_keyval(P *ps, const Buf *table)
     int line = ps->line;
 
     memset(&e, 0, sizeof e);
+    e.lbeg = line_start(ps, ps->p);
+    e.tab = table->n ? (long)ps->cfg->n_tables - 1 : -1;
     if (table->n && (!buf_put(&key, table->b, table->n) || !buf_put(&key, ".", 1)))
         return fail(ps, "out of memory");
     if (!buf_put(&key, "", 0) || !parse_key(ps, &key))
@@ -633,6 +670,7 @@ static int parse_keyval(P *ps, const Buf *table)
     skip_ws(ps);
     if (!check_key(ps, key.b) || !note_dotted(ps, key.b, table->n ? table->n + 1 : 0))
         goto bad;
+    e.vbeg = (size_t)(ps->p - ps->base);
     if (ps->p < ps->end && *ps->p == '[') {
         e.val.type = RCFG_ARRAY;
         if (!parse_array(ps, &e))
@@ -640,8 +678,10 @@ static int parse_keyval(P *ps, const Buf *table)
     } else if (!parse_scalar(ps, &e.val)) {
         goto bad;
     }
+    e.vend = (size_t)(ps->p - ps->base);
     if (!expect_eol(ps))
         goto bad;
+    e.lnext = (size_t)(ps->p - ps->base);
     if (ps->cfg->n == ps->cfg->cap) {
         size_t nc = ps->cfg->cap ? ps->cfg->cap * 2 : 16;
         Entry *ne = (Entry *)realloc(ps->cfg->e, nc * sizeof *ne);
@@ -715,7 +755,7 @@ recomp_cfg *recomp_cfg_load_string(const char *text, const char *name,
         return NULL;
     }
     memset(&ps, 0, sizeof ps);
-    ps.p = text ? text : "";
+    ps.base = ps.p = text ? text : "";
     ps.end = ps.p + strlen(ps.p);
     ps.line = 1;
     ps.cfg = cfg;
@@ -801,6 +841,7 @@ void recomp_cfg_free(recomp_cfg *cfg)
     for (i = 0; i < cfg->n_tables; i++)
         free(cfg->tables[i]);
     free(cfg->tables);
+    free(cfg->tab_at);
     for (i = 0; i < cfg->n_dotted; i++)
         free(cfg->dotted[i]);
     free(cfg->dotted);
@@ -948,3 +989,683 @@ const char *recomp_cfg_array_string(const recomp_cfg *cfg, const char *key, size
 long long recomp_cfg_array_int(const recomp_cfg *cfg, const char *key, size_t i, long long def) { return val_int(item(cfg, key, i), def); }
 double recomp_cfg_array_float(const recomp_cfg *cfg, const char *key, size_t i, double def) { return val_float(item(cfg, key, i), def); }
 int recomp_cfg_array_bool(const recomp_cfg *cfg, const char *key, size_t i, int def) { return val_bool(item(cfg, key, i), def); }
+
+/* ── patching a file ───────────────────────────────────────────────── */
+
+/* The menu's Save rewrites only what changed: every other byte (comments,
+ * blank lines, key order, the user's spelling) stays as the user wrote it,
+ * and the result is parsed again before anything reaches the disk. */
+
+typedef struct {
+    size_t at, end;   /* replace text[at, end) (at == end inserts) */
+    char *text;
+    size_t seq;       /* call order, so inserts at one place keep it */
+} Edit;
+
+static int vals_equal(const Val *a, const Val *b)
+{
+    if (a->type != b->type)
+        return 0;
+    switch (a->type) {
+    case RCFG_STRING: return !strcmp(a->v.s, b->v.s);
+    case RCFG_INT:    return a->v.i == b->v.i;
+    case RCFG_FLOAT:  return a->v.f == b->v.f || (isnan(a->v.f) && isnan(b->v.f));
+    case RCFG_BOOL:   return !a->v.b == !b->v.b;
+    default:          return 1;
+    }
+}
+
+static int entries_equal(const Entry *a, const Entry *b)
+{
+    size_t i;
+    if (!vals_equal(&a->val, &b->val) || a->n_items != b->n_items)
+        return 0;
+    for (i = 0; i < a->n_items; i++)
+        if (!vals_equal(&a->items[i], &b->items[i]))
+            return 0;
+    return 1;
+}
+
+int recomp_cfg_quote(const char *s, char *out, size_t outlen)
+{
+    Buf b = {0};
+    int ok = buf_put(&b, "\"", 1);
+    for (; ok && s && *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        char esc[8];
+        if (c == '"' || c == '\\') {
+            esc[0] = '\\';
+            esc[1] = (char)c;
+            ok = buf_put(&b, esc, 2);
+        } else if (c < 0x20 || c == 0x7F) {
+            snprintf(esc, sizeof esc, "\\u%04X", c);
+            ok = buf_put(&b, esc, 6);
+        } else {
+            ok = buf_put(&b, (const char *)&c, 1);
+        }
+    }
+    ok = ok && buf_put(&b, "\"", 1);
+    if (!ok || b.n + 1 > outlen) {
+        free(b.b);
+        if (out && outlen)
+            out[0] = 0;
+        return 0;
+    }
+    memcpy(out, b.b, b.n + 1);
+    free(b.b);
+    return 1;
+}
+
+static int put_part(Buf *b, const char *s, size_t n)
+{
+    size_t i;
+    char *tmp, *q;
+    int ok;
+    for (i = 0; i < n && is_bare(s[i]); i++)
+        ;
+    if (n && i == n)
+        return buf_put(b, s, n);
+    if (!(tmp = dup_n(s, n)) || !(q = (char *)malloc(n * 6 + 3))) {
+        free(tmp);
+        return 0;
+    }
+    ok = recomp_cfg_quote(tmp, q, n * 6 + 3) && buf_put(b, q, strlen(q));
+    free(tmp);
+    free(q);
+    return ok;
+}
+
+/* The length of the flat table prefix `key` starts with ("mods."), or 0. */
+static size_t flat_prefix(const char *key)
+{
+    size_t i;
+    for (i = 0; i < sizeof flat_tables / sizeof flat_tables[0]; i++) {
+        size_t n = strlen(flat_tables[i]);
+        if (!strncmp(key, flat_tables[i], n) && key[n])
+            return n;
+    }
+    return 0;
+}
+
+/* `key` spelled for a line under a table whose prefix is key[0, from): the
+ * parts split at dots, except a flat table's name, quoted whole. */
+static int put_key(Buf *b, const char *key, size_t from)
+{
+    size_t flat = flat_prefix(key);
+    const char *p = key + from, *end = key + strlen(key);
+    const char *last = flat && flat >= from ? key + flat : NULL;
+    for (;;) {
+        const char *d;
+        if (last && p == last)
+            return put_part(b, p, (size_t)(end - p));
+        d = memchr(p, '.', (size_t)(end - p));
+        if (!d)
+            d = end;
+        if (!put_part(b, p, (size_t)(d - p)))
+            return 0;
+        if (d == end)
+            return 1;
+        if (!buf_put(b, ".", 1))
+            return 0;
+        p = d + 1;
+    }
+}
+
+/* The table a new `key` belongs in: its prefix length (0 for the root). */
+static size_t natural_table(const char *key)
+{
+    size_t flat = flat_prefix(key);
+    const char *d;
+    if (flat)
+        return flat - 1;
+    d = strrchr(key, '.');
+    return d ? (size_t)(d - key) : 0;
+}
+
+static long header_of(const recomp_cfg *c, const char *key, size_t len)
+{
+    size_t i;
+    for (i = 0; i < c->n_tables; i++)
+        if (strlen(c->tables[i]) == len && !strncmp(c->tables[i], key, len))
+            return (long)i;
+    return -1;
+}
+
+/* The source spans of an array's items, from its '[' to past its ']'.
+ * Blanks, newlines and comments between items are skipped; strings are
+ * scanned to their closing quote, so a '#' or ',' in one is not a break.
+ * Returns the item count, or -1 for anything this does not handle (a nested
+ * array, a multi-line string): the caller then replaces the whole value. */
+#define ARRAY_EDIT_MAX 32
+
+static long array_items(const char *s, size_t at, size_t end, size_t *beg, size_t *fin, size_t max)
+{
+    size_t p = at + 1;
+    long n = 0;
+    if (at >= end || s[at] != '[')
+        return -1;
+    for (;;) {
+        while (p < end && (s[p] == ' ' || s[p] == '\t' || s[p] == '\r' || s[p] == '\n' || s[p] == '#')) {
+            if (s[p] == '#')
+                while (p < end && s[p] != '\n')
+                    p++;
+            else
+                p++;
+        }
+        if (p >= end)
+            return -1;
+        if (s[p] == ']')
+            return n;
+        if ((size_t)n == max || s[p] == '[' || s[p] == ',')
+            return -1;
+        beg[n] = p;
+        if (s[p] == '"' || s[p] == '\'') {
+            char q = s[p++];
+            if (p + 1 < end && s[p] == q && s[p + 1] == q)
+                return -1;
+            while (p < end && s[p] != q && s[p] != '\n')
+                p += (q == '"' && s[p] == '\\' && p + 1 < end) ? 2 : 1;
+            if (p >= end || s[p] != q)
+                return -1;
+            p++;
+        } else {
+            while (p < end && !strchr(" \t\r\n,]#", s[p]))
+                p++;
+        }
+        fin[n++] = p;
+        while (p < end && (s[p] == ' ' || s[p] == '\t' || s[p] == '\r' || s[p] == '\n' || s[p] == '#')) {
+            if (s[p] == '#')
+                while (p < end && s[p] != '\n')
+                    p++;
+            else
+                p++;
+        }
+        if (p < end && s[p] == ',')
+            p++;
+        else if (p >= end || s[p] != ']')
+            return -1;
+    }
+}
+
+static int add_edit(Edit **ed, size_t *n, size_t at, size_t end, const char *text, size_t tn)
+{
+    Edit *ne = (Edit *)realloc(*ed, (*n + 1) * sizeof *ne);
+    if (!ne)
+        return 0;
+    *ed = ne;
+    ne[*n].at = at;
+    ne[*n].end = end;
+    ne[*n].seq = *n;
+    if (!(ne[*n].text = dup_n(text, tn)))
+        return 0;
+    (*n)++;
+    return 1;
+}
+
+static int edit_cmp(const void *a, const void *b)
+{
+    const Edit *x = (const Edit *)a, *y = (const Edit *)b;
+    if (x->at != y->at)
+        return x->at < y->at ? -1 : 1;
+    return x->seq < y->seq ? -1 : x->seq > y->seq;
+}
+
+static void perr(char *err, size_t errlen, const char *fmt, ...)
+{
+    va_list ap;
+    if (!err || !errlen)
+        return;
+    va_start(ap, fmt);
+    vsnprintf(err, errlen, fmt, ap);
+    va_end(ap);
+}
+
+char *recomp_cfg_patch_text(const char *text, const char *name,
+                            const char *const *keys, const char *const *values,
+                            size_t n, char *err, size_t errlen)
+{
+    recomp_cfg *orig = NULL, *after = NULL, **want = NULL;
+    Edit *ed = NULL;
+    size_t ned = 0, i, k, len, expect;
+    char *work = NULL, *out = NULL;
+    const char *eol;
+    unsigned char *del_tab = NULL;   /* per header: 1 when it is removed */
+    unsigned char *ins_tab = NULL;   /* per header: 1 when a key goes in */
+    Buf tail = {0}, line = {0}, res = {0};
+    char e2[256];
+    int ok = 0;
+
+    if (err && errlen)
+        err[0] = 0;
+    name = name ? name : "<string>";
+    text = text ? text : "";
+    len = strlen(text);
+    /* A last line without its newline gets one, so a key can follow it. */
+    if (!(work = (char *)malloc(len + 2)))
+        goto oom;
+    memcpy(work, text, len + 1);
+    if (len && work[len - 1] != '\n') {
+        work[len++] = '\n';
+        work[len] = 0;
+    }
+    eol = strstr(work, "\r\n") ? "\r\n" : "\n";
+    if (!(orig = recomp_cfg_load_string(work, name, e2, sizeof e2))) {
+        perr(err, errlen, "%s (left as it is)", e2);
+        goto done;
+    }
+    want = (recomp_cfg **)calloc(n ? n : 1, sizeof *want);
+    del_tab = (unsigned char *)calloc(orig->n_tables + 1, 1);
+    ins_tab = (unsigned char *)calloc(orig->n_tables + 1, 1);
+    if (!want || !del_tab || !ins_tab)
+        goto oom;
+
+    /* Each new value must be one TOML value on its own. */
+    for (i = 0; i < n; i++) {
+        Buf t = {0};
+        if (!keys[i] || !*keys[i] || keys[i][0] == '.' || strstr(keys[i], "..") ||
+            keys[i][strlen(keys[i]) - 1] == '.') {
+            perr(err, errlen, "%s: bad key '%s'", name, keys[i] ? keys[i] : "");
+            goto done;
+        }
+        for (k = 0; k < i; k++)
+            if (!strcmp(keys[k], keys[i])) {
+                perr(err, errlen, "%s: key '%s' given twice", name, keys[i]);
+                goto done;
+            }
+        if (!values[i])
+            continue;
+        if (!buf_put(&t, "v = ", 4) || !buf_put(&t, values[i], strlen(values[i])) ||
+            !buf_put(&t, "\n", 1)) {
+            free(t.b);
+            goto oom;
+        }
+        want[i] = recomp_cfg_load_string(t.b, keys[i], e2, sizeof e2);
+        free(t.b);
+        if (!want[i] || want[i]->n != 1) {
+            perr(err, errlen, "%s: bad value for %s: %s", name, keys[i],
+                 want[i] ? "more than one value" : e2);
+            goto done;
+        }
+    }
+
+    /* Changed and removed keys, where they are. */
+    for (i = 0; i < n; i++) {
+        long at = recomp_cfg_find(orig, keys[i]);
+        const Entry *e;
+        if (at < 0)
+            continue;
+        e = &orig->e[at];
+        if (values[i]) {
+            /* An array that keeps its item count is edited item by item, so
+             * a binding list written one per line keeps its layout and the
+             * comments between the items. */
+            size_t ob[ARRAY_EDIT_MAX], oe[ARRAY_EDIT_MAX], nb[ARRAY_EDIT_MAX], ne[ARRAY_EDIT_MAX];
+            size_t vl = strlen(values[i]);
+            long on = array_items(work, e->vbeg, e->vend, ob, oe, ARRAY_EDIT_MAX);
+            long nn = array_items(values[i], 0, vl, nb, ne, ARRAY_EDIT_MAX);
+            if (on > 0 && on == nn) {
+                for (k = 0; k < (size_t)on; k++)
+                    if (!add_edit(&ed, &ned, ob[k], oe[k], values[i] + nb[k], ne[k] - nb[k]))
+                        goto oom;
+            } else if (!add_edit(&ed, &ned, e->vbeg, e->vend, values[i], vl)) {
+                goto oom;
+            }
+        } else if (!add_edit(&ed, &ned, e->lbeg, e->lnext, "", 0)) {
+            goto oom;
+        }
+    }
+
+    /* New keys: under their own [header] when the file has one, at the root
+     * when a dotted key there already made their table, else in a new
+     * [header] at the end. */
+    for (i = 0; i < n; i++) {
+        size_t tl, from, at;
+        long h;
+        if (!values[i] || recomp_cfg_find(orig, keys[i]) >= 0)
+            continue;
+        tl = natural_table(keys[i]);
+        h = tl ? header_of(orig, keys[i], tl) : -1;
+        if (tl && h < 0 && list_has(orig->dotted, orig->n_dotted, keys[i], tl)) {
+            /* the longest header above it, else the root */
+            size_t best = 0;
+            for (k = 0; k < orig->n_tables; k++) {
+                size_t hl = strlen(orig->tables[k]);
+                if (hl < tl && hl > best && is_prefix(orig->tables[k], keys[i])) {
+                    best = hl;
+                    h = (long)k;
+                }
+            }
+            tl = best;
+        } else if (tl && h < 0) {
+            continue;   /* a new header, below */
+        }
+        from = tl ? tl + 1 : 0;
+        line.n = 0;
+        if (!buf_put(&line, "", 0) || !put_key(&line, keys[i], from) ||
+            !buf_put(&line, " = ", 3) || !buf_put(&line, values[i], strlen(values[i])) ||
+            !buf_put(&line, eol, strlen(eol)))
+            goto oom;
+        at = (size_t)-1;
+        for (k = 0; k < orig->n; k++)
+            if (orig->e[k].tab == h && (at == (size_t)-1 || orig->e[k].lnext > at))
+                at = orig->e[k].lnext;
+        if (at == (size_t)-1) {
+            if (h >= 0) {
+                const char *nl = strchr(work + orig->tab_at[h], '\n');
+                at = nl ? (size_t)(nl + 1 - work) : len;
+            } else if (orig->n_tables) {
+                at = orig->tab_at[0];
+                if (!buf_put(&line, eol, strlen(eol)))
+                    goto oom;
+            } else {
+                at = len;
+            }
+        }
+        if (h >= 0)
+            ins_tab[h] = 1;
+        if (!add_edit(&ed, &ned, at, at, line.b, line.n))
+            goto oom;
+    }
+    for (i = 0; i < n; i++) {
+        size_t tl;
+        if (!values[i] || recomp_cfg_find(orig, keys[i]) >= 0)
+            continue;
+        tl = natural_table(keys[i]);
+        if (!tl || header_of(orig, keys[i], tl) >= 0 ||
+            list_has(orig->dotted, orig->n_dotted, keys[i], tl))
+            continue;
+        /* the first key of this new table writes the header and all of its
+         * keys, in the order given */
+        for (k = 0; k < i; k++)
+            if (values[k] && recomp_cfg_find(orig, keys[k]) < 0 &&
+                natural_table(keys[k]) == tl && !strncmp(keys[k], keys[i], tl))
+                break;
+        if (k < i)
+            continue;
+        if ((len || tail.n) && !buf_put(&tail, eol, strlen(eol)))
+            goto oom;
+        {
+            char *tname = dup_n(keys[i], tl);
+            int hok = tname && buf_put(&tail, "[", 1) && put_key(&tail, tname, 0);
+            free(tname);
+            if (!hok)
+                goto oom;
+        }
+        if (!buf_put(&tail, "]", 1) || !buf_put(&tail, eol, strlen(eol)))
+            goto oom;
+        for (k = i; k < n; k++) {
+            if (!values[k] || recomp_cfg_find(orig, keys[k]) >= 0 ||
+                natural_table(keys[k]) != tl || strncmp(keys[k], keys[i], tl))
+                continue;
+            if (!put_key(&tail, keys[k], tl + 1) || !buf_put(&tail, " = ", 3) ||
+                !buf_put(&tail, values[k], strlen(values[k])) ||
+                !buf_put(&tail, eol, strlen(eol)))
+                goto oom;
+        }
+    }
+
+    /* A [header] left with nothing under it goes too, unless it carries a
+     * comment: a comment is the user's and is never dropped. */
+    for (k = 0; k < orig->n_tables; k++) {
+        size_t s = orig->tab_at[k];
+        size_t e = k + 1 < orig->n_tables ? orig->tab_at[k + 1] : len;
+        size_t p, cnt = 0, gone = 0;
+        const char *nl;
+        int clean = 1;
+        if (ins_tab[k])
+            continue;
+        for (i = 0; i < orig->n; i++) {
+            if (orig->e[i].tab != (long)k)
+                continue;
+            cnt++;
+            for (size_t j = 0; j < n; j++)
+                if (!values[j] && !strcmp(keys[j], orig->e[i].key))
+                    gone++;
+        }
+        if (!cnt || gone != cnt)
+            continue;
+        nl = memchr(work + s, '\n', e - s);
+        p = nl ? (size_t)(nl + 1 - work) : e;
+        if (memchr(work + s, '#', p - s))
+            continue;
+        while (p < e && clean) {
+            for (i = 0; i < orig->n; i++)
+                if (orig->e[i].tab == (long)k && orig->e[i].lbeg == p)
+                    break;
+            if (i < orig->n) {
+                p = orig->e[i].lnext;
+                continue;
+            }
+            if (work[p] != ' ' && work[p] != '\t' && work[p] != '\r' && work[p] != '\n')
+                clean = 0;
+            p++;
+        }
+        if (clean) {
+            del_tab[k] = 1;
+            if (!add_edit(&ed, &ned, s, e, "", 0))
+                goto oom;
+        }
+    }
+    /* drop the line removals a removed section already covers */
+    for (i = 0; i < ned; i++) {
+        for (k = 0; k < orig->n_tables; k++) {
+            size_t s = orig->tab_at[k];
+            size_t e = k + 1 < orig->n_tables ? orig->tab_at[k + 1] : len;
+            if (del_tab[k] && ed[i].at >= s && ed[i].end <= e && !(ed[i].at == s && ed[i].end == e))
+                ed[i].at = ed[i].end = (size_t)-1;
+        }
+    }
+
+    qsort(ed, ned, sizeof *ed, edit_cmp);
+    {
+        size_t cur = 0;
+        if (!buf_put(&res, "", 0))
+            goto oom;
+        for (i = 0; i < ned; i++) {
+            if (ed[i].at == (size_t)-1)
+                continue;
+            if (ed[i].at < cur) {
+                perr(err, errlen, "%s: overlapping edits (left as it is)", name);
+                goto done;
+            }
+            if (!buf_put(&res, work + cur, ed[i].at - cur) ||
+                !buf_put(&res, ed[i].text, strlen(ed[i].text)))
+                goto oom;
+            cur = ed[i].end;
+        }
+        if (!buf_put(&res, work + cur, len - cur) || (tail.n && !buf_put(&res, tail.b, tail.n)))
+            goto oom;
+    }
+
+    /* The check: the new text must say exactly the old file plus the patch. */
+    if (!(after = recomp_cfg_load_string(res.b, name, e2, sizeof e2))) {
+        perr(err, errlen, "the patched file does not parse: %s (left as it is)", e2);
+        goto done;
+    }
+    expect = orig->n;
+    for (i = 0; i < n; i++) {
+        int had = recomp_cfg_find(orig, keys[i]) >= 0;
+        const Entry *got = entry_get(after, keys[i]);
+        if (values[i] && !had)
+            expect++;
+        if (!values[i] && had)
+            expect--;
+        if (values[i] ? !got || !entries_equal(got, &want[i]->e[0]) : got != NULL) {
+            perr(err, errlen, "%s: %s did not come out as asked (left as it is)", name, keys[i]);
+            goto done;
+        }
+    }
+    for (i = 0; i < orig->n; i++) {
+        const Entry *got;
+        for (k = 0; k < n && strcmp(keys[k], orig->e[i].key); k++)
+            ;
+        if (k < n)
+            continue;
+        got = entry_get(after, orig->e[i].key);
+        if (!got || !entries_equal(got, &orig->e[i])) {
+            perr(err, errlen, "%s: %s would change (left as it is)", name, orig->e[i].key);
+            goto done;
+        }
+    }
+    if (after->n != expect) {
+        perr(err, errlen, "%s: the patch adds keys it was not asked to (left as it is)", name);
+        goto done;
+    }
+    /* Nothing changed: hand back the caller's own text, newline and all. */
+    if (!strcmp(res.b, work) && strlen(text) != len)
+        out = dup_n(text, strlen(text));
+    else
+        out = dup_n(res.b, res.n);
+    if (!out)
+        goto oom;
+    ok = 1;
+    goto done;
+oom:
+    perr(err, errlen, "%s: out of memory", name);
+done:
+    for (i = 0; i < ned; i++)
+        free(ed[i].text);
+    free(ed);
+    if (want)
+        for (i = 0; i < n; i++)
+            recomp_cfg_free(want[i]);
+    free(want);
+    free(del_tab);
+    free(ins_tab);
+    free(tail.b);
+    free(line.b);
+    free(res.b);
+    free(work);
+    recomp_cfg_free(orig);
+    recomp_cfg_free(after);
+    if (!ok) {
+        free(out);
+        out = NULL;
+    }
+    return out;
+}
+
+int recomp_cfg_patch(const char *path, const char *const *keys,
+                     const char *const *values, size_t n, char *err, size_t errlen)
+{
+    char *text = NULL, *res, *tmp, *real = NULL;
+    size_t plen = strlen(path);
+    FILE *f;
+    int rc = -1;
+
+    if (err && errlen)
+        err[0] = 0;
+    f = fopen(path, "rb");
+    if (f) {
+        long size;
+        size_t got;
+        if (fseek(f, 0, SEEK_END) != 0 || (size = ftell(f)) < 0 || fseek(f, 0, SEEK_SET) != 0 ||
+            !(text = (char *)malloc((size_t)size + 1))) {
+            fclose(f);
+            perr(err, errlen, "%s: cannot read", path);
+            return -1;
+        }
+        got = fread(text, 1, (size_t)size, f);
+        fclose(f);
+        text[got] = 0;
+        if (strlen(text) != got) {
+            perr(err, errlen, "%s: NUL byte in file (left as it is)", path);
+            free(text);
+            return -1;
+        }
+    } else if (errno != ENOENT) {
+        perr(err, errlen, "%s: cannot open: %s", path, strerror(errno));
+        return -1;
+    }
+    res = recomp_cfg_patch_text(text, path, keys, values, n, err, errlen);
+    if (!res) {
+        free(text);
+        return -1;
+    }
+    if (text ? !strcmp(res, text) : !*res) {
+        free(text);
+        free(res);
+        return 0;   /* nothing to write */
+    }
+    free(text);
+#ifndef _WIN32
+    /* A config.toml that is a symlink (a dotfiles repo, a shared config on
+     * another drive) is written at its target: renaming over the link
+     * would turn it into a plain file and cut it off from the target. */
+    {
+        struct stat st;
+        if (lstat(path, &st) == 0 && S_ISLNK(st.st_mode)) {
+            if (!(real = realpath(path, NULL))) {
+                perr(err, errlen, "%s: cannot follow the link: %s", path, strerror(errno));
+                free(res);
+                return -1;
+            }
+            path = real;
+            plen = strlen(path);
+        }
+    }
+#endif
+    /* A whole new file beside the old one, then one rename: a crash leaves
+     * the old file or the new one, never half of each. */
+    if (!(tmp = (char *)malloc(plen + 5))) {
+        perr(err, errlen, "%s: out of memory", path);
+        free(res);
+        free(real);
+        return -1;
+    }
+    memcpy(tmp, path, plen);
+    memcpy(tmp + plen, ".tmp", 5);
+    f = fopen(tmp, "wb");
+    if (!f) {
+        perr(err, errlen, "%s: cannot write: %s", tmp, strerror(errno));
+    } else {
+        size_t rn = strlen(res);
+        int wok = fwrite(res, 1, rn, f) == rn;
+        wok = (fflush(f) == 0) && wok;
+        /* The data must be on the disk before the rename is: a delayed
+         * allocation filesystem (exFAT on an SD card, ext4 without
+         * auto_da_alloc) can otherwise land the rename first and leave an
+         * empty config.toml after a power loss right after Save. */
+#ifdef _WIN32
+        wok = wok && FlushFileBuffers((HANDLE)_get_osfhandle(_fileno(f)));
+#else
+        wok = wok && fsync(fileno(f)) == 0;
+#endif
+        wok = (fclose(f) == 0) && wok;
+        if (!wok) {
+            perr(err, errlen, "%s: write failed", tmp);
+            remove(tmp);
+        }
+#ifdef _WIN32
+        else if (!MoveFileExA(tmp, path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            perr(err, errlen, "%s: cannot replace (error %lu)", path, (unsigned long)GetLastError());
+            remove(tmp);
+        }
+#else
+        else if (rename(tmp, path) != 0) {
+            perr(err, errlen, "%s: cannot replace: %s", path, strerror(errno));
+            remove(tmp);
+        }
+#endif
+        else
+            rc = 0;
+    }
+#ifndef _WIN32
+    /* ...and the rename itself is only durable once its directory is. A
+     * failure here is not reported: the file is already in place. */
+    if (rc == 0) {
+        const char *slash = strrchr(path, '/');
+        char *dir = slash ? dup_n(path, slash == path ? 1 : (size_t)(slash - path)) : NULL;
+        int fd = open(dir ? dir : ".", O_RDONLY);
+        if (fd >= 0) {
+            fsync(fd);
+            close(fd);
+        }
+        free(dir);
+    }
+#endif
+    free(tmp);
+    free(real);
+    free(res);
+    return rc;
+}

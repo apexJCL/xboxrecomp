@@ -83,6 +83,36 @@ int recomp_cfg_line(const recomp_cfg *cfg, const char *key);
 /* The name given at load (the path, for a file). */
 const char *recomp_cfg_name(const recomp_cfg *cfg);
 
+/* ---- writing: the menu's Save ------------------------------------------ */
+
+/* Set or remove keys in a config text and touch nothing else: a key that
+ * is there keeps its line, spelling and comment and gets only its new value;
+ * a new key goes under its table's [header] (a new [header] at the end when
+ * the file has none); NULL removes the key's line, and a [header] left with
+ * no keys and no comment. Each value is TOML as it would follow "key = "
+ * ("2", "\"linear\"", "[\"F10\", \"guide+a\"]"). An array that keeps its
+ * item count is edited item by item, so its layout and the comments between
+ * its items stay; one that grows or shrinks is written on one line and
+ * loses them. A comment line above a removed key stays (it cannot be told
+ * from a note on the table). CRLF files stay CRLF.
+ * The result is parsed again and must hold exactly the old keys plus the
+ * patch, else nothing comes back. Returns the new text (free() it), or NULL
+ * with `err` set; a text that does not parse is refused, never repaired. */
+char *recomp_cfg_patch_text(const char *text, const char *name,
+                            const char *const *keys, const char *const *values,
+                            size_t n, char *err, size_t errlen);
+
+/* The same on a file (missing is empty): the new text goes to "<path>.tmp",
+ * is flushed to the disk and renamed over the file, so a crash or a power
+ * loss leaves one whole file. A path that is a symlink is written at its
+ * target and stays a link (POSIX; on Windows the link is replaced). Nothing
+ * is written when nothing changes. 0, or -1 with `err` set. */
+int recomp_cfg_patch(const char *path, const char *const *keys,
+                     const char *const *values, size_t n, char *err, size_t errlen);
+
+/* `s` as a TOML basic string, quotes included. 0 when it does not fit. */
+int recomp_cfg_quote(const char *s, char *out, size_t outlen);
+
 #ifdef __cplusplus
 }
 #endif

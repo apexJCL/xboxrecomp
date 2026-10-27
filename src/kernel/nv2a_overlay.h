@@ -119,6 +119,7 @@ void nv2a_overlay_placement(int *x, int *y, int *w, int *h);
 
 /* The presenter's name for the strip ("Metal", "D3D11", "SDL"). */
 void nv2a_overlay_set_presenter(const char *name);
+const char *nv2a_overlay_presenter(void);   /* NULL before the first present */
 /* Called from any thread when what the overlay draws moved (a publish,
  * the visible mask, a toast): a presenter that sleeps between frames
  * wakes its loop. It must not block or take the overlay's calls. */

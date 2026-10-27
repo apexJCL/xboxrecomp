@@ -40,15 +40,7 @@ static int fails;
 int xbox_PacingMode(void) { return 1; }
 unsigned nv2a_host_render_scale(void) { return 2; }
 uint64_t nv2a_tex_pack_hits(void) { return 7; }
-unsigned nv2a_tex_pack_misses(struct nv2a_tex_pack_miss *out, unsigned n)
-{
-    if (n < 2)
-        return 0;
-    memset(out, 0, 2 * sizeof *out);
-    out[0].count = 3;
-    out[1].count = 4;
-    return 2;
-}
+uint64_t nv2a_tex_pack_miss_total(void) { return 7; }
 
 static const char *s_ref_out;
 

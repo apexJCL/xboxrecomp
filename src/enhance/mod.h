@@ -55,6 +55,7 @@ extern "C" {
 #define XBOX_MOD_API_VERSION 2u
 
 struct xbox_mod_api;
+struct enhance_item;            /* enhance_menu.h */
 
 struct xbox_mod {
     const char *name;           /* the log lines' [MOD name] */
@@ -119,11 +120,23 @@ struct xbox_mod_api {
     /* Fires since the last call (any thread); held now past its hold. */
     int (*action_pressed)(int id);
     int (*action_down)(int id);
-    /* Reserved for the menu (phase 3D): NULL until then. */
-    void *menu_add;
-    /* Reserved (phase 3D): fn(user) when the mod's enable key changes
-     * live. NULL until then. */
-    void *on_enable;
+    /* Init only. An item (enhance_menu.h) on the mod's own sub-page of the
+     * menu's Mods page: entering the mod's row lists them. The item is kept,
+     * not copied, so it must outlive the process (a static). Its key
+     * persists through Save like the toolkit's. Returns 0 when the table is
+     * full (XBOX_MOD_MAX_ITEMS) or the item has no key or label. */
+    int (*menu_add)(const struct enhance_item *it);
+    /* Init only. fn(on, user) when the Mods page turns the mod off (0) or
+     * on (1). The toolkit records the request and calls fn from the next
+     * xbox_mod_frame, on the guest's thread, so the mod changes guest
+     * memory and its own state from the thread its on_frame uses. Only
+     * the last toggle before a frame reaches fn, so fn may be told the
+     * state the mod is already in: it must be idempotent. Off stops
+     * nothing by itself: on_frame, the filters and armed actions keep
+     * being called, and the mod gates them while it is off. A mod that
+     * gives none shows "applies at restart" on its row. Returns 0 when fn
+     * is NULL or outside init. */
+    int (*on_enable)(void (*fn)(int on, void *user), void *user);
     /* A short message on screen; a "[MOD <name>] toast:" line until the
      * overlay lands (phase 3B). */
     void (*toast)(const struct xbox_mod *m, const char *fmt, ...);
@@ -136,6 +149,7 @@ struct xbox_mod_api {
 
 #define XBOX_MOD_MAX_FRAME   16
 #define XBOX_MOD_MAX_FILTER  8
+#define XBOX_MOD_MAX_ITEMS   32
 
 /* Guest memory through the API: XBOX_MOD_MEM32(api, 0x0035C2A0) = 1. The
  * guest is little-endian and so is every host the toolkit runs on. */
@@ -163,6 +177,30 @@ int xbox_mod_input_captured(void);
  * input_core.c and does not call it. */
 void xbox_enhance_pad_filter(DWORD port, const struct xbox_host_pad *host,
                              XBOX_INPUT_STATE *st);
+
+/* ---- the menu's Mods page ---------------------------------------------
+ *
+ * The toolkit keeps the table, each init's result and the enable state.
+ * `mods.<name>` (bool, default true) is the persisted key: a mod set false
+ * is not inited at start. Index i is the table's. */
+enum xbox_mod_state {
+    XBOX_MOD_ON = 0,
+    XBOX_MOD_OFF,           /* off now: by its key at start, or live */
+    XBOX_MOD_FAILED,        /* init returned non-zero */
+    XBOX_MOD_RESTART        /* the change applies at the next start */
+};
+int xbox_mod_count(void);                   /* entries in the table */
+const char *xbox_mod_name(int i);
+enum xbox_mod_state xbox_mod_state(int i);
+const char *xbox_mod_state_name(enum xbox_mod_state s);   /* "on", ... */
+int xbox_mod_has_on_enable(int i);
+int xbox_mod_enabled(int i);                /* the key's value as set now */
+/* The Mods page's toggle (any thread): through on_enable at the next
+ * xbox_mod_frame when the mod gave one and runs, else recorded for the
+ * next start. Returns the new state. */
+enum xbox_mod_state xbox_mod_set_enabled(int i, int on);
+/* The items mod i added with menu_add, in order; returns the count. */
+int xbox_mod_items(int i, const struct enhance_item **out, int max);
 
 /* Removes the filter, stops the frame dispatch, then the mods' shutdowns,
  * in reverse order, and the capture released. Runs once; the exit paths

@@ -87,7 +87,8 @@ extern "C" {
     X(TEXTURES_FONT,     CONFIG, "RECOMP_TEXTURES_FONT",     NULL, "enhancements: textures.font, the pack's font-atlas entries, on (default) or off") \
     X(TEXTURES_TEXT,     CONFIG, "RECOMP_TEXTURES_TEXT",     NULL, "enhancements: textures.text, the pack's baked-text entries, on (default) or off") \
     X(INPUT_CHORD_DELAY_MS, CONFIG, "RECOMP_INPUT_CHORD_DELAY_MS", NULL, "enhancements: input.chord_delay_ms, ms a host-action chord member is held back from the game after its press, 0 (default) to 100") \
-    X(OVERLAY_STATS,     CONFIG, "RECOMP_OVERLAY_STATS",     NULL, "enhancements: overlay.stats, the stats strip (fps, frame ms, pacing, scale, backend) in the window's top right corner (1/0, default 0)")
+    X(OVERLAY_STATS,     CONFIG, "RECOMP_OVERLAY_STATS",     NULL, "enhancements: overlay.stats, the stats strip (fps, frame ms, pacing, scale, backend) in the window's top right corner (1/0, default 0)") \
+    X(MENU,              CONFIG, "RECOMP_MENU",              NULL, "enhancements: menu.enabled, the in-game enhancements menu opened by the menu.open action (F10, guide+a, paddle1) (1/0, default 0)")
 #else
 #define RECOMP_ENV_ENHANCE_KEYS(X)
 #endif

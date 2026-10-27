@@ -219,6 +219,11 @@ void nv2a_overlay_set_presenter(const char *name)
     __atomic_store_n(&s_presenter, name, __ATOMIC_RELAXED);
 }
 
+const char *nv2a_overlay_presenter(void)
+{
+    return __atomic_load_n(&s_presenter, __ATOMIC_RELAXED);
+}
+
 /* ── Writer side ── */
 
 struct nv2a_ovl_build *nv2a_overlay_build_begin(enum nv2a_overlay_layer l,

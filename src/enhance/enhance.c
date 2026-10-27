@@ -10,6 +10,7 @@
 #include "enhance_actions.h"
 #include "enhance_cfg.h"
 #include "enhance_input.h"
+#include "enhance_menu.h"
 #include "kernel_pacing.h"
 #include "mod.h"
 #include "nv2a_backend_common.h"
@@ -212,6 +213,9 @@ int xbox_enhance_init(const char *root, const char *title)
             && stats)
             nv2a_overlay_set_stats(1);
     }
+    /* The menu (menu.enabled) arms its own layer and the actions hook's
+     * menu step; off, it logs that and nothing more. */
+    enhance_menu_start();
     /* No enhance_cfg_report_unused() here: the title reads its own keys
      * (game.mode, say) after this, and calls it then. */
     return rc;

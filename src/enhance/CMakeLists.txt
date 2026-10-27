@@ -9,13 +9,15 @@
 #                  filter and the flip tick (enhance_actions.h)
 #   mod.c          the mods: the title's table, the mod API, the frame and
 #                  batch-filter dispatch (mod.h)
+#   enhance_menu.c the in-game menu (menu.enabled): items, pages, Save
+#                  (enhance_menu.h)
 # docs/runtime/config.md has the file format and the keys.
 #
 # The layer links the runtime (xbox_kernel, for nv2a_host_opts_set), never
 # the other way round: with the layer off the options stay zero (stock).
 
 add_library(xbox_enhance STATIC recomp_cfg.c enhance_cfg.c enhance.c enhance_input.c
-    enhance_actions.c mod.c)
+    enhance_actions.c mod.c enhance_menu.c)
 target_include_directories(xbox_enhance PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(xbox_enhance PUBLIC recomp_env xbox_kernel xbox_input)
 if(NOT MSVC)

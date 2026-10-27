@@ -112,6 +112,12 @@ const recomp_cfg *enhance_cfg_defaults(void);
  * init. Returns the count. */
 int enhance_cfg_report_unused(void);
 
+/* Mark every file key that is `prefix` or starts with it and then '.' or
+ * '_' as read: a mod switched off by mods.<name> never runs the init that
+ * reads its keys ("camera.free", "camera.free_speed"), and those keys are
+ * not typos. "camera.freecam" is not the mod's and is still reported. */
+void enhance_cfg_mark_read_prefix(const char *prefix);
+
 #ifdef __cplusplus
 }
 #endif

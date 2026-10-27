@@ -54,6 +54,9 @@ void nv2a_overlay_set_stats(int on) { (void)on; }
 int nv2a_overlay_stats(void) { return 0; }
 /* api_toast's overlay push: the last line, to check the mod's text. */
 static char s_toast_last[256];
+/* The menu (tests/enhance_menu has it): enhance.c starts it. */
+void enhance_menu_start(void);
+void enhance_menu_start(void) {}
 void nv2a_overlay_toast(const char *fmt, ...)
 {
     va_list ap;
@@ -528,6 +531,30 @@ static void test_exit_hooks(void)
     CHECK(s_hooks_run == 7);
 }
 
+/* ---- 8. a mod off by mods.<name> takes its keys' warnings with it ---- */
+
+static void test_off_keys(void)
+{
+    static const struct xbox_mod *const mods[] = { &k_beta, NULL };
+
+    /* beta never inits, so nothing reads beta.speed, beta.hud or
+     * beta_lives; they are the mod's, not typos. A key outside its prefix
+     * still warns, and so does one that only shares its letters (betamax). */
+    write_file("config/config.toml",
+               "beta_lives = 3\nbetamax = 1\n\n[mods]\nbeta = false\n\n[beta]\nspeed = 2\nhud = 1\n"
+               "\n[render]\nscael = 2\n");
+    enhance_cfg_shutdown();
+    CHECK(enhance_cfg_init(".", NULL) >= 1);
+    xbox_mod_register_table(mods);
+    s_log[0] = 0;
+    CHECK(xbox_mod_init() == 0);
+    CHECK(s_log[0] == 0);
+    CHECK(xbox_mod_state(0) == XBOX_MOD_OFF);
+    CHECK(enhance_cfg_report_unused() == 2);    /* betamax and render.scael */
+    xbox_mod_shutdown();
+    enhance_cfg_shutdown();
+}
+
 int main(void)
 {
     test_table();
@@ -537,6 +564,7 @@ int main(void)
     test_failed_init_capture();
     test_shutdown_once();
     test_exit_hooks();
+    test_off_keys();
     printf("enhance_mod: %d checks, %d failed\n", s_checks, s_fail);
     return s_fail ? 1 : 0;
 }

@@ -979,6 +979,9 @@ int nv2a_overlay_arm(uint32_t layers, uint32_t out_h)
 }
 void nv2a_overlay_set_stats(int on) { s_ovl_stats = on; }
 int nv2a_overlay_stats(void) { return s_ovl_stats > 0; }
+/* The menu (tests/enhance_menu has it): enhance.c starts it. */
+void enhance_menu_start(void);
+void enhance_menu_start(void) {}
 void nv2a_overlay_toast(const char *fmt, ...) { (void)fmt; }
 DWORD xbox_InputLastState(DWORD port, XBOX_INPUT_STATE *st)
 {

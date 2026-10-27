@@ -131,6 +131,10 @@ struct action {
     int  live;              /* 0: a dropped mod's slot, never reused (ids stay) */
     int  pressed;           /* atomic: fires not yet taken */
     uint32_t down;          /* atomic: bit per binding held past its hold */
+    /* The menu's Controls page: bindings set live, over the files and the
+     * defaults until Save writes them (enhance_action_set_bindings). */
+    char ovr[ENHANCE_ACTION_BINDS][TEXT_MAX];
+    int  novr, has_ovr;
 };
 
 static struct action s_act[ENHANCE_ACTIONS_MAX];
@@ -204,22 +208,31 @@ static void disarm_where(int all_mods, int owner);
 static uint64_t s_log_sec;
 static int s_log_n, s_log_dropped;
 
-/* The toolkit's actions that act at the fire (menu.open toasts until the
- * menu, 3D, takes it over). Fires run under s_step_lock, so the strip's
- * read-then-set never races another fire. */
+/* The toolkit's actions that act at the fire. Fires run under
+ * s_step_lock, so the strip's read-then-set never races another fire. */
 static int s_stats_act = -1;
 static int s_menu_act = -1;
+
+/* The menu (enhance_menu.c): its hook runs after each step, outside the
+ * step lock, and a menu.open fire is a request it takes there. */
+static enhance_menu_hook_fn s_menu_hook;
+static int s_menu_req;
 
 static void toolkit_fire(int action)
 {
 #ifdef XBOXRECOMP_ENHANCE
     if (action == s_stats_act)
         nv2a_overlay_set_stats(!nv2a_overlay_stats());
-    /* Until the menu lands, a toast shows that the binding reached us: on
-     * the Deck a grip goes through Steam Input to a key, and a log line
-     * alone cannot be checked from the couch. Fires only while armed. */
-    else if (action == s_menu_act)
-        nv2a_overlay_toast("Menu: not in this build yet");
+    /* Without the menu (menu.enabled off, the hook armed by another key) a
+     * toast says why nothing opens: on the Deck a grip goes through Steam
+     * Input to a key, and a log line alone cannot be checked from the
+     * couch. */
+    else if (action == s_menu_act) {
+        if (__atomic_load_n(&s_menu_hook, __ATOMIC_ACQUIRE))
+            __atomic_store_n(&s_menu_req, 1, __ATOMIC_RELEASE);
+        else
+            nv2a_overlay_toast("Menu is off (menu.enabled)");
+    }
 #else
     (void)action;
 #endif
@@ -335,11 +348,27 @@ static const char *guest_key_use(int code, char *buf, size_t size)
 
 /* ---- the parser -------------------------------------------------------- */
 
+/* enhance_action_check: the reason goes to its caller (the menu shows it
+ * on the row) instead of the log. Per thread, so a rebuild on another
+ * thread still logs. */
+#if defined(_MSC_VER)
+#define ACTIONS_THREAD_LOCAL __declspec(thread)   /* as host_time.c: older MSVC has no _Thread_local */
+#else
+#define ACTIONS_THREAD_LOCAL _Thread_local
+#endif
+static ACTIONS_THREAD_LOCAL char *s_why;
+static ACTIONS_THREAD_LOCAL size_t s_why_n;
+
 static void warn(const char *where, const char *text, const char *fmt, ...)
 {
     va_list ap;
-    fprintf(stderr, "[INPUT] action %s: '%s' refused: ", where, text);
     va_start(ap, fmt);
+    if (s_why) {
+        vsnprintf(s_why, s_why_n, fmt, ap);
+        va_end(ap);
+        return;
+    }
+    fprintf(stderr, "[INPUT] action %s: '%s' refused: ", where, text);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     fputc('\n', stderr);
@@ -349,8 +378,13 @@ static void warn_off(const char *where, const char *text, const char *was,
                      const char *fmt, ...)
 {
     va_list ap;
-    fprintf(stderr, "[INPUT] action %s: '%s' inactive: ", where, text);
     va_start(ap, fmt);
+    if (s_why) {
+        vsnprintf(s_why, s_why_n, fmt, ap);
+        va_end(ap);
+        return;
+    }
+    fprintf(stderr, "[INPUT] action %s: '%s' inactive: ", where, text);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
     if (was)
@@ -647,7 +681,8 @@ void enhance_actions_filter(unsigned port, const struct xbox_host_pad *host,
                             XBOX_INPUT_STATE *st)
 {
     uint64_t now;
-    uint32_t mask;
+    uint32_t mask, held;
+    enhance_menu_hook_fn hook;
 
     if (port >= PORTS || !__atomic_load_n(&s_armed, __ATOMIC_ACQUIRE))
         return;
@@ -657,11 +692,15 @@ void enhance_actions_filter(unsigned port, const struct xbox_host_pad *host,
     s_port[port].polled = 1;
     /* -1 too: a port whose pad went away has no slot for the tick to read. */
     s_port[port].slot = host ? host->slot : -1;
-    step(s_table, port, host_bits(host), 0, now);
+    held = host_bits(host);
+    step(s_table, port, held, 0, now);
     mask = guest_mask(s_table, port, now);
     spin_unlock(&s_step_lock);
     if (st)
         apply_mask(st, mask);
+    hook = __atomic_load_n(&s_menu_hook, __ATOMIC_ACQUIRE);
+    if (hook)
+        hook(port, held, st, now);
 }
 
 /* A port the tick steps: one its table reads that the title has not
@@ -691,8 +730,10 @@ void enhance_actions_tick(void)
     unsigned want = 0, read = 0;
     int slot[PORTS], polled[PORTS];
     uint64_t last[PORTS];
-    uint32_t got[PORTS];
+    uint32_t got[PORTS], held0 = 0;
     DWORD rc[PORTS];
+    int stale0 = 0;
+    enhance_menu_hook_fn hook;
 
     if (!__atomic_load_n(&s_armed, __ATOMIC_ACQUIRE))
         return;
@@ -712,9 +753,17 @@ void enhance_actions_tick(void)
         if ((t->ports & (1u << port)) && slot[port] >= 0)
             read |= 1u << port;
     }
+    /* The menu steps from the flip when the title has stopped polling (a
+     * loading screen): port 0, its keys and the pad the tick read. */
+    stale0 = !(s_port[0].polled && now - s_port[0].last_poll < STALE_MS);
+    held0 = s_port[0].held;
     spin_unlock(&s_step_lock);
-    if (!want)
+    hook = __atomic_load_n(&s_menu_hook, __ATOMIC_ACQUIRE);
+    if (!want) {
+        if (hook && stale0)
+            hook(0, held0, NULL, now);
         return;
+    }
     /* The backend outside the lock: XInput under Wine can take a while. */
     for (unsigned port = 0; port < PORTS; port++) {
         struct xbox_host_pad h;
@@ -750,8 +799,12 @@ void enhance_actions_tick(void)
                 held = 0;   /* no pad: a modifier held as it went away is let go */
         }
         step(t, port, held, 1, now);
+        if (port == 0)
+            held0 = held;
     }
     spin_unlock(&s_step_lock);
+    if (hook && stale0)
+        hook(0, held0, NULL, now);
 }
 
 void enhance_actions_mask_until_release(unsigned port, uint32_t bits)
@@ -922,6 +975,12 @@ static int config_texts(const struct action *a, const char *texts[ENHANCE_ACTION
     const recomp_cfg *c;
     int n = 0;
 
+    if (a->has_ovr) {
+        snprintf(where, 96, "%s (menu)", a->name);
+        for (int i = 0; i < a->novr; i++)
+            texts[n++] = a->ovr[i];
+        return n;
+    }
     snprintf(key, sizeof key, PREFIX "%s", a->name);
     c = enhance_cfg_lookup(key);
     if (c) {
@@ -1278,6 +1337,111 @@ static void disarm_where(int all_mods, int owner)
     }
 }
 
+/* ---- the menu's calls --------------------------------------------------- */
+
+int enhance_action_count(void)
+{
+    return __atomic_load_n(&s_nact, __ATOMIC_ACQUIRE);
+}
+
+const char *enhance_action_label(int id)
+{
+    int n = __atomic_load_n(&s_nact, __ATOMIC_ACQUIRE);
+    return id >= 0 && id < n && s_act[id].live ? s_act[id].label : NULL;
+}
+
+int enhance_action_bindings(int id, char out[][ENHANCE_ACTION_TEXT], int max)
+{
+    const char *texts[ENHANCE_ACTION_BINDS];
+    char where[96];
+    int n = 0, k;
+
+    spin_lock(&s_reg_lock);
+    if (id < 0 || id >= s_nact || !s_act[id].live) {
+        spin_unlock(&s_reg_lock);
+        return 0;
+    }
+    k = config_texts(&s_act[id], texts, where);
+    for (int i = 0; i < k && n < max; i++)
+        if (texts[i] && *texts[i])
+            snprintf(out[n++], ENHANCE_ACTION_TEXT, "%s", texts[i]);
+    spin_unlock(&s_reg_lock);
+    return n;
+}
+
+int enhance_action_default_bindings(int id, char out[][ENHANCE_ACTION_TEXT], int max)
+{
+    int n = 0;
+
+    spin_lock(&s_reg_lock);
+    if (id >= 0 && id < s_nact && s_act[id].live)
+        for (int i = 0; i < s_act[id].ndefs && n < max; i++)
+            snprintf(out[n++], ENHANCE_ACTION_TEXT, "%s", s_act[id].defs[i]);
+    spin_unlock(&s_reg_lock);
+    return n;
+}
+
+int enhance_action_set_bindings(int id, const char *const *texts, int n)
+{
+    struct action *a;
+
+    if (n > ENHANCE_ACTION_BINDS)
+        return 0;
+    spin_lock(&s_reg_lock);
+    if (id < 0 || id >= s_nact || !s_act[id].live) {
+        spin_unlock(&s_reg_lock);
+        return 0;
+    }
+    a = &s_act[id];
+    a->has_ovr = n >= 0;
+    a->novr = 0;
+    for (int i = 0; i < n; i++)
+        if (texts[i] && *texts[i])
+            snprintf(a->ovr[a->novr++], TEXT_MAX, "%s", texts[i]);
+    spin_unlock(&s_reg_lock);
+    enhance_actions_rebuild();
+    return 1;
+}
+
+int enhance_action_check(const char *text, char *why, size_t n)
+{
+    struct binding b;
+    xbox_pad_setup ps;
+    uint32_t feeds[SRC_BITS], used;
+    char dummy[8];
+    int ok;
+
+    if (!why || !n) {
+        why = dummy;
+        n = sizeof dummy;
+    }
+    why[0] = 0;
+    s_why = why;
+    s_why_n = n;
+    ok = parse_binding("check", text, &b);
+    if (ok && b.kind == B_PAD) {
+        xbox_InputPadSetup(&ps);
+        used = map_feeds(&ps, feeds);
+        classify(&b, "check", &ps, used, NULL);
+        ok = b.kind != B_OFF;
+    }
+    s_why = NULL;
+    if (ok)
+        snprintf(why, n, "%s", kind_name(&b));
+    return ok;
+}
+
+void enhance_actions_set_menu_hook(enhance_menu_hook_fn fn)
+{
+    __atomic_store_n(&s_menu_req, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_menu_hook, fn, __ATOMIC_RELEASE);
+}
+
+int enhance_actions_menu_request(void)
+{
+    return __atomic_exchange_n(&s_menu_req, 0, __ATOMIC_ACQ_REL);
+}
+
 /* ---- the toolkit's actions and the start ------------------------------ */
 
 void enhance_actions_init(void)
@@ -1324,6 +1488,7 @@ void enhance_actions_reset(void)
 #ifdef XBOXRECOMP_ENHANCE
     nv2a_flip_hook_set(NULL);
 #endif
+    enhance_actions_set_menu_hook(NULL);
     spin_lock(&s_reg_lock);
     s_nact = 0;
     s_started = 0;

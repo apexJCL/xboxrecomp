@@ -58,15 +58,13 @@ void nv2a_stats_read(struct nv2a_stats_snap *s, uint64_t now_ns)
     uint64_t sum = 0;
     uint32_t max = 0;
     unsigned i, k;
-    struct nv2a_tex_pack_miss m[NV2A_TEX_PACK_MISSES];
 
     memset(s, 0, sizeof *s);
     for (k = 0; k < NV2A_STAT_COUNT; k++)
         s->count[k] = __atomic_load_n(&nv2a_stats_count_[k], __ATOMIC_RELAXED);
     s->pack_hits = nv2a_tex_pack_hits();
-    k = nv2a_tex_pack_misses(m, NV2A_TEX_PACK_MISSES);
-    for (i = 0; i < k; i++)
-        s->pack_misses += m[i].count;
+    /* The total, not the ring: the ring is the walker's, unlocked. */
+    s->pack_misses = nv2a_tex_pack_miss_total();
 
     /* The newest entries that ended within the last second. */
     for (i = 0; i < RING && i < n; i++) {
@@ -84,6 +82,20 @@ void nv2a_stats_read(struct nv2a_stats_snap *s, uint64_t now_ns)
         s->ms_avg = (float)((double)sum / s->frames / 1000.0);
         s->ms_max = (float)(max / 1000.0);
     }
+}
+
+unsigned nv2a_stats_frames(float *ms, unsigned n)
+{
+    uint64_t total = __atomic_load_n(&s_ring_n, __ATOMIC_ACQUIRE);
+    unsigned k = n < RING ? n : RING;
+
+    if (total < k)
+        k = (unsigned)total;
+    for (unsigned i = 0; i < k; i++) {
+        uint64_t j = (total - k + i) % RING;
+        ms[i] = (float)(__atomic_load_n(&s_ring_us[j], __ATOMIC_RELAXED) / 1000.0);
+    }
+    return k;
 }
 
 void nv2a_stats_reset_for_test(void)

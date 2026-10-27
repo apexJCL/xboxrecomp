@@ -34,6 +34,17 @@ static atomic_uint s_gen;
 
 static struct nv2a_tex_pack_miss s_miss[NV2A_TEX_PACK_MISSES];
 static unsigned s_miss_n, s_miss_next;
+/* Every miss counted, for a reader on another thread (the stats). */
+static uint64_t s_miss_total;
+
+/* The menu's copy of the ring (nv2a_tex_pack_snapshot): the ring is the
+ * upload path's alone, written without a lock, so another thread reads
+ * only this copy, under a spin flag held for one copy of the array. The
+ * structs are too wide for a lock-free atomic copy (libatomic on mingw). */
+static int s_snap_want;                     /* atomic: users */
+static char s_snap_lock;                    /* atomic flag */
+static unsigned s_snap_n;
+static struct nv2a_tex_pack_miss s_snap[NV2A_TEX_PACK_MISSES];
 
 static uint32_t rd32(const uint8_t *p)
 {
@@ -107,6 +118,7 @@ void nv2a_tex_pack_unload(void)
     s_hits = 0;
     memset(s_miss, 0, sizeof s_miss);
     s_miss_n = s_miss_next = 0;
+    __atomic_store_n(&s_miss_total, 0, __ATOMIC_RELAXED);
 }
 
 int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
@@ -386,6 +398,7 @@ void nv2a_tex_pack_miss(uint64_t hash, uint32_t w, uint32_t h, uint32_t color,
     uint32_t why = NV2A_TEX_PACK_MISS_ABSENT;
     unsigned i;
 
+    __atomic_add_fetch(&s_miss_total, 1, __ATOMIC_RELAXED);
     /* The pack holds it but it did not go up: switched off, or the backend
      * could not use it (a device without BC3, a texture too large, a
      * failed read). The trace says which, so an owner does not rebuild a
@@ -445,6 +458,47 @@ unsigned nv2a_tex_pack_misses(struct nv2a_tex_pack_miss *out, unsigned n)
         n = k;
     memcpy(out, all, sizeof(all[0]) * n);
     return n;
+}
+
+uint64_t nv2a_tex_pack_miss_total(void)
+{
+    return __atomic_load_n(&s_miss_total, __ATOMIC_RELAXED);
+}
+
+void nv2a_tex_pack_snapshot_want(int on)
+{
+    __atomic_add_fetch(&s_snap_want, on ? 1 : -1, __ATOMIC_RELAXED);
+}
+
+void nv2a_tex_pack_snapshot(void)
+{
+    struct nv2a_tex_pack_miss m[NV2A_TEX_PACK_MISSES];
+    unsigned n;
+
+    if (__atomic_load_n(&s_snap_want, __ATOMIC_RELAXED) <= 0)
+        return;
+    n = nv2a_tex_pack_misses(m, NV2A_TEX_PACK_MISSES);
+    /* A reader inside: this flip keeps the last copy, the next one takes it. */
+    if (__atomic_test_and_set(&s_snap_lock, __ATOMIC_ACQUIRE))
+        return;
+    memcpy(s_snap, m, n * sizeof m[0]);
+    s_snap_n = n;
+    __atomic_clear(&s_snap_lock, __ATOMIC_RELEASE);
+}
+
+unsigned nv2a_tex_pack_misses_snapshot(struct nv2a_tex_pack_miss *out, unsigned n)
+{
+    unsigned k;
+
+    if (!out || !n)
+        return 0;
+    /* The writer holds it for one memcpy of a few KB. */
+    while (__atomic_test_and_set(&s_snap_lock, __ATOMIC_ACQUIRE))
+        ;
+    k = s_snap_n < n ? s_snap_n : n;
+    memcpy(out, s_snap, k * sizeof out[0]);
+    __atomic_clear(&s_snap_lock, __ATOMIC_RELEASE);
+    return k;
 }
 
 static const char *fmt_name(uint32_t color, char *buf, size_t len)
