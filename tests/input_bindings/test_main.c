@@ -793,6 +793,82 @@ static void test_merge(void)
     xbox_InputSetBackend(NULL);
 }
 
+#ifdef _WIN32
+/* The re-centre fallback in a window that grows while captured.
+ * A render-scale change resizes the window in the flip, after the pump's
+ * clip; the clip ended at the old client edge, so in the next pump every
+ * re-centre to the new centre was clamped short and posted another move,
+ * and that pump never drained. The clip must follow WM_SIZE (not wait for
+ * Sync), a move loop must end, and the fallback must still report motion. */
+static LRESULT CALLBACK grow_proc(HWND h, UINT m, WPARAM w, LPARAM l)
+{
+    /* Focus is not under test, and a test window may lose it to whatever
+     * else the desktop activates (Wine does, mid-drain), which would drop
+     * the capture and its motion. */
+    if (m != WM_KILLFOCUS && m != WM_SETFOCUS)
+        xbox_InputMouseWin32Msg(h, m, (uintptr_t)w, (intptr_t)l);
+    return DefWindowProcA(h, m, w, l);
+}
+
+static void test_capture_grow(void)
+{
+    WNDCLASSA wc = {0};
+    RECT want, clip;
+    MSG msg;
+    HWND h;
+    int n = 0, x = 0, y = 0;
+
+    fresh();
+    wc.lpfnWndProc = grow_proc;
+    wc.hInstance = GetModuleHandleA(NULL);
+    wc.lpszClassName = "input_bindings_grow";
+    RegisterClassA(&wc);
+    h = CreateWindowA(wc.lpszClassName, "grow", WS_POPUP | WS_VISIBLE,
+                      0, 0, 160, 100, NULL, NULL, wc.hInstance, NULL);
+    if (!h) {
+        printf("input_bindings: no window, grow case skipped\n");
+        return;
+    }
+    xbox_InputMouseFocus(0);
+    xbox_InputMouseWin32Sync(h);
+    CHECK(xbox_InputMouseCaptured(), "grow: not captured");
+    /* A session with no interactive desktop (a service, ssh, a locked
+     * workstation) ignores the clip: nothing to test there. */
+    GetClientRect(h, &want);
+    MapWindowPoints(h, NULL, (POINT *)&want, 2);
+    if (!GetClipCursor(&clip) || !EqualRect(&clip, &want)) {
+        printf("input_bindings: the clip does not apply here, grow case skipped\n");
+        xbox_InputMouseWin32Release(h);
+        DestroyWindow(h);
+        xbox_InputMouseReset();
+        return;
+    }
+    SetWindowPos(h, NULL, 0, 0, 320, 200, SWP_NOZORDER | SWP_NOACTIVATE);
+    GetClientRect(h, &want);
+    MapWindowPoints(h, NULL, (POINT *)&want, 2);
+    CHECK(GetClipCursor(&clip) && EqualRect(&clip, &want),
+          "grow: the clip did not follow WM_SIZE (%ld,%ld-%ld,%ld)",
+          clip.left, clip.top, clip.right, clip.bottom);
+    /* Moves away from the new centre: each one re-centres; the loop ends. */
+    for (int i = 0; i < 4; i++)
+        PostMessageA(h, WM_MOUSEMOVE, 0, MAKELPARAM(159, 99));
+    while (n < 10000 && PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+        n++;
+    }
+    CHECK(n < 10000, "grow: the pump never drained");
+    /* The 3rd and 4th moves are motion: a guard that trips on every warp
+     * would leave none. */
+    xbox_InputMouseLook(&x, &y);
+    CHECK(x || y, "grow: the fallback reported no motion");
+    xbox_InputMouseWin32Release(h);
+    CHECK(GetClipCursor(&clip) && !EqualRect(&clip, &want), "grow: clip kept after release");
+    DestroyWindow(h);
+    xbox_InputMouseReset();
+}
+#endif
+
 int main(void)
 {
     test_names();
@@ -803,6 +879,9 @@ int main(void)
     test_wheel();
     test_mouse_model();
     test_capture();
+#ifdef _WIN32
+    test_capture_grow();
+#endif
     test_enable();
     test_script();
     test_merge();

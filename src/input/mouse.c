@@ -459,6 +459,7 @@ void xbox_InputMouseReset(void)
 static int  s_applied;          /* window thread: the cursor is captured */
 static int  s_raw_seen;         /* WM_INPUT arrived since the capture */
 static int  s_moves;            /* WM_MOUSEMOVE away from the centre */
+static int  s_warp_stuck;       /* a re-centre missed: none until the next pump */
 static int  s_path_logged;
 static LONG s_abs_x, s_abs_y;
 static int  s_have_abs;
@@ -480,6 +481,33 @@ static int client_centre(HWND h, POINT *c)
         return 0;
     c->x = r.right / 2;
     c->y = r.bottom / 2;
+    return 1;
+}
+
+static int unapply(void);
+
+/* Clip the cursor to the client area. The exit hook may release on another
+ * thread between the caller's checks and this clip, and then nothing would
+ * undo it: Close is set before that release, so look again once the clip is
+ * in place. Returns whether the capture still holds. An empty client area
+ * (a style change in flight) is left unclipped: a clip to it would pin the
+ * cursor to one point. */
+static int clip_client(HWND h)
+{
+    RECT r;
+
+    if (!s_applied || !GetClientRect(h, &r))
+        return 0;
+    if (r.right <= 0 || r.bottom <= 0)
+        return 1;
+    MapWindowPoints(h, NULL, (POINT *)&r, 2);
+    ClipCursor(&r);
+    __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    if (__atomic_load_n(&s_closed, __ATOMIC_SEQ_CST)) {
+        unapply();
+        ClipCursor(NULL);
+        return 0;
+    }
     return 1;
 }
 
@@ -523,7 +551,7 @@ static void raw_input(HWND h, HRAWINPUT hr)
 void xbox_InputMouseWin32Msg(void *hwnd, unsigned msg, uintptr_t w, intptr_t l)
 {
     HWND h = (HWND)hwnd;
-    POINT c;
+    POINT c, at;
     uint32_t now;
 
     switch (msg) {
@@ -536,7 +564,27 @@ void xbox_InputMouseWin32Msg(void *hwnd, unsigned msg, uintptr_t w, intptr_t l)
     case WM_SETFOCUS:  xbox_InputMouseFocusGainedAt((uint32_t)GetTickCount()); return;
     case WM_KILLFOCUS: xbox_InputMouseFocus(1); return;
     case WM_SIZE:
-        if (w == SIZE_MINIMIZED) xbox_InputMouseFocus(1);
+        if (w == SIZE_MINIMIZED) {
+            xbox_InputMouseFocus(1);
+            return;
+        }
+        /* fall through */
+    case WM_MOVE:
+        /* The clip must follow the window the moment it changes, not at the
+         * end of the next pump. A render-scale change resizes the window in
+         * the flip, after this pump's clip (Alt+Enter on the GDI window
+         * resizes inside the pump). A larger window's centre lies on or
+         * past the old clip's edge, so in the next pump every re-centre
+         * below was clamped short and posted another move: that pump never
+         * drained to its Sync, and the game hung (scale 1 to 2
+         * under Proton). Re-clipping only in Sync brings the hang back. A
+         * move with no size change sends no WM_SIZE, hence WM_MOVE. Not
+         * after the capture was dropped (focus lost in this pump): Sync
+         * releases it. */
+        if (!xbox_InputMouseCaptured())
+            return;
+        s_warp_stuck = 0;
+        clip_client(h);
         return;
     case WM_CLOSE:
     case WM_DESTROY:   xbox_InputMouseClose(); return;
@@ -549,7 +597,7 @@ void xbox_InputMouseWin32Msg(void *hwnd, unsigned msg, uintptr_t w, intptr_t l)
          * cursor is put back at the centre after every move, so its offset
          * is the motion. A couple of moves first, so raw input has its
          * chance to arrive. */
-        if (!s_applied || s_raw_seen || !client_centre(h, &c))
+        if (!s_applied || s_raw_seen || s_warp_stuck || !client_centre(h, &c))
             return;
         if (GET_X_LPARAM(l) == c.x && GET_Y_LPARAM(l) == c.y)
             return;
@@ -559,6 +607,11 @@ void xbox_InputMouseWin32Msg(void *hwnd, unsigned msg, uintptr_t w, intptr_t l)
         }
         ClientToScreen(h, &c);
         SetCursorPos(c.x, c.y);
+        /* A warp the clip (or the host) refuses posts a move that is not at
+         * the centre, and re-centring again only repeats it: the pump would
+         * never drain. Stop until the next pump re-clips. */
+        if (GetCursorPos(&at) && (at.x != c.x || at.y != c.y))
+            s_warp_stuck = 1;
         return;
     /* The wheel always comes this way: raw_input() leaves it out. */
     case WM_MOUSEWHEEL:
@@ -640,7 +693,6 @@ void xbox_InputMouseWin32Sync(void *hwnd)
     int want = xbox_InputMouseCaptured();
     RAWINPUTDEVICE rid;
     POINT c;
-    RECT r;
 
     if (!h)
         return;
@@ -656,6 +708,7 @@ void xbox_InputMouseWin32Sync(void *hwnd)
         RegisterRawInputDevices(&rid, 1, sizeof rid);
         s_raw_seen = 0;
         s_moves = 0;
+        s_warp_stuck = 0;
         s_have_abs = 0;
         STORE(&s_applied, 1);
         /* A window close or a guest exit ends the process without another
@@ -671,23 +724,14 @@ void xbox_InputMouseWin32Sync(void *hwnd)
         unapply();
         return;
     }
-    if (!s_applied || !GetClientRect(h, &r))
-        return;
     /* Every pump: the window may have moved, and a cursor at the centre
      * cannot leave through an edge before the next one. */
-    MapWindowPoints(h, NULL, (POINT *)&r, 2);
-    ClipCursor(&r);
+    if (!clip_client(h))
+        return;
+    s_warp_stuck = 0;
     if (client_centre(h, &c)) {
         ClientToScreen(h, &c);
         SetCursorPos(c.x, c.y);
-    }
-    /* The exit hook may release on another thread between the checks above
-     * and this clip, and then nothing would undo it: Close is set before
-     * that release, so look again once the clip is in place. */
-    __atomic_thread_fence(__ATOMIC_SEQ_CST);
-    if (__atomic_load_n(&s_closed, __ATOMIC_SEQ_CST)) {
-        unapply();
-        ClipCursor(NULL);
     }
 }
 
