@@ -262,9 +262,22 @@ static int parse_string(P *ps, Buf *out)
 /* Tables whose keys are names with dots in them, stored flat: under
  * [input.actions], "menu.open" = [...] (what a TOML writer emits for that
  * key) and menu.open = [...] are the same entry; so are [mods]
- * "camera.free" and camera.free (a mod's name is its key). Only a last key part may
- * quote a dot, and only directly under one of these. */
-static const char *const flat_tables[] = { "input.actions.", "mods." };
+ * "camera.free" and camera.free (a mod's name is its key), and so are
+ * [input.controls] "camera.free.look" and camera.free.look. Only a last key
+ * part may quote a dot, and only directly under one of these. */
+static const char *const flat_tables[] = { "input.actions.", "input.controls.", "mods." };
+
+/* The length of the flat table prefix `key` starts with ("mods."), or 0. */
+static size_t flat_prefix(const char *key)
+{
+    size_t i;
+    for (i = 0; i < sizeof flat_tables / sizeof flat_tables[0]; i++) {
+        size_t n = strlen(flat_tables[i]);
+        if (!strncmp(key, flat_tables[i], n) && key[n])
+            return n;
+    }
+    return 0;
+}
 
 static int flat_quoted(const Buf *out, size_t before)
 {
@@ -589,11 +602,16 @@ static int note_dotted(P *ps, const char *key, size_t from)
  * not be a table that already has keys under it. */
 static int check_key(P *ps, const char *key)
 {
-    size_t i;
+    size_t i, flat = flat_prefix(key);
     for (i = 0; i < ps->cfg->n; i++) {
         const char *k = ps->cfg->e[i].key;
         if (!strcmp(k, key))
             return fail(ps, "duplicate key '%s' (first set on line %d)", key, ps->cfg->e[i].line);
+        /* Under a flat table every name is one key, so a mod's switch
+         * "camera.free" and its setting "camera.free.speed" sit side by
+         * side; only the same name twice clashes. */
+        if (flat && flat_prefix(k) == flat && !strncmp(k, key, flat))
+            continue;
         if (is_prefix(k, key))
             return fail(ps, "'%s' is a value (line %d), not a table", k, ps->cfg->e[i].line);
         if (is_prefix(key, k))
@@ -1075,18 +1093,6 @@ static int put_part(Buf *b, const char *s, size_t n)
     return ok;
 }
 
-/* The length of the flat table prefix `key` starts with ("mods."), or 0. */
-static size_t flat_prefix(const char *key)
-{
-    size_t i;
-    for (i = 0; i < sizeof flat_tables / sizeof flat_tables[0]; i++) {
-        size_t n = strlen(flat_tables[i]);
-        if (!strncmp(key, flat_tables[i], n) && key[n])
-            return n;
-    }
-    return 0;
-}
-
 /* `key` spelled for a line under a table whose prefix is key[0, from): the
  * parts split at dots, except a flat table's name, quoted whole. */
 static int put_key(Buf *b, const char *key, size_t from)
@@ -1220,9 +1226,12 @@ static void perr(char *err, size_t errlen, const char *fmt, ...)
     va_end(ap);
 }
 
-char *recomp_cfg_patch_text(const char *text, const char *name,
-                            const char *const *keys, const char *const *values,
-                            size_t n, char *err, size_t errlen)
+/* recomp_cfg_patch_text, with the count of keys left out for a [table]
+ * in *nleft. The count is kept apart from `err`: a short or absent buffer
+ * holds no message, and a caller must still learn the write was partial. */
+static char *patch_text(const char *text, const char *name, const char *const *keys,
+                        const char *const *values, size_t n, char *err, size_t errlen,
+                        size_t *nleft)
 {
     recomp_cfg *orig = NULL, *after = NULL, **want = NULL;
     Edit *ed = NULL;
@@ -1231,12 +1240,16 @@ char *recomp_cfg_patch_text(const char *text, const char *name,
     const char *eol;
     unsigned char *del_tab = NULL;   /* per header: 1 when it is removed */
     unsigned char *ins_tab = NULL;   /* per header: 1 when a key goes in */
+    unsigned char *skip = NULL;      /* per key: 1 when refused for a table */
+    size_t nskip = 0;
     Buf tail = {0}, line = {0}, res = {0};
     char e2[256];
     int ok = 0;
 
     if (err && errlen)
         err[0] = 0;
+    if (nleft)
+        *nleft = 0;
     name = name ? name : "<string>";
     text = text ? text : "";
     len = strlen(text);
@@ -1286,6 +1299,71 @@ char *recomp_cfg_patch_text(const char *text, const char *name,
                  want[i] ? "more than one value" : e2);
             goto done;
         }
+    }
+
+    /* A flat name that is also a [header] in the file ([mods.alpha] under
+     * "alpha" = false), or the start of a deeper one ([mods.alpha.x]),
+     * cannot be written: the header makes it a table, and TOML has no key
+     * that is both. Mod settings are flat keys under [mods] ("alpha.speed"
+     * = 3), so the user moves the table's keys there. Only that key is
+     * left out: a menu Save batches every change, and one legacy table
+     * must not lose the rest. */
+    for (i = 0; i < n; i++) {
+        size_t el;
+        const char *sep, *who, *colon;
+        if (!values[i] || !flat_prefix(keys[i]))
+            continue;
+        for (k = 0; k < orig->n_tables && !is_prefix(keys[i], orig->tables[k]); k++)
+            ;
+        if (k == orig->n_tables)
+            continue;
+        if (!skip && !(skip = (unsigned char *)calloc(n, 1)))
+            goto oom;
+        skip[i] = 1;
+        nskip++;
+        /* The file is named once, so a long config path leaves room
+         * for every key in a caller's buffer. */
+        el = err && errlen ? strlen(err) : 0;
+        sep = nskip > 1 ? "; " : "";
+        who = nskip > 1 ? "" : name;
+        colon = nskip > 1 ? "" : ": ";
+        if (!strcmp(keys[i], orig->tables[k]))
+            perr(err ? err + el : NULL, err && errlen ? errlen - el : 0,
+                 "%s%s%s%s is the table [%s]; write its keys flat under [%.*s] "
+                 "(left as it is)", sep, who, colon, keys[i], orig->tables[k],
+                 (int)(flat_prefix(keys[i]) - 1), keys[i]);
+        else
+            perr(err ? err + el : NULL, err && errlen ? errlen - el : 0,
+                 "%s%s%s%s cannot sit beside the table [%s]; write that table's keys "
+                 "flat under [%.*s] (left as it is)", sep, who, colon, keys[i],
+                 orig->tables[k], (int)(flat_prefix(keys[i]) - 1), keys[i]);
+    }
+    if (nskip) {
+        /* The rest, as a patch of their own: it is checked the same way. */
+        const char **fk = (const char **)malloc((n - nskip + 1) * sizeof *fk);
+        const char **fv = (const char **)malloc((n - nskip + 1) * sizeof *fv);
+        size_t nf = 0;
+        if (!fk || !fv) {
+            free(fk);
+            free(fv);
+            goto oom;
+        }
+        for (i = 0; i < n; i++)
+            if (!skip[i]) {
+                fk[nf] = keys[i];
+                fv[nf++] = values[i];
+            }
+        out = patch_text(text, name, fk, fv, nf, e2, sizeof e2, NULL);
+        free(fk);
+        free(fv);
+        if (!out) {
+            perr(err, errlen, "%s", e2);
+            goto done;
+        }
+        if (nleft)
+            *nleft = nskip;
+        ok = 1;
+        goto done;
     }
 
     /* Changed and removed keys, where they are. */
@@ -1532,6 +1610,7 @@ done:
     free(want);
     free(del_tab);
     free(ins_tab);
+    free(skip);
     free(tail.b);
     free(line.b);
     free(res.b);
@@ -1545,13 +1624,20 @@ done:
     return out;
 }
 
+char *recomp_cfg_patch_text(const char *text, const char *name,
+                            const char *const *keys, const char *const *values,
+                            size_t n, char *err, size_t errlen)
+{
+    return patch_text(text, name, keys, values, n, err, errlen, NULL);
+}
+
 int recomp_cfg_patch(const char *path, const char *const *keys,
                      const char *const *values, size_t n, char *err, size_t errlen)
 {
     char *text = NULL, *res, *tmp, *real = NULL;
-    size_t plen = strlen(path);
+    size_t plen = strlen(path), left = 0;
     FILE *f;
-    int rc = -1;
+    int rc = -1, part;
 
     if (err && errlen)
         err[0] = 0;
@@ -1577,15 +1663,17 @@ int recomp_cfg_patch(const char *path, const char *const *keys,
         perr(err, errlen, "%s: cannot open: %s", path, strerror(errno));
         return -1;
     }
-    res = recomp_cfg_patch_text(text, path, keys, values, n, err, errlen);
+    res = patch_text(text, path, keys, values, n, err, errlen, &left);
     if (!res) {
         free(text);
         return -1;
     }
+    /* Text with err set: keys left out for a [table], the rest written. */
+    part = left > INT_MAX ? INT_MAX : (int)left;
     if (text ? !strcmp(res, text) : !*res) {
         free(text);
         free(res);
-        return 0;   /* nothing to write */
+        return part;   /* nothing to write */
     }
     free(text);
 #ifndef _WIN32
@@ -1667,5 +1755,5 @@ int recomp_cfg_patch(const char *path, const char *const *keys,
     free(tmp);
     free(real);
     free(res);
-    return rc;
+    return rc == 0 ? part : rc;
 }

@@ -36,6 +36,7 @@ add_executable(input_actions_test
     ${XR_SRC}/enhance/enhance_input.c
     ${XR_SRC}/enhance/enhance_actions.c
     ${XR_SRC}/enhance/mod.c
+    ${XR_SRC}/enhance/mod_describe.c
     ${XR_SRC}/input/input_core.c
     ${XR_SRC}/input/pad_map.c
     ${XR_SRC}/input/keyboard.c

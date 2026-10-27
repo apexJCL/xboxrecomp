@@ -1056,6 +1056,8 @@ exist only when the layer is built (`RECOMP_ENV_HAVE_ENHANCE_KEYS`):
 | `RECOMP_MENU` | overrides `menu.enabled` |
 | `RECOMP_KEYBOARD` | overrides `input.keyboard` (an older name, outside the naming rule) |
 | `RECOMP_MOUSE` | overrides `input.mouse` |
+| `RECOMP_MODS_DESCRIBE` | `json` writes the mods' descriptor dump and exits before the game starts (see "Mods", "The descriptor dump"). Any other value logs one `[MOD]` line and is ignored |
+| `RECOMP_MODS_DESCRIBE_OUT` | the file the dump replaces; unset, it goes to stdout. A Windows or Proton launcher needs it, since the game has no stdout there |
 
 The layer converts an environment value to the type of the key:
 
@@ -1133,12 +1135,12 @@ The title lists its mods in a NULL-terminated table and hands it over before
 static int cam_init(const struct xbox_mod_api *api)
 {
     s_api = api;
-    s_speed = api->cfg_float("mods.free_camera.speed", 1.0);
+    s_speed = api->cfg_float("mods.free_camera.speed", 1.0);   /* v2; v3: api->setting */
     api->on_frame(cam_frame, NULL);
     api->batch_filter(cam_hide_hud, NULL);
     return 0;                                   /* non-zero leaves the mod out */
 }
-static const struct xbox_mod free_camera = { "free_camera", cam_init, cam_shutdown };
+static const struct xbox_mod free_camera = { "free_camera", cam_init, cam_shutdown, NULL };
 static const struct xbox_mod *const mods[] = { &free_camera, NULL };
 
 xbox_mod_register_table(mods);
@@ -1158,12 +1160,12 @@ The title's glue calls two entries:
 - `xbox_mod_input_captured()` from its pad read. While it returns true, the
   title must see a released pad.
 
-`struct xbox_mod_api` (version 2, `XBOX_MOD_API_VERSION`) holds:
+`struct xbox_mod_api` (version 3, `XBOX_MOD_API_VERSION`) holds:
 
 | Member | What it gives |
 | --- | --- |
 | `mem`, `XBOX_MOD_MEM32(api, va)`, `XBOX_MOD_MEMF(api, va)` | The guest's memory. It is valid from the first `on_frame` or filter call; it is 0 during init. |
-| `cfg_string`, `cfg_int`, `cfg_float`, `cfg_bool`, `cfg_choice`, `cfg_bind_env` | The getters above. A mod's keys start with its name (`camera.free_speed` for `camera.free`) and count as used. Not under `[mods.<name>]`: `[mods]` holds the enable bools, and a table of the same name would clash with `mods.<name>`. |
+| `cfg_string`, `cfg_int`, `cfg_float`, `cfg_bool`, `cfg_choice`, `cfg_bind_env` | The getters above. A mod's own keys are flat names under `[mods]`, beside its switch: `"free_camera.speed" = 2` is the key `mods.free_camera.speed`. Never a `[mods.<name>]` table: it would clash with the switch `mods.<name>`, and the menu's Save leaves the switch out over one (naming it in the log) while it writes the other changes. A descriptor mod reads its settings through `setting` instead. |
 | `log(mod, fmt, ...)` | One `[MOD <name>]` line. |
 | `on_frame(fn, user)` | Called from `xbox_mod_frame`, in table order. Init only; up to `XBOX_MOD_MAX_FRAME`. |
 | `input_state(out)` | The title's last port-0 read (the keyboard merged), and the mouse's raw counts and buttons while captured. A mod never polls, because a poll would move the keyboard's stick ramp. |
@@ -1172,11 +1174,193 @@ The title's glue calls two entries:
 | `menu_add(item)` | An item (`enhance_menu.h`) on the mod's own list on the menu's Mods page. Kept, not copied, so it must be static; its key persists through Save. Init only; up to `XBOX_MOD_MAX_ITEMS`. |
 | `on_enable(fn, user)` | `fn(on, user)` when the Mods page turns the mod off (0) or on (1). The toolkit calls it from the next `xbox_mod_frame`, on the guest's thread, never from the menu's. Only the last toggle before a frame is sent, so `fn` can be called with the state the mod is already in and must be idempotent. The toolkit keeps calling the mod's frame hooks and actions while it is off: the mod gates its own. A mod without one is switched at the next start. Init only. |
 
+| `setting(desc, idx)` | v3. A descriptor setting's value now (any thread; a relaxed atomic load). A bool is 0/1, an enum the choice's index. |
+| `on_setting(desc, fn, user)` | v3. `fn(idx, value, user)` after the menu changes a setting, from the next `xbox_mod_frame` on the guest's thread, as `on_enable`. A `restart` setting only records the value and never calls back. Init only. |
+| `control_action(desc, idx)` | v3. The action id of an ACTION control, for `action_pressed` and `action_down`; -1 for another kind. |
+| `control_value(desc, idx, out)` | v3. A captured control's value. Until the recorded pad state lands it reports not connected (0, `out` zeroed). |
+
 `mods.<name> = false` leaves a mod's init out at start; the Mods page
 writes the key. The toolkit keeps each mod's state (`xbox_mod_state`:
-on, off, failed, or a change waiting for the restart). The keys of a mod
-left out this way (those starting with its name) count as used, so they
-print no `unused key` line.
+on, off, failed, or a change waiting for the restart). A key no lookup
+reads prints an `unused key` line, except the keys under a v2 mod left out
+this way (`mods.<name>.*`), since its code never ran to read them.
+
+### The descriptor (v3)
+
+A mod can say what it is and what it reads as const data, `desc` in
+`struct xbox_mod` (`struct xbox_mod_desc`, descriptor version 1). The
+toolkit reads it before any `init`, so the Mods page and the dump can
+describe a mod that is off or was never inited, without running its code.
+`desc` is a source contract for mods linked into the game, not a plugin
+ABI. The toolkit reads only the fields inside `size`, so a descriptor
+from an older header is read as far as it goes. A mod with `desc = NULL`
+keeps the v2 behaviour.
+
+```c
+static const char *const offon[] = { "off", "on", NULL };
+static const struct xbox_mod_setting cam_set[] = {
+    /* name, key, env, aliases, label, help, unit, kind, live, flags, def, lo, hi, step, choices */
+    { "free", "camera.free", "RECOMP_CAMERA_FREE", NULL, "Free camera", NULL, NULL,
+      XBOX_SET_ENUM, ENHANCE_LIVE, XBOX_SET_ENABLE, 0, 0, 0, 0, offon },
+    { "speed", "camera.free_speed", NULL, NULL, "Speed", NULL, "x",
+      XBOX_SET_FLOAT, ENHANCE_LIVE, 0, 1, 0.05, 20, 0.05, NULL },
+};
+static const char *const toggle_def[] = { "F6", NULL };
+static const struct xbox_mod_control cam_ctl[] = {
+    { "toggle", "Toggle", NULL, NULL, XBOX_CTL_ACTION, toggle_def, NULL, NULL },
+};
+static const struct xbox_mod_desc cam_desc = {
+    XBOX_MOD_DESC_VERSION, sizeof cam_desc, "Free camera", "Fly the camera", NULL, "1",
+    cam_set, 2, cam_ctl, 1 };
+```
+
+The descriptor is checked once at start. A setting or control declared
+twice, `lo > hi`, a default outside `lo..hi`, an enum with no choices, an
+unknown kind or live class, an env name that is not a `recomp_env` row,
+or a second `XBOX_SET_ENABLE` setting refuses it: the mod fails with one
+line and is never inited.
+
+```
+[MOD] cam: descriptor refused: setting 'speed': lo 9 > hi 1; left out
+```
+
+**Settings.** A setting without `key` is `mods."<id>.<name>"`, a flat key
+under `[mods]`. `key` keeps a legacy spelling (`camera.free_speed`).
+Each value is read once at start, highest row first:
+
+| Row | Source name |
+| --- | --- |
+| the `env` row, when set | `env` (read-only on the Mods page) |
+| the user files' key | `user` |
+| the user files' aliases, in order | `user_alias` |
+| `config.default.toml`'s key | `defaults` |
+| `config.default.toml`'s aliases | `defaults_alias` |
+| the descriptor's `def` | `default` |
+
+A row of the wrong type is reported and the next row is read:
+
+```
+[MOD] cam.speed: ./config/config.toml:7: mods.cam.speed should be a number; ignored
+[MOD] cam.speed: RECOMP_CAMERA_FREE_SPEED='fast' is not a number; ignored
+```
+
+A number is clamped to `lo..hi` and snapped to `lo + k * step` (an int
+is rounded). An unknown enum choice falls back to the default and the
+key is left for the player to fix. Each change is one line:
+
+```
+[MOD] cam.speed: 25 -> 20
+[MOD] cam.hud: bogus -> keep
+```
+
+A value read from a user-file alias goes on the pending-rewrite list
+(`xbox_mod_pending_rewrites`): the menu's Save writes it under the key and
+removes the alias. An ACTION or captured control read from an alias goes
+on the same list, as an array of strings.
+
+**The switch and the init rule.** `mods."<id>"` (bool, default true)
+keeps its meaning. A descriptor may mark one bool or enum setting
+`XBOX_SET_ENABLE`; the Mods page shows it as the mod's Enabled switch, and
+its value is printed at start whether or not the mod is inited:
+
+```
+[ENHANCE] camera.free=off
+```
+
+The line prints the value the run uses: when `mods."<id>" = false` holds
+the mod off, it says off and why, whatever the setting holds:
+
+```
+[ENHANCE] camera.free=off (held off by mods.camera.free)
+```
+
+The Mods page's toggle for such a mod is its enable setting: Save writes
+that key in the setting's own type (an enum's choice text, a bool), never
+`mods."<id>"`, and turning it on removes a `mods."<id>" = false` from the
+user file. A setting's or control's full key must be under 64 bytes (the
+env binding's limit), or the descriptor is refused.
+
+The mod is inited when `mods."<id>"` is true and either it has no enable
+setting or that setting is on. With the setting off, the menu on
+(`menu.enabled`) and the setting's live class `live`, it is inited
+dormant, so the menu can turn it on without a restart. A dormant mod that
+gave no `on_enable` gets one line, and turning it on applies at restart:
+
+```
+[MOD] cam: inited dormant but gave no on_enable; turning it on applies at restart
+```
+
+Otherwise it is not inited. The menu's change to a setting is clamped and
+snapped the same way, stored at once, and reaches the mod through
+`on_setting` at the next frame. A `restart` setting only records it.
+
+**Controls.** An ACTION control is registered before `init` as the host
+action `<id>.<control id>`, with its defaults, aliases (full keys, such
+as `input.actions.camera_toggle`) and env row (`"F6,guide+y"` replaces
+the bindings). While the mod is off the action is dormant: it never
+fires, consumes nothing and does not arm the hook, but its bindings keep
+their inputs in the one-input-one-action rule, so switching the mod on
+moves no binding. When a dormant default wins a tie, one line says so:
+
+```
+[MOD] F6: camera.toggle keeps it over probe.go (dormant)
+```
+
+A BUTTON or STICK control is bound under `[input.controls]`, flat:
+`"<id>.<control id>" = ["w", "pad.ls"]`. An INFO control is shown and
+never bound.
+
+**Unknown keys.** A `mods."<id>..."` key a descriptor does not declare,
+a key of an id the build does not have, and an `[input.controls]` key no
+control declares are reported as `unused key`. Neither Save nor Reset
+removes them.
+
+### The descriptor dump
+
+`RECOMP_MODS_DESCRIBE=json` makes `xbox_enhance_init` resolve every
+descriptor as a start would, settings and bindings included, then write
+the JSON to `RECOMP_MODS_DESCRIBE_OUT` (replaced) or stdout and exit 0.
+No mod `init` runs and no hook is armed. A file that cannot be written
+exits 1 with one line:
+
+```
+[MOD] RECOMP_MODS_DESCRIBE_OUT=/no/x.json: cannot write it (No such file or directory)
+```
+
+Schema 1. Fields are only added; one removed or changed in meaning bumps
+`schema`. A field that does not apply is left out.
+
+```json
+{"schema": 1, "api": 3, "mods": [
+  {"id": "fly", "title": "Free camera", "descriptor": true, "init": "no", "enable": "fly.enabled",
+   "settings": [
+      {"name": "speed", "key": "mods.fly.speed", "kind": "float", "label": "Speed",
+       "default": 1, "lo": 0.05, "hi": 20, "step": 0.05, "live": "live",
+       "env": "RECOMP_APU_HRTF", "aliases": ["fly.old_speed"], "value": 1, "source": "default"}],
+   "controls": [
+      {"id": "toggle", "kind": "action", "action": "fly.toggle", "label": "Toggle", "when": null,
+       "defaults": ["F6"], "bindings": ["F6"], "source": "default"}]},
+  {"id": "bad", "descriptor": true, "init": "failed", "reason": "setting 'x': lo 9 > hi 1"},
+  {"id": "legacy", "descriptor": false}
+]}
+```
+
+- `init`: `yes`, `dormant`, `no` or `failed` (with `reason`), what a start
+  would do now.
+- `source`: the row a value or a control's bindings came from (the table
+  above).
+- `value` and `default`: a bool as `true`/`false`, an enum as its choice,
+  a number in the C locale's shortest round-trip form.
+- `live`: `live`, `activate` or `restart`.
+- `bindings`: an action's texts as the config gives them. `refused`, only
+  when nonempty, lists those of them that would never fire at a start: an
+  input name the game does not know, an input another action holds, or a
+  pad input the game uses itself (an off binding, see the `[INPUT]`
+  warnings above). The dump builds the action table as a
+  start does, so `refused` is what the game would drop; the launcher
+  shows these unbound instead of rerunning the rules itself.
+
+`tests/mod_desc/expected.json` is the full dump of the test table.
 
 A failed init leaves nothing behind. Its registrations are dropped and the
 capture goes back to what the earlier mods left. Shutdown runs in reverse
@@ -1184,7 +1368,8 @@ order, once, at exit. The guest and the render thread may still be running
 then, and a frame or filter call may be in flight. So a mod's shutdown must
 not free anything its callbacks use.
 Hotkeys come from `xbox_FramebufferKeyDown` and the names in
-`src/input/input_names.h`. Tests: `tests/enhance_mod` (ctest `enhance_mod`).
+`src/input/input_names.h`. Tests: `tests/enhance_mod` (ctest `enhance_mod`)
+and `tests/mod_desc` (ctest `mod_desc`, the descriptor and the dump).
 
 ## Design note: why the reader is our own
 

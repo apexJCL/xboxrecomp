@@ -43,6 +43,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "enhance_actions.h"
 #include "enhance_input.h"
 #include "host_pad.h"
 #include "nv2a_backend_common.h"
@@ -52,16 +53,96 @@
 extern "C" {
 #endif
 
-#define XBOX_MOD_API_VERSION 2u
+#define XBOX_MOD_API_VERSION 3u
 
 struct xbox_mod_api;
+struct xbox_mod_desc;
 struct enhance_item;            /* enhance_menu.h */
 
 struct xbox_mod {
-    const char *name;           /* the log lines' [MOD name] */
+    const char *name;           /* the log lines' [MOD name]; the mod's id */
     /* 0 to run; anything else leaves the mod out. May be NULL. */
     int (*init)(const struct xbox_mod_api *api);
     void (*shutdown)(void);     /* may be NULL */
+    /* v3: what the mod is and what it reads, as const data the toolkit
+     * reads before any init (below). NULL keeps the v2 behaviour. Appended:
+     * this is a source contract for mods linked into the game, not a plugin
+     * ABI (struct xbox_mod has no size field). */
+    const struct xbox_mod_desc *desc;
+};
+
+/* ---- the descriptor (v3; docs/runtime/config.md, "Mods") ----------------
+ *
+ * Static data: the Mods page and the descriptor dump (RECOMP_MODS_DESCRIBE)
+ * describe a mod that is off or never inited from it, without running its
+ * code. Validated once at xbox_mod_init: a duplicate setting name or
+ * control id, lo > hi, an enum with no choices, an unknown kind or a second
+ * XBOX_SET_ENABLE fails the mod (XBOX_MOD_FAILED, one [MOD] line). Text is
+ * UTF-8. The toolkit reads only the fields inside `size`, so fields can be
+ * appended. */
+#define XBOX_MOD_DESC_VERSION 1u
+
+enum {
+    XBOX_SET_BOOL = 0,
+    XBOX_SET_INT,
+    XBOX_SET_FLOAT,
+    XBOX_SET_ENUM
+};
+#define XBOX_SET_ENABLE 0x1u    /* flags: this setting is the mod's switch */
+
+/* A setting the toolkit owns: it resolves the value (env row, then the
+ * user files' key then aliases, then config.default.toml's key then
+ * aliases, then def), clamps it to lo..hi and snaps it to lo + k * step
+ * (each change logged "[MOD] <id>.<name>: <value> -> <used>"), and the mod
+ * reads it with api->setting. Bool is 0/1, an enum the choice's index. */
+struct xbox_mod_setting {
+    const char *name;           /* "speed": key mods."<id>.speed" */
+    const char *key;            /* NULL, or the full key ("camera.free_speed") */
+    const char *env;            /* NULL, or a recomp_env row name ("RECOMP_...") */
+    const char *const *aliases; /* retired full keys, NULL-terminated, or NULL */
+    const char *label, *help, *unit;
+    uint8_t kind;               /* XBOX_SET_* */
+    uint8_t live;               /* enhance_item_live: LIVE, LIVE_ACTIVATE, LIVE_RESTART */
+    uint8_t flags;              /* XBOX_SET_ENABLE */
+    double def, lo, hi, step;   /* int and float: lo..hi, step 0 for none */
+    const char *const *choices; /* enum: NULL-terminated; def is an index */
+};
+
+enum {
+    XBOX_CTL_ACTION = 0,        /* a host hotkey: action "<id>.<control id>" */
+    XBOX_CTL_BUTTON,            /* read every frame while the mod captures */
+    XBOX_CTL_STICK,
+    XBOX_CTL_INFO               /* shown, never bound ("Mouse: look") */
+};
+#define XBOX_CTL_SRC_LEFT  0u
+#define XBOX_CTL_SRC_RIGHT 1u
+
+struct xbox_mod_control {
+    const char *id;             /* "toggle": action "<mod>.toggle" */
+    const char *label, *help, *when;   /* when: "while flying", or NULL */
+    uint8_t kind;               /* XBOX_CTL_* */
+    const char *const *defaults;       /* binding strings, NULL-terminated */
+    const char *const *aliases;        /* retired full keys, NULL-terminated */
+    const char *env;            /* NULL, or a recomp_env row: its value
+                                   ("F6,guide+y") replaces the bindings */
+};
+
+/* control_value's answer for a captured control. */
+struct xbox_ctl_value {
+    int16_t raw[2];             /* STICK: the axes as the pad reports them;
+                                   BUTTON: raw[0] 0..255, the largest binding */
+    uint8_t src;                /* STICK: XBOX_CTL_SRC_LEFT or _RIGHT */
+    uint8_t connected;          /* 0: port 0 has no pad and no keyboard source */
+};
+
+struct xbox_mod_desc {
+    uint32_t version;           /* XBOX_MOD_DESC_VERSION */
+    uint32_t size;              /* sizeof(struct xbox_mod_desc) */
+    const char *title, *summary, *author, *version_text;
+    const struct xbox_mod_setting *settings;
+    uint32_t n_settings;
+    const struct xbox_mod_control *controls;
+    uint32_t n_controls;
 };
 
 typedef void (*xbox_mod_frame_fn)(void *user);
@@ -77,8 +158,11 @@ struct xbox_mod_api {
     uintptr_t mem;
 
     /* The layer's config getters (enhance_cfg.h): env over the files over
-     * the default. A mod's keys sit under its own table ([mods.<name>] by
-     * convention) and count as used, so they are not reported. */
+     * the default. A mod's keys are flat names under [mods]
+     * ("<name>.speed" = 2, beside its switch "<name>" = true). A key no
+     * lookup reads is reported as a typo, except under a v2 mod switched
+     * off by its key, whose code never ran to read them. A descriptor
+     * mod's settings come through `setting`. */
     const char *(*cfg_string)(const char *key, const char *def);
     long long (*cfg_int)(const char *key, long long def);
     double (*cfg_float)(const char *key, double def);
@@ -148,6 +232,30 @@ struct xbox_mod_api {
      * fires and nothing is filtered unless some feature key arms it.
      * From init only: a mod left out takes its key with it. */
     int (*actions_arm)(const char *key);
+
+    /* ---- version 3 (check size before using these) ---------------------
+     * The descriptor (struct xbox_mod_desc above); desc is the mod's own. */
+
+    /* Setting idx's value now: a relaxed atomic load, any thread. Bool
+     * 0/1, an enum the choice's index. 0 for a bad desc or idx. The
+     * values it reads stay valid until process exit: shutdown frees
+     * nothing, and only a re-init (the tests) frees them, so a callback
+     * still in flight at shutdown reads safely. */
+    double (*setting)(const struct xbox_mod_desc *desc, uint32_t idx);
+    /* Init only. fn(idx, value, user) after the menu changes a setting,
+     * from the next xbox_mod_frame on the guest's thread (as on_enable).
+     * A RESTART setting only records the value and never calls back. */
+    int (*on_setting)(const struct xbox_mod_desc *desc,
+                      void (*fn)(uint32_t idx, double value, void *user), void *user);
+    /* The action id of ACTION control idx (registered by the toolkit
+     * before init as "<id>.<control id>"), for action_pressed and
+     * action_down; -1 for another kind or a bad idx. */
+    int (*control_action)(const struct xbox_mod_desc *desc, uint32_t idx);
+    /* A captured control's value: fills *out, returns 1 when it reads a
+     * source. Until the recorded pad state lands (mod-settings phase D)
+     * it reports not connected: out zeroed, 0. */
+    int (*control_value)(const struct xbox_mod_desc *desc, uint32_t idx,
+                         struct xbox_ctl_value *out);
 };
 
 #define XBOX_MOD_MAX_FRAME   16
@@ -204,6 +312,71 @@ int xbox_mod_enabled(int i);                /* the key's value as set now */
 enum xbox_mod_state xbox_mod_set_enabled(int i, int on);
 /* The items mod i added with menu_add, in order; returns the count. */
 int xbox_mod_items(int i, const struct enhance_item **out, int max);
+
+/* ---- descriptor mods (the Mods page detail view, the dump) -------------
+ *
+ * xbox_mod_desc_of: mod i's descriptor, NULL for a v2 mod or a refused one
+ * (xbox_mod_fail_reason says why). Settings are by index into it. */
+const struct xbox_mod_desc *xbox_mod_desc_of(int i);
+const char *xbox_mod_fail_reason(int i);    /* "" unless failed */
+double xbox_mod_setting_value(int i, uint32_t idx);
+/* The precedence row the value came from: "env", "user", "user_alias",
+ * "defaults", "defaults_alias", "default" (or "menu" once set live). */
+const char *xbox_mod_setting_source(int i, uint32_t idx);
+int xbox_mod_setting_forced(int i, uint32_t idx);   /* env-set: read-only */
+const char *xbox_mod_setting_key(int i, uint32_t idx);   /* the full key */
+/* The menu's change (any thread): clamped and snapped as at load, stored,
+ * and the mod's on_setting queued for the next xbox_mod_frame (a RESTART
+ * setting only records it). The enable setting switches the mod as
+ * xbox_mod_set_enabled does. Returns the value stored; refused (the old
+ * value) when env forces it. */
+double xbox_mod_setting_set(int i, uint32_t idx, double v);
+/* What the init rule did this run, as the dump spells it: "yes",
+ * "dormant", "no" or "failed". */
+const char *xbox_mod_init_outcome(int i);
+/* The enable setting's index, or -1 (none, or no descriptor). */
+int xbox_mod_enable_setting(int i);
+/* The action id of mod i's control idx, -1 for none. */
+int xbox_mod_control_action(int i, uint32_t idx);
+
+/* 1 when mod i has a descriptor, valid or refused (a refused one fails). */
+int xbox_mod_has_desc(int i);
+/* The env row bound to setting idx ("RECOMP_..."), or NULL. */
+const char *xbox_mod_setting_env(int i, uint32_t idx);
+/* Control idx's bindings as this run resolved them, into out (up to max),
+ * and *src the precedence row's name ("default", "env", "user", ...): an
+ * ACTION's are its action's, a BUTTON's or STICK's come from
+ * [input.controls] "<id>.<control id>" (D3). Returns the count. */
+int xbox_mod_control_bindings(int i, uint32_t idx, char out[][ENHANCE_ACTION_TEXT], int max,
+                              const char **src);
+
+/* User-file aliases waiting to be rewritten under the current key (D4):
+ * the menu's Save writes key = value and removes old. Returns the count;
+ * fills up to max of each (pointers into the toolkit's own storage, valid
+ * until the next xbox_mod_init). */
+int xbox_mod_pending_rewrites(const char **keys, const char **values,
+                              const char **olds, int max);
+
+/* The dump's xbox_mod_init: resolve every descriptor, register and
+ * dormant-mark the actions and compute the init rule, but run no init
+ * (RECOMP_MODS_DESCRIBE). */
+int xbox_mod_init_describe(void);
+
+/* ---- the descriptor dump (mod_describe.c; D9) ---------------------------
+ *
+ * RECOMP_MODS_DESCRIBE=json asks xbox_enhance_init for the dump instead of
+ * the start: xbox_mod_init_describe, the bindings built, the JSON written
+ * to RECOMP_MODS_DESCRIBE_OUT (replaced) or stdout, and exit with the
+ * write's result. */
+/* 1 for "json"; any other set value logs one [MOD] line and gives 0. */
+int xbox_mod_describe_wanted(void);
+/* Schema 1 of every mod in the table, as xbox_mod_init_describe left them,
+ * to path (NULL or "" for stdout). 0, or 1 with one [MOD] line when the file
+ * cannot be written. */
+int xbox_mod_describe_write(const char *path);
+/* A number as the config files and the dump spell it: the C locale's '.',
+ * the shortest text that reads back to v. Returns the length. */
+int xbox_mod_num_text(char *out, size_t n, double v);
 
 /* Removes the filter, stops the frame dispatch, then the mods' shutdowns,
  * in reverse order, and the capture released. Runs once; the exit paths

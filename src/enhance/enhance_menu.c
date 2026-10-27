@@ -294,8 +294,9 @@ struct slot {
 #define MODS_MAX 32
 #define SLOTS_MAX (ENHANCE_MENU_MAX_ITEMS + 2 * XBOX_MOD_MAX_ITEMS + MODS_MAX + 16)
 static struct slot s_slot[SLOTS_MAX];
-/* The Mods page's toggle per mod (mods.<name>), synthesized at the first
- * open. */
+/* The Mods page's toggle per mod, synthesized at the first open: its key
+ * is mods.<name>, or for a descriptor mod with an enable setting that
+ * setting's key (D4), which Save writes in the setting's own type. */
 static struct enhance_item s_mod_toggle[MODS_MAX];
 static char s_mod_key[MODS_MAX][64];
 static int s_nslot, s_built;
@@ -390,7 +391,12 @@ static void build_slots(void)
         const struct enhance_item *items[XBOX_MOD_MAX_ITEMS];
         int n = xbox_mod_items(m, items, XBOX_MOD_MAX_ITEMS);
         struct enhance_item *t = &s_mod_toggle[m];
-        snprintf(s_mod_key[m], sizeof s_mod_key[m], "mods.%s", xbox_mod_name(m));
+        int e = xbox_mod_enable_setting(m);
+        if (e >= 0)
+            snprintf(s_mod_key[m], sizeof s_mod_key[m], "%s",
+                     xbox_mod_setting_key(m, (uint32_t)e));
+        else
+            snprintf(s_mod_key[m], sizeof s_mod_key[m], "mods.%s", xbox_mod_name(m));
         memset(t, 0, sizeof *t);
         t->key = s_mod_key[m];
         t->label = xbox_mod_name(m);
@@ -418,10 +424,17 @@ static int slot_saveable(const struct slot *s)
 
 /* The stock value: the defaults file's, else the item's code default. 0
  * when neither has one. */
+static double enable_stock(int m, int e, const char *key);
+
 static int slot_stock(const struct slot *s, char *out, size_t n)
 {
     const recomp_cfg *d = enhance_cfg_defaults();
     const struct enhance_item *it = s->it;
+    if (s->toggle && xbox_mod_enable_setting(s->mod) >= 0) {
+        int e = xbox_mod_enable_setting(s->mod);
+        snprintf(out, n, "%s", enable_stock(s->mod, e, s->key) ? "true" : "false");
+        return 1;
+    }
     if (d && recomp_cfg_type_of(d, s->key) != RCFG_NONE) {
         switch (it->kind) {
         case ENHANCE_ITEM_TOGGLE:
@@ -646,6 +659,15 @@ static int slot_find(const char *key)
     return -1;
 }
 
+/* Mod m's Enabled toggle slot, whichever key it carries. */
+static int toggle_slot(int m)
+{
+    for (int i = 0; i < s_nslot; i++)
+        if (s_slot[i].toggle && s_slot[i].mod == m)
+            return i;
+    return -1;
+}
+
 static void slot_row(const char *key)
 {
     int i = slot_find(key);
@@ -767,10 +789,7 @@ static void build_rows(void)
         break;
     case PAGE_MODS:
         if (s_mod_sub >= 0) {
-            char key[64];
-            int t;
-            snprintf(key, sizeof key, "mods.%s", xbox_mod_name(s_mod_sub));
-            t = slot_find(key);
+            int t = toggle_slot(s_mod_sub);
             header(xbox_mod_name(s_mod_sub));
             if (t >= 0) {
                 struct row *r = row_add(R_SLOT, t, 1, "Enabled");
@@ -902,9 +921,66 @@ static void build_rows(void)
 
 /* ---- Save and Reset ------------------------------------------------------- */
 
-static char s_pkey[SLOTS_MAX + ENHANCE_ACTIONS_MAX][96];
-static char s_pval[SLOTS_MAX + ENHANCE_ACTIONS_MAX][VAL_MAX * 4];
-static int s_pnull[SLOTS_MAX + ENHANCE_ACTIONS_MAX];
+/* + MODS_MAX: a descriptor toggle saved on also drops a stale
+ * mods."<id>" = false (enable_save). */
+static char s_pkey[SLOTS_MAX + ENHANCE_ACTIONS_MAX + MODS_MAX][96];
+static char s_pval[SLOTS_MAX + ENHANCE_ACTIONS_MAX + MODS_MAX][VAL_MAX * 4];
+static int s_pnull[SLOTS_MAX + ENHANCE_ACTIONS_MAX + MODS_MAX];
+
+/* The stock of mod m's enable setting e: the defaults file's key, else
+ * the descriptor's default. */
+static double enable_stock(int m, int e, const char *key)
+{
+    const struct xbox_mod_setting *st = &xbox_mod_desc_of(m)->settings[e];
+    const recomp_cfg *d = enhance_cfg_defaults();
+    double dv = st->def;
+
+    if (d && st->kind == XBOX_SET_ENUM && recomp_cfg_type_of(d, key) == RCFG_STRING) {
+        for (int c = 0; st->choices[c]; c++)
+            if (!strcmp(st->choices[c], recomp_cfg_string(d, key, "")))
+                dv = c;
+    } else if (d && st->kind == XBOX_SET_BOOL && recomp_cfg_type_of(d, key) == RCFG_BOOL) {
+        dv = recomp_cfg_bool(d, key, 0);
+    }
+    return dv;
+}
+
+/* The value text of mod m's enable setting e at v, as the config holds
+ * it: an enum's choice quoted, a bool true/false. */
+static void enable_text(int m, int e, double v, char *out, size_t n)
+{
+    const struct xbox_mod_setting *st = &xbox_mod_desc_of(m)->settings[e];
+    if (st->kind == XBOX_SET_ENUM)
+        recomp_cfg_quote(st->choices[(int)v], out, n);
+    else
+        snprintf(out, n, "%s", v ? "true" : "false");
+}
+
+/* A descriptor mod's toggle saves its enable setting, never mods."<id>"
+ * (D4): the value the setting now holds (an enum keeps the choice the
+ * player had), NULL when that is the stock (the defaults file's, else the
+ * descriptor's). Turning it on also removes mods."<id>" = false from the
+ * user file, which would hold the mod off at the next start. Returns the
+ * entries added at n. */
+static int enable_save(const struct slot *s, int n)
+{
+    int m = s->mod, e = xbox_mod_enable_setting(m), k = 0;
+    char stock[VAL_MAX * 4], sw[96];
+
+    snprintf(s_pkey[n], sizeof s_pkey[n], "%s", s->key);
+    enable_text(m, e, xbox_mod_setting_value(m, (uint32_t)e), s_pval[n], sizeof s_pval[n]);
+    enable_text(m, e, enable_stock(m, e, s->key), stock, sizeof stock);
+    s_pnull[n] = !strcmp(stock, s_pval[n]);
+    k++;
+    snprintf(sw, sizeof sw, "mods.%s", xbox_mod_name(m));
+    if (on_text(s->cur) && enhance_cfg_source_of(sw) == ENHANCE_SRC_FILE
+        && !enhance_cfg_bool(sw, 1)) {
+        snprintf(s_pkey[n + k], sizeof s_pkey[n + k], "%s", sw);
+        s_pnull[n + k] = 1;
+        k++;
+    }
+    return k;
+}
 
 static int collect(void)
 {
@@ -914,6 +990,10 @@ static int collect(void)
         char stock[VAL_MAX];
         if (!slot_saveable(s) || !strcmp(s->cur, s->base))
             continue;
+        if (s->toggle && xbox_mod_enable_setting(s->mod) >= 0) {
+            n += enable_save(s, n);
+            continue;
+        }
         snprintf(s_pkey[n], sizeof s_pkey[n], "%s", s->key);
         s_pnull[n] = slot_stock(s, stock, sizeof stock) && !strcmp(stock, s->cur);
         if (s->it->kind == ENHANCE_ITEM_CHOICE && !(s->it->flags & ENHANCE_ITEM_NUMERIC))
@@ -999,8 +1079,11 @@ static void save(void)
     const char *path = enhance_cfg_user_path();
     const char *keys[sizeof s_pkey / sizeof s_pkey[0]];
     const char *vals[sizeof s_pkey / sizeof s_pkey[0]];
-    char err[160];
-    int n;
+    /* A refusal names the config path once, then each key left out with
+     * its table and advice (~120 bytes a key): room for a full macOS
+     * path and several keys in the log line. */
+    char err[2048];
+    int n, rc;
     if (!path) {
         status("Save is off (RECOMP_CONFIG=none)");
         return;
@@ -1011,14 +1094,26 @@ static void save(void)
         return;
     }
     mkdir_parent(path);
-    if (recomp_cfg_patch(path, keys, vals, (size_t)n, err, sizeof err) < 0) {
+    rc = recomp_cfg_patch(path, keys, vals, (size_t)n, err, sizeof err);
+    if (rc < 0) {
         status("Save failed: %s", err);
         fprintf(stderr, LOGP "menu: save to %s failed: %s\n", path, err);
         return;
     }
+    /* Keys left out for a [table] in the file (rc > 0) are named in the
+     * log; the player fixes the file, so they are not kept pending to
+     * fail again. */
     for (int i = 0; i < s_nslot; i++)
         memcpy(s_slot[i].base, s_slot[i].cur, sizeof s_slot[i].base);
     memset(s_adirty, 0, sizeof s_adirty);
+    if (rc > 0) {
+        fprintf(stderr, LOGP "menu: saved to %s, %d key%s left out: %s\n", path, rc,
+                rc == 1 ? "" : "s", err);
+        /* The status line is short: the count, and the log has the rest. */
+        status("Saved; %d key%s left out, a [table] in the file holds %s (see the log)", rc,
+               rc == 1 ? "" : "s", rc == 1 ? "it" : "them");
+        return;
+    }
     fprintf(stderr, LOGP "menu: saved %d key%s to %s\n", n, n == 1 ? "" : "s", path);
     status("Saved %d change%s", n, n == 1 ? "" : "s");
 }
@@ -1238,15 +1333,13 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
             break;
         case R_MOD: {
             const struct enhance_item *items[1];
-            char key[64];
             int t;
             if (ok && xbox_mod_items(r->ref, items, 1) > 0) {
                 s_mod_sub = r->ref;
                 s_sel[PAGE_MODS] = 0;
                 break;
             }
-            snprintf(key, sizeof key, "mods.%s", xbox_mod_name(r->ref));
-            t = slot_find(key);
+            t = toggle_slot(r->ref);
             if (t >= 0)
                 change_slot(&s_slot[t], dir, ok);
             break;
@@ -1592,6 +1685,7 @@ static const char *live_tag(int live)
     switch (live) {
     case ENHANCE_LIVE_FLUSH: return "at the flip";
     case ENHANCE_LIVE_STAGE: return "next stage";
+    case ENHANCE_LIVE_ACTIVATE: return "next activation";
     case ENHANCE_LIVE_RESTART: return "at restart";
     default: return "live";
     }
@@ -1644,7 +1738,9 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
                               with_alpha(t->accent, 200));
             x += d + nv2a_ovl_px(s, 8);
         } else {
-            const char *w = it->live == ENHANCE_LIVE_RESTART ? "applies at restart" : "next stage";
+            const char *w = it->live == ENHANCE_LIVE_RESTART ? "applies at restart"
+                          : it->live == ENHANCE_LIVE_ACTIVATE ? "next activation"
+                          : "next stage";
             mu_draw_text(ctx, fs, w, -1, mu_vec2(x, fy),
                          it->live == ENHANCE_LIVE_RESTART ? t->warn : t->text_dim);
             x += text_w(fs, w) + nv2a_ovl_px(s, 8);

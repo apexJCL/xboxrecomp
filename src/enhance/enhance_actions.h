@@ -45,7 +45,35 @@ int enhance_action_register(const char *name, const char *label,
  * leaves no action behind (enhance_actions_drop_owner). -1 is the toolkit. */
 int enhance_action_register_owned(const char *name, const char *label,
                                   const char *const *defaults, int owner);
+/* The same with retired keys and an env row (a mod descriptor's action,
+ * mod.h): aliases is a NULL-terminated list of full keys read below
+ * input.actions.<name> in each file (kept, not copied: static data), env a
+ * recomp_env row or -1, whose value ("F6,guide+y") replaces every binding
+ * when set. */
+int enhance_action_register_full(const char *name, const char *label,
+                                 const char *const *defaults, int owner,
+                                 const char *const *aliases, int env);
 void enhance_actions_drop_owner(int owner);
+/* Make owner's actions dormant (its mod is off) or live again, and rebuild
+ * when started. A dormant action's bindings stay in the table and keep
+ * their inputs from other actions (enhance_action_owner names it), but it
+ * never fires, consumes an input or reads as down. */
+void enhance_actions_set_dormant(int owner, int on);
+int enhance_action_dormant(int id);
+/* Which row its bindings come from: an ENHANCE_ACT_SRC_*, with the file
+ * key it read in key (empty for env, menu and default), and the row's name
+ * as the descriptor dump spells it ("env", "user_alias", ...). */
+enum {
+    ENHANCE_ACT_SRC_DEFAULT = 0,
+    ENHANCE_ACT_SRC_ENV,
+    ENHANCE_ACT_SRC_MENU,
+    ENHANCE_ACT_SRC_USER,
+    ENHANCE_ACT_SRC_USER_ALIAS,
+    ENHANCE_ACT_SRC_DEFAULTS,
+    ENHANCE_ACT_SRC_DEFAULTS_ALIAS
+};
+int enhance_action_source(int id, char *key, size_t n);
+const char *enhance_action_source_name(int src);
 /* Drop every mod's actions (xbox_mod_init starting over). */
 void enhance_actions_drop_mods(void);
 
@@ -77,6 +105,11 @@ int enhance_actions_arm(const char *key);
 /* The same for a mod's init (owner: its mod table index): the key goes
  * when the mod is dropped (enhance_actions_drop_owner). */
 int enhance_actions_arm_owned(const char *key, int owner);
+/* A mod's arm key set live (its enable setting switched from the menu):
+ * on arms as enhance_actions_arm_owned does, off drops that owner's entry
+ * for the key and disarms the hook when it was the last. Returns whether
+ * the hook is armed after the call. */
+int enhance_actions_arm_set(const char *key, int owner, int on);
 int enhance_actions_armed(void);
 /* 1 when key is one the hook is armed by (its config value was true):
  * enhance.c reads overlay.stats through this, so the key has one reader. */
@@ -102,6 +135,11 @@ const char *enhance_action_label(int id);
 /* The bindings in effect: the menu's (set_bindings), else the highest file's
  * [input.actions] entry, else the defaults. Returns how many. */
 int enhance_action_bindings(int id, char out[][ENHANCE_ACTION_TEXT], int max);
+/* Those of them that never fire for the action in the table in use: a text
+ * that does not parse, an input another action holds, or a pad input left
+ * to the game (an off binding). The descriptor dump lists them, since a
+ * launcher must not show them bound. */
+int enhance_action_refused(int id, char out[][ENHANCE_ACTION_TEXT], int max);
 int enhance_action_default_bindings(int id, char out[][ENHANCE_ACTION_TEXT], int max);
 /* Bind the action to these n texts at once, over the files (n 0 unbinds;
  * n -1 drops the menu's list, back to the files and defaults), and

@@ -106,6 +106,39 @@ const recomp_cfg *enhance_cfg_file(int i);
 const char *enhance_cfg_user_path(void);
 const recomp_cfg *enhance_cfg_defaults(void);
 
+/* A key read by mod-settings precedence (design D4): the key with its
+ * aliases (old spellings), user files over the defaults file, and in each
+ * the key over its aliases. enhance_cfg_layered fills `out` with every file
+ * row that holds a value, highest first, so a caller that finds one of the
+ * wrong type falls through to the next:
+ *
+ *   ENHANCE_ROW_USER            the key in the title file, then the user file
+ *   ENHANCE_ROW_USER_ALIAS      each alias in the title file, then the user file
+ *   ENHANCE_ROW_DEFAULTS        the key in config.default.toml
+ *   ENHANCE_ROW_DEFAULTS_ALIAS  each alias in config.default.toml
+ *
+ * The key and every alias count as read in every file, so a stale alias the
+ * key overrides is not reported as a typo. `aliases` is NULL-terminated (or
+ * NULL). Returns the number of rows filled (at most `max`). The env tier is
+ * the caller's: enhance_cfg_env(key). */
+enum {
+    ENHANCE_ROW_USER = 0,
+    ENHANCE_ROW_USER_ALIAS,
+    ENHANCE_ROW_DEFAULTS,
+    ENHANCE_ROW_DEFAULTS_ALIAS
+};
+struct enhance_cfg_hit {
+    const recomp_cfg *file;
+    const char *key;        /* the spelling found: the key or an alias */
+    int row;                /* ENHANCE_ROW_* */
+};
+int enhance_cfg_layered(const char *key, const char *const *aliases,
+                        struct enhance_cfg_hit *out, int max);
+
+/* The environment value bound to `key` (enhance_cfg_bind_env), or NULL when
+ * unbound, unset or empty; a file key it overrides counts as read. */
+const char *enhance_cfg_env(const char *key);
+
 /* Log the file keys no lookup has read so far ("unused key render.scael,
  * config/config.toml:3"), the defaults file's included; a key a higher file
  * overrides counts as read. So a typo is visible. Call after the modules'

@@ -173,10 +173,10 @@ static int beta_init(const struct xbox_mod_api *api)
 }
 static void beta_shutdown(void) { say("beta.down"); }
 
-static const struct xbox_mod k_alpha = { "alpha", alpha_init, alpha_shutdown };
-static const struct xbox_mod k_bad = { "bad", bad_init, bad_shutdown };
-static const struct xbox_mod k_beta = { "beta", beta_init, beta_shutdown };
-static const struct xbox_mod k_quiet = { "quiet", NULL, NULL };
+static const struct xbox_mod k_alpha = { "alpha", alpha_init, alpha_shutdown, NULL };
+static const struct xbox_mod k_bad = { "bad", bad_init, bad_shutdown, NULL };
+static const struct xbox_mod k_beta = { "beta", beta_init, beta_shutdown, NULL };
+static const struct xbox_mod k_quiet = { "quiet", NULL, NULL, NULL };
 
 static void test_table(void)
 {
@@ -184,7 +184,7 @@ static void test_table(void)
     uint32_t v = 0xC0FFEE11u;
 
     MKDIR("config");
-    write_file("config/config.toml", "[mods.alpha]\nspeed = 3\n");
+    write_file("config/config.toml", "[mods]\n\"alpha.speed\" = 3\n");
     xbox_mod_register_table(mods);
     s_log[0] = 0;
     CHECK(xbox_enhance_init(".", NULL) == 0);
@@ -261,7 +261,7 @@ static int filter_init(const struct xbox_mod_api *api)
     api->batch_filter(hud_filter, &s_hud_on);
     return 0;
 }
-static const struct xbox_mod k_filter = { "filter", filter_init, NULL };
+static const struct xbox_mod k_filter = { "filter", filter_init, NULL, NULL };
 
 static void test_batch_filter(void)
 {
@@ -337,7 +337,7 @@ static int input_init(const struct xbox_mod_api *api)
     s_in_api = api;
     return 0;
 }
-static const struct xbox_mod k_input = { "input", input_init, NULL };
+static const struct xbox_mod k_input = { "input", input_init, NULL, NULL };
 
 static void test_capture(void)
 {
@@ -425,7 +425,7 @@ static int fo_init(const struct xbox_mod_api *api)
     api->batch_filter(fo_filter, NULL);
     return 0;
 }
-static const struct xbox_mod k_filter_only = { "filteronly", fo_init, NULL };
+static const struct xbox_mod k_filter_only = { "filteronly", fo_init, NULL, NULL };
 
 static void test_filter_only(void)
 {
@@ -450,9 +450,9 @@ static void test_filter_only(void)
 static int hold_init(const struct xbox_mod_api *api) { api->input_capture(1); return 0; }
 static int letgo_fail_init(const struct xbox_mod_api *api) { api->input_capture(0); return 1; }
 static int grab_fail_init(const struct xbox_mod_api *api) { api->input_capture(1); return 1; }
-static const struct xbox_mod k_hold = { "hold", hold_init, NULL };
-static const struct xbox_mod k_letgo_fail = { "letgo", letgo_fail_init, NULL };
-static const struct xbox_mod k_grab_fail = { "grab", grab_fail_init, NULL };
+static const struct xbox_mod k_hold = { "hold", hold_init, NULL, NULL };
+static const struct xbox_mod k_letgo_fail = { "letgo", letgo_fail_init, NULL, NULL };
+static const struct xbox_mod k_grab_fail = { "grab", grab_fail_init, NULL, NULL };
 
 static void test_failed_init_capture(void)
 {
@@ -485,7 +485,7 @@ static int once_init(const struct xbox_mod_api *api)
     return 0;
 }
 static void once_shutdown(void) { s_once_down++; }
-static const struct xbox_mod k_once = { "once", once_init, once_shutdown };
+static const struct xbox_mod k_once = { "once", once_init, once_shutdown, NULL };
 
 static void test_shutdown_once(void)
 {

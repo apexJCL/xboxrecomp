@@ -97,7 +97,11 @@ const char *recomp_cfg_name(const recomp_cfg *cfg);
  * from a note on the table). CRLF files stay CRLF.
  * The result is parsed again and must hold exactly the old keys plus the
  * patch, else nothing comes back. Returns the new text (free() it), or NULL
- * with `err` set; a text that does not parse is refused, never repaired. */
+ * with `err` set; a text that does not parse is refused, never repaired.
+ * A flat key the file holds as a [table] (or the start of a deeper one)
+ * is left out and named in `err` (the file once, then each key), and the
+ * other keys are still written: the text comes back with `err` set, as
+ * far as `errlen` holds it. `err` may be NULL or of any length. */
 char *recomp_cfg_patch_text(const char *text, const char *name,
                             const char *const *keys, const char *const *values,
                             size_t n, char *err, size_t errlen);
@@ -106,7 +110,10 @@ char *recomp_cfg_patch_text(const char *text, const char *name,
  * is flushed to the disk and renamed over the file, so a crash or a power
  * loss leaves one whole file. A path that is a symlink is written at its
  * target and stays a link (POSIX; on Windows the link is replaced). Nothing
- * is written when nothing changes. 0, or -1 with `err` set. */
+ * is written when nothing changes. 0; the number of keys left out for a
+ * [table], the rest written, with `err` naming them as far as it holds
+ * (the count does not depend on it); or -1 with `err` set and nothing
+ * written. */
 int recomp_cfg_patch(const char *path, const char *const *keys,
                      const char *const *values, size_t n, char *err, size_t errlen);
 

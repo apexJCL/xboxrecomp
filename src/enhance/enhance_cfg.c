@@ -16,7 +16,7 @@
 
 #include "recomp_exe_dir.h"
 
-#define ENHANCE_MAX_BINDS 64
+#define ENHANCE_MAX_BINDS 128
 /* Slots in lookup order: the first that holds a key answers. */
 #define SLOT_TITLE 0
 #define SLOT_USER 1
@@ -539,6 +539,53 @@ int enhance_cfg_choice(const char *key, const char *const *choices, int def)
         return def;
     }
     return i;
+}
+
+static void mark_read(int f, const char *key)
+{
+    long k = recomp_cfg_find(s_file[f], key);
+    if (k >= 0 && s_flags[f])
+        s_flags[f][k] |= 1;
+}
+
+static int hit(struct enhance_cfg_hit *out, int n, int max, int f, const char *key, int row)
+{
+    if (n < max && recomp_cfg_find(s_file[f], key) >= 0) {
+        out[n].file = s_file[f];
+        out[n].key = key;
+        out[n].row = row;
+        n++;
+    }
+    return n;
+}
+
+int enhance_cfg_layered(const char *key, const char *const *aliases,
+                        struct enhance_cfg_hit *out, int max)
+{
+    int n = 0, f;
+    size_t a;
+    if (!key)
+        return 0;
+    for (f = 0; f < ENHANCE_FILES; f++) {
+        mark_read(f, key);
+        for (a = 0; aliases && aliases[a]; a++)
+            mark_read(f, aliases[a]);
+    }
+    for (f = SLOT_TITLE; f <= SLOT_USER; f++)
+        n = hit(out, n, max, f, key, ENHANCE_ROW_USER);
+    for (a = 0; aliases && aliases[a]; a++)
+        for (f = SLOT_TITLE; f <= SLOT_USER; f++)
+            n = hit(out, n, max, f, aliases[a], ENHANCE_ROW_USER_ALIAS);
+    n = hit(out, n, max, SLOT_DEFAULTS, key, ENHANCE_ROW_DEFAULTS);
+    for (a = 0; aliases && aliases[a]; a++)
+        n = hit(out, n, max, SLOT_DEFAULTS, aliases[a], ENHANCE_ROW_DEFAULTS_ALIAS);
+    return n;
+}
+
+const char *enhance_cfg_env(const char *key)
+{
+    Bind *b;
+    return key ? env_of(key, &b) : NULL;
 }
 
 enhance_cfg_source enhance_cfg_source_of(const char *key)

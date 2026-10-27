@@ -5,6 +5,7 @@
 #include "enhance.h"
 
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "enhance_actions.h"
@@ -190,6 +191,15 @@ int xbox_enhance_init(const char *root, const char *title)
     enhance_input_init();
     /* The toolkit's host actions before the mods register theirs. */
     enhance_actions_init();
+    /* The descriptor dump (RECOMP_MODS_DESCRIBE=json, mod.h): every value and
+     * binding resolved as a start would, then the JSON and exit, with no
+     * mod init, no hook and no hook line. Before any window, audio or guest,
+     * which the title opens after this call. */
+    if (xbox_mod_describe_wanted()) {
+        xbox_mod_init_describe();
+        enhance_actions_rebuild();
+        exit(xbox_mod_describe_write(recomp_env(RENV_MODS_DESCRIBE_OUT)));
+    }
     /* Last: a mod's init reads its keys over every file and the [input]
      * keys already applied (mod.h). */
     xbox_mod_init();

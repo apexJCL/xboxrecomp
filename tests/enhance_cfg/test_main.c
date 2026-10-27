@@ -379,9 +379,15 @@ static void test_quoted_dots(void)
     /* The quoted and the bare spelling are one key. */
     expect_error("[input.actions]\n\"menu.open\" = \"F10\"\nmenu.open = \"F9\"\n",
                  "duplicate key 'input.actions.menu.open'", 3);
-    /* x.y beside x.y.z: a value and a table of it. */
-    expect_error("[input.actions]\nmenu.open = \"F10\"\nmenu.open.all = \"F9\"\n",
-                 "'input.actions.menu.open' is a value", 3);
+    /* Under a flat table x.y beside x.y.z are two names (a mod's switch
+     * and its setting); anywhere else they are a value and a table of it. */
+    c = recomp_cfg_load_string("[mods]\n\"camera.free\" = false\ncamera.free.speed = 2\n",
+                               "q", err, sizeof err);
+    CHECK(c && recomp_cfg_bool(c, "mods.camera.free", 1) == 0 &&
+          recomp_cfg_int(c, "mods.camera.free.speed", 0) == 2);
+    recomp_cfg_free(c);
+    expect_error("[render]\nscale = 1\nscale.x = 2\n", "'render.scale' is a value", 3);
+    expect_error("[mods.alpha]\nspeed = 3\n[mods]\nalpha = true\n", "'mods.alpha' is a table", 4);
     /* Anywhere else, and not as a middle part. */
     expect_error("[render]\n\"a.b\" = 1\n", "'.' inside a quoted key", 2);
     expect_error("\"input.actions\".x = 1\n", "'.' inside a quoted key", 1);

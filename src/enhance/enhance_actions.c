@@ -146,6 +146,17 @@ struct action {
      * defaults until Save writes them (enhance_action_set_bindings). */
     char ovr[ENHANCE_ACTION_BINDS][TEXT_MAX];
     int  novr, has_ovr;
+    /* A descriptor action (mod.h, mod-settings D3): its retired keys, its
+     * env row (-1 none) that replaces every binding when set, and whether
+     * its mod is off. A dormant action keeps its bindings in the table, so
+     * they still hold their inputs against other actions, but none of them
+     * fires, consumes or reads as down. */
+    const char *const *aliases;
+    int  env;
+    int  dormant;
+    char envb[ENHANCE_ACTION_BINDS][TEXT_MAX];   /* the env row, split; s_reg_lock */
+    int  src;               /* ENHANCE_ACT_SRC_* of the last config_texts */
+    char srckey[sizeof PREFIX + NAME_MAX_];      /* the file key it came from */
 };
 
 static struct action s_act[ENHANCE_ACTIONS_MAX];
@@ -177,6 +188,7 @@ struct binding {
      * new table no longer does. */
     char name[NAME_MAX_];
     int explicit_;          /* from the menu or a file, not the action's defaults */
+    int dormant;            /* its action's mod is off: holds the input, never fires */
     /* A longer binding on the same port holds all of its members: this one
      * fires at its release, and only when no longer one fired meanwhile
      * (one press, one action). */
@@ -215,6 +227,13 @@ static int s_delay_ms;
 /* ---- arming ------------------------------------------------------------ */
 
 static int s_armed;
+/* The keys below change at init and, since mod-settings, from the menu's
+ * thread when a descriptor mod's arm setting is switched live, while the
+ * menu and the overlay read them: s_arm_lock covers the list. Only that
+ * one thread arms or disarms after start, so s_armed's flip and the hook
+ * install that follows need no more than its atomics. Never held while
+ * taking s_reg_lock. */
+static int s_arm_lock;
 static char s_arm_keys[ARM_KEYS][NAME_MAX_];
 static int s_arm_owner[ARM_KEYS];   /* the mod that armed it, -1 the toolkit */
 static int s_narm;
@@ -639,7 +658,7 @@ static void step(struct table *t, unsigned port, uint32_t held, int tick, uint64
         int cond = 0;
 
         b->want = 0;
-        if (b->kind == B_OFF || (b->kind == B_KEY ? port != 0 : b->port != port))
+        if (b->kind == B_OFF || b->dormant || (b->kind == B_KEY ? port != 0 : b->port != port))
             continue;
         if (tick && b->kind == B_CHORD && b->guest)
             continue;
@@ -719,7 +738,7 @@ static void step(struct table *t, unsigned port, uint32_t held, int tick, uint64
     }
     for (int i = 0; i < t->n; i++) {
         struct binding *b = &t->b[i];
-        if (b->kind == B_OFF || (b->kind == B_KEY ? port != 0 : b->port != port))
+        if (b->kind == B_OFF || b->dormant || (b->kind == B_KEY ? port != 0 : b->port != port))
             continue;
         /* A shorter binding is a tap: it never reads as down. */
         if (b->active && b->fired && !b->held_over && !b->shadowed)
@@ -972,6 +991,13 @@ const char *enhance_action_name(int id)
 int enhance_action_register_owned(const char *name, const char *label,
                                   const char *const *defaults, int owner)
 {
+    return enhance_action_register_full(name, label, defaults, owner, NULL, -1);
+}
+
+int enhance_action_register_full(const char *name, const char *label,
+                                 const char *const *defaults, int owner,
+                                 const char *const *aliases, int env)
+{
     struct action *a;
     int id, started, c;
 
@@ -1007,6 +1033,8 @@ int enhance_action_register_owned(const char *name, const char *label,
     for (int i = 0; defaults && defaults[i] && a->ndefs < ENHANCE_ACTION_BINDS; i++)
         snprintf(a->defs[a->ndefs++], TEXT_MAX, "%s", defaults[i]);
     a->owner = owner;
+    a->aliases = aliases;
+    a->env = env;
     a->live = 1;
     __atomic_store_n(&s_nact, id + 1, __ATOMIC_RELEASE);
     started = s_started;
@@ -1065,56 +1093,111 @@ int enhance_action_down(int id)
 
 /* ---- building the table ------------------------------------------------ */
 
-/* The bindings of one action from the highest file that names it (all of
- * them: an empty list unbinds), else its defaults. Returns how many texts;
- * *explicit_ (when not NULL) is 0 for the defaults. */
-static int config_texts(const struct action *a, const char *texts[ENHANCE_ACTION_BINDS],
+/* One file row's bindings: 1 with the texts, 0 when the value is not a
+ * string or a list of strings (a line; the next row answers). */
+static int file_texts(const recomp_cfg *c, const char *key, const char *where,
+                      const char *texts[ENHANCE_ACTION_BINDS], int *n)
+{
+    recomp_cfg_type t = recomp_cfg_type_of(c, key);
+    *n = 0;
+    if (t == RCFG_STRING) {
+        texts[(*n)++] = recomp_cfg_string(c, key, "");
+        return 1;
+    }
+    if (t == RCFG_ARRAY) {
+        size_t len = recomp_cfg_array_len(c, key);
+        for (size_t i = 0; i < len; i++) {
+            if (recomp_cfg_array_type(c, key, i) != RCFG_STRING) {
+                fprintf(stderr, "[INPUT] action %s: element %zu is not a"
+                        " string; skipped\n", where, i + 1);
+                continue;
+            }
+            if (*n == ENHANCE_ACTION_BINDS) {
+                fprintf(stderr, "[INPUT] action %s: more than %d bindings;"
+                        " the rest skipped\n", where, ENHANCE_ACTION_BINDS);
+                break;
+            }
+            texts[(*n)++] = recomp_cfg_array_string(c, key, i, "");
+        }
+        return 1;
+    }
+    fprintf(stderr, "[INPUT] action %s: should be a list of strings; skipped\n", where);
+    return 0;
+}
+
+/* The bindings of one action, highest first (mod-settings D4): its env
+ * row, the menu's list, the user files' key then its aliases, the defaults
+ * file's key then its aliases, its defaults. A file row names all of them
+ * (an empty list unbinds). Returns how many texts; *explicit_ (when not
+ * NULL) is 0 for the defaults. Under s_reg_lock: the env split lands in
+ * the action. */
+static int config_texts(struct action *a, const char *texts[ENHANCE_ACTION_BINDS],
                         char where[96], int *explicit_)
 {
     char key[sizeof PREFIX + NAME_MAX_];
-    const recomp_cfg *c;
-    int n = 0, dummy;
+    char alias[ENHANCE_ACTION_BINDS][sizeof PREFIX + NAME_MAX_];
+    const char *aliases[ENHANCE_ACTION_BINDS + 1];
+    struct enhance_cfg_hit hits[2 * (ENHANCE_ACTION_BINDS + 1) + 2];
+    const char *env = a->env >= 0 ? recomp_env((recomp_env_id)a->env) : NULL;
+    int n = 0, na = 0, nh, dummy;
 
     if (!explicit_)
         explicit_ = &dummy;
     *explicit_ = 1;
+    if (env && *env) {
+        const char *p = env;
+        snprintf(where, 96, "%s (%s)", a->name, recomp_env_name((recomp_env_id)a->env));
+        a->src = ENHANCE_ACT_SRC_ENV;
+        while (*p && n < ENHANCE_ACTION_BINDS) {
+            const char *c = strchr(p, ',');
+            size_t len = c ? (size_t)(c - p) : strlen(p);
+            if (len >= TEXT_MAX)
+                len = TEXT_MAX - 1;
+            memcpy(a->envb[n], p, len);
+            a->envb[n][len] = 0;
+            trim(a->envb[n]);
+            if (a->envb[n][0]) {
+                texts[n] = a->envb[n];
+                n++;
+            }
+            if (!c)
+                break;
+            p = c + 1;
+        }
+        return n;
+    }
     if (a->has_ovr) {
         snprintf(where, 96, "%s (menu)", a->name);
+        a->src = ENHANCE_ACT_SRC_MENU;
         for (int i = 0; i < a->novr; i++)
             texts[n++] = a->ovr[i];
         return n;
     }
     snprintf(key, sizeof key, PREFIX "%s", a->name);
-    c = enhance_cfg_lookup(key);
-    if (c) {
-        recomp_cfg_type t = recomp_cfg_type_of(c, key);
-        snprintf(where, 96, "%s (%s:%d)", key, recomp_cfg_name(c), recomp_cfg_line(c, key));
-        if (t == RCFG_STRING) {
-            texts[n++] = recomp_cfg_string(c, key, "");
+    for (int i = 0; a->aliases && a->aliases[i] && na < ENHANCE_ACTION_BINDS; i++) {
+        /* An alias is a full key ("input.actions.camera.toggle"). */
+        snprintf(alias[na], sizeof alias[na], "%s", a->aliases[i]);
+        aliases[na] = alias[na];
+        na++;
+    }
+    aliases[na] = NULL;
+    nh = enhance_cfg_layered(key, aliases, hits, (int)(sizeof hits / sizeof hits[0]));
+    for (int h = 0; h < nh; h++) {
+        snprintf(where, 96, "%s (%s:%d)", hits[h].key, recomp_cfg_name(hits[h].file),
+                 recomp_cfg_line(hits[h].file, hits[h].key));
+        if (file_texts(hits[h].file, hits[h].key, where, texts, &n)) {
+            snprintf(a->srckey, sizeof a->srckey, "%s", hits[h].key);
+            a->src = hits[h].row == ENHANCE_ROW_USER ? ENHANCE_ACT_SRC_USER
+                   : hits[h].row == ENHANCE_ROW_USER_ALIAS ? ENHANCE_ACT_SRC_USER_ALIAS
+                   : hits[h].row == ENHANCE_ROW_DEFAULTS ? ENHANCE_ACT_SRC_DEFAULTS
+                   : ENHANCE_ACT_SRC_DEFAULTS_ALIAS;
             return n;
         }
-        if (t == RCFG_ARRAY) {
-            size_t len = recomp_cfg_array_len(c, key);
-            for (size_t i = 0; i < len; i++) {
-                if (recomp_cfg_array_type(c, key, i) != RCFG_STRING) {
-                    fprintf(stderr, "[INPUT] action %s: element %zu is not a"
-                            " string; skipped\n", where, i + 1);
-                    continue;
-                }
-                if (n == ENHANCE_ACTION_BINDS) {
-                    fprintf(stderr, "[INPUT] action %s: more than %d bindings;"
-                            " the rest skipped\n", where, ENHANCE_ACTION_BINDS);
-                    break;
-                }
-                texts[n++] = recomp_cfg_array_string(c, key, i, "");
-            }
-            return n;
-        }
-        fprintf(stderr, "[INPUT] action %s: should be a list of strings; using"
-                " the defaults\n", where);
     }
     snprintf(where, 96, "%s (default)", a->name);
     *explicit_ = 0;
+    a->src = ENHANCE_ACT_SRC_DEFAULT;
+    n = 0;
     for (int i = 0; i < a->ndefs; i++)
         texts[n++] = a->defs[i];
     return n;
@@ -1282,6 +1365,12 @@ static int dedup(struct table *t)
         if (o) {
             fprintf(stderr, "[INPUT] action %s: '%s' refused: %s has it ('%s');"
                     " one input fires one action\n", b->name, b->text, o->name, o->text);
+            /* Two defaults on one input with a mod off: the first
+             * registered keeps it whether or not the mod is on, so
+             * switching it live moves nothing (mod-settings D3). */
+            if (!o->explicit_ && !b->explicit_ && (o->dormant || b->dormant))
+                fprintf(stderr, "[MOD] %s: %s keeps it over %s (dormant)\n", b->text,
+                        o->name, b->name);
             continue;
         }
         for (int k = 0; k < n; k++) {
@@ -1332,6 +1421,7 @@ static struct table *build(const struct table *old)
                 continue;
             b->action = i;
             b->explicit_ = expl;
+            b->dormant = s_act[i].dormant;
             snprintf(b->name, sizeof b->name, "%s", s_act[i].name);
             if (b->kind == B_PAD)
                 classify(b, where, &ps, used, old);
@@ -1344,8 +1434,12 @@ static struct table *build(const struct table *old)
         if (i && b->action != t->b[i - 1].action)
             idx = 0;
         b->idx = idx++;
+        /* A dormant binding keeps its input from the others (dedup above)
+         * but takes no part in a step: it shadows nothing, reads no port. */
+        if (b->dormant)
+            continue;
         for (int k = 0; k < t->n && !b->shadowed; k++)
-            b->shadowed = pad_inside(b, &t->b[k]);
+            b->shadowed = !t->b[k].dormant && pad_inside(b, &t->b[k]);
         /* A held input must be let go before a new binding fires on it,
          * and does not read as down until then. */
         b->active = b->fired = b->held_over = 1;
@@ -1425,26 +1519,36 @@ static void hook_line(void)
         return;
     }
     fprintf(stderr, "[ENHANCE] actions hook=on (");
+    spin_lock(&s_arm_lock);
     for (int i = 0; i < s_narm; i++)
         fprintf(stderr, i ? ", %s" : "%s", s_arm_keys[i]);
+    spin_unlock(&s_arm_lock);
     fprintf(stderr, ")\n");
 }
 
-static int arm_key(const char *key, int owner)
+static int arm_key_on(const char *key, int owner, int on)
 {
-    if (!key || !enhance_cfg_bool(key, 0))
+    if (!key || !on)
         return 0;
+    spin_lock(&s_arm_lock);
     for (int i = 0; i < s_narm; i++)
         if (!strcmp(s_arm_keys[i], key)) {
             if (owner < 0)
                 s_arm_owner[i] = -1;    /* the toolkit's key stays */
+            spin_unlock(&s_arm_lock);
             return 1;
         }
     if (s_narm < ARM_KEYS) {
         s_arm_owner[s_narm] = owner;
         snprintf(s_arm_keys[s_narm++], NAME_MAX_, "%s", key);
     }
+    spin_unlock(&s_arm_lock);
     return 1;
+}
+
+static int arm_key(const char *key, int owner)
+{
+    return key && arm_key_on(key, owner, enhance_cfg_bool(key, 0));
 }
 
 /* The title's pad glue (mod.h) and input_core's seam. */
@@ -1484,6 +1588,27 @@ int enhance_actions_arm_owned(const char *key, int owner)
     return 1;
 }
 
+static void disarm_key(const char *key, int owner);
+
+int enhance_actions_arm_set(const char *key, int owner, int on)
+{
+    int was = __atomic_load_n(&s_armed, __ATOMIC_ACQUIRE);
+    if (!on) {
+        disarm_key(key, owner);
+        return enhance_actions_armed();
+    }
+    if (!arm_key_on(key, owner, 1))
+        return was;
+    if (!s_started)
+        return 1;
+    if (!was) {
+        __atomic_store_n(&s_armed, 1, __ATOMIC_RELEASE);
+        install();
+        hook_line();
+    }
+    return 1;
+}
+
 int enhance_actions_armed(void)
 {
     return __atomic_load_n(&s_armed, __ATOMIC_ACQUIRE);
@@ -1491,20 +1616,25 @@ int enhance_actions_armed(void)
 
 int enhance_actions_keyed(const char *key)
 {
-    for (int i = 0; key && i < s_narm; i++)
-        if (!strcmp(s_arm_keys[i], key))
-            return 1;
-    return 0;
+    int hit = 0;
+    spin_lock(&s_arm_lock);
+    for (int i = 0; key && i < s_narm && !hit; i++)
+        hit = !strcmp(s_arm_keys[i], key);
+    spin_unlock(&s_arm_lock);
+    return hit;
 }
 
 /* A mod left out (its init failed) or dropped takes the keys it armed
  * with; the last one gone disarms the hook. */
-static void disarm_where(int all_mods, int owner)
+static void disarm_match(int all_mods, int owner, const char *key)
 {
-    int n = 0;
+    int n = 0, was;
 
+    spin_lock(&s_arm_lock);
+    was = s_narm;
     for (int i = 0; i < s_narm; i++) {
-        if (s_arm_owner[i] >= 0 && (all_mods || s_arm_owner[i] == owner))
+        if (s_arm_owner[i] >= 0 && (all_mods || s_arm_owner[i] == owner) &&
+            (!key || !strcmp(s_arm_keys[i], key)))
             continue;
         if (n != i) {
             memcpy(s_arm_keys[n], s_arm_keys[i], NAME_MAX_);
@@ -1512,9 +1642,10 @@ static void disarm_where(int all_mods, int owner)
         }
         n++;
     }
-    if (n == s_narm)
-        return;
     s_narm = n;
+    spin_unlock(&s_arm_lock);
+    if (n == was)
+        return;
     if (!n && s_started && __atomic_load_n(&s_armed, __ATOMIC_ACQUIRE)) {
         __atomic_store_n(&s_armed, 0, __ATOMIC_RELEASE);
         xbox_InputSetPadFilter(NULL);
@@ -1525,7 +1656,70 @@ static void disarm_where(int all_mods, int owner)
     }
 }
 
+static void disarm_where(int all_mods, int owner)
+{
+    disarm_match(all_mods, owner, NULL);
+}
+
+/* A mod's key switched off live: only that mod's entry goes (the toolkit's
+ * own entry for the same key stays). */
+static void disarm_key(const char *key, int owner)
+{
+    if (key && owner >= 0)
+        disarm_match(0, owner, key);
+}
+
 /* ---- the menu's calls --------------------------------------------------- */
+
+void enhance_actions_set_dormant(int owner, int on)
+{
+    int changed = 0, started;
+
+    spin_lock(&s_reg_lock);
+    for (int i = 0; i < s_nact; i++)
+        if (s_act[i].live && s_act[i].owner == owner && owner >= 0 &&
+            s_act[i].dormant != !!on) {
+            s_act[i].dormant = !!on;
+            changed = 1;
+        }
+    started = s_started;
+    spin_unlock(&s_reg_lock);
+    if (changed && started)
+        enhance_actions_rebuild();
+}
+
+int enhance_action_dormant(int id)
+{
+    int n = __atomic_load_n(&s_nact, __ATOMIC_ACQUIRE);
+    return id >= 0 && id < n && s_act[id].live && s_act[id].dormant;
+}
+
+int enhance_action_source(int id, char *key, size_t n)
+{
+    const char *texts[ENHANCE_ACTION_BINDS];
+    char where[96];
+    int src = ENHANCE_ACT_SRC_DEFAULT;
+
+    if (key && n)
+        key[0] = 0;
+    spin_lock(&s_reg_lock);
+    if (id >= 0 && id < s_nact && s_act[id].live) {
+        s_act[id].srckey[0] = 0;
+        config_texts(&s_act[id], texts, where, NULL);
+        src = s_act[id].src;
+        if (key && n)
+            snprintf(key, n, "%s", s_act[id].srckey);
+    }
+    spin_unlock(&s_reg_lock);
+    return src;
+}
+
+const char *enhance_action_source_name(int src)
+{
+    static const char *const names[] = { "default", "env", "menu", "user", "user_alias",
+                                         "defaults", "defaults_alias" };
+    return src >= 0 && src < (int)(sizeof names / sizeof names[0]) ? names[src] : "?";
+}
 
 int enhance_action_count(void)
 {
@@ -1553,6 +1747,37 @@ int enhance_action_bindings(int id, char out[][ENHANCE_ACTION_TEXT], int max)
     for (int i = 0; i < k && n < max; i++)
         if (texts[i] && *texts[i])
             snprintf(out[n++], ENHANCE_ACTION_TEXT, "%s", texts[i]);
+    spin_unlock(&s_reg_lock);
+    return n;
+}
+
+int enhance_action_refused(int id, char out[][ENHANCE_ACTION_TEXT], int max)
+{
+    const char *texts[ENHANCE_ACTION_BINDS];
+    char where[96];
+    int n = 0, k;
+
+    /* s_reg_lock then s_step_lock, as a rebuild takes them. */
+    spin_lock(&s_reg_lock);
+    if (id < 0 || id >= s_nact || !s_act[id].live) {
+        spin_unlock(&s_reg_lock);
+        return 0;
+    }
+    k = config_texts(&s_act[id], texts, where, NULL);
+    spin_lock(&s_step_lock);
+    for (int i = 0; i < k && n < max; i++) {
+        int held = 0;
+        if (!texts[i] || !*texts[i])
+            continue;
+        for (int j = 0; s_table && j < s_table->n && !held; j++)
+            /* An off binding stays in the table but never fires: the
+             * game keeps that input (classify). */
+            held = s_table->b[j].action == id && s_table->b[j].kind != B_OFF &&
+                   !strcmp(s_table->b[j].text, texts[i]);
+        if (!held)
+            snprintf(out[n++], ENHANCE_ACTION_TEXT, "%s", texts[i]);
+    }
+    spin_unlock(&s_step_lock);
     spin_unlock(&s_reg_lock);
     return n;
 }
@@ -1695,7 +1920,9 @@ void enhance_actions_start(void)
      * mod's own key it armed with during its init. */
     arm_key("menu.enabled", -1);
     arm_key("overlay.stats", -1);
+    spin_lock(&s_arm_lock);
     keyed = s_narm > 0;
+    spin_unlock(&s_arm_lock);
     report_unknown();
     enhance_actions_rebuild();
     spin_lock(&s_reg_lock);
@@ -1720,7 +1947,9 @@ void enhance_actions_reset(void)
     spin_lock(&s_reg_lock);
     s_nact = 0;
     s_started = 0;
+    spin_lock(&s_arm_lock);
     s_narm = 0;
+    spin_unlock(&s_arm_lock);
     s_delay_ms = 0;
     memset(s_act, 0, sizeof s_act);
     spin_unlock(&s_reg_lock);

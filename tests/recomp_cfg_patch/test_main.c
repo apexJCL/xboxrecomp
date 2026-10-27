@@ -185,6 +185,111 @@ static void test_actions_mods(void)
     }
 }
 
+/* Flat tables: a mod's switch and its settings side by side, captured
+ * controls, keys the patch was not given, and a [mods.<name>] table. */
+static int read_file(const char *p, char *buf, size_t n);
+static void write_file(const char *p, const char *s);
+
+static void test_flat(void)
+{
+    {
+        const char *k[] = { "mods.alpha", "mods.alpha.speed" }, *v[] = { "false", "4" };
+        EXPECT("[mods]\n\"alpha.speed\" = 3\n\"y.extra\" = 1  # not ours\n", k, v,
+               "[mods]\n\"alpha.speed\" = 4\n\"y.extra\" = 1  # not ours\n"
+               "alpha = false\n");
+        EXPECT("", k, v, "[mods]\nalpha = false\n\"alpha.speed\" = 4\n");
+        /* a bare dotted name under [mods] is the same flat key */
+        EXPECT("[mods]\nalpha = true\nalpha.speed = 3\n", k, v,
+               "[mods]\nalpha = false\nalpha.speed = 4\n");
+    }
+    {
+        const char *k[] = { "input.controls.camera.free.look" }, *v[] = { "[\"mouse\", \"pad.rs\"]" };
+        EXPECT("", k, v, "[input.controls]\n\"camera.free.look\" = [\"mouse\", \"pad.rs\"]\n");
+        EXPECT("[input.controls]\n\"camera.free.look\" = [\"pad.ls\", \"mouse\"]\n"
+               "\"camera.free\" = [\"x\"]\n", k, v,
+               "[input.controls]\n\"camera.free.look\" = [\"mouse\", \"pad.rs\"]\n"
+               "\"camera.free\" = [\"x\"]\n");
+        v[0] = NULL;
+        EXPECT("[input.controls]\n\"camera.free.look\" = [\"mouse\"]\n", k, v, "");
+    }
+    {
+        /* [mods.alpha] makes alpha a table: writing the switch is refused
+         * with a line that says where the keys go; its own keys still edit */
+        const char *k[] = { "mods.alpha" }, *v[] = { "false" };
+        char err[256];
+        char *got = recomp_cfg_patch_text("[mods.alpha]\nspeed = 3\n", "t.toml", k, v, 1,
+                                          err, sizeof err);
+        /* left out and named; with nothing else, the text comes back as is */
+        CHECK(got && !strcmp(got, "[mods.alpha]\nspeed = 3\n"));
+        CHECK(strstr(err, "mods.alpha is the table [mods.alpha]") != NULL);
+        CHECK(strstr(err, "flat under [mods]") != NULL);
+        free(got);
+        const char *k2[] = { "mods.alpha.speed" }, *v2[] = { "4" };
+        EXPECT("[mods.alpha]\nspeed = 3\n", k2, v2, "[mods.alpha]\nspeed = 4\n");
+    }
+    {
+        /* A mixed batch (a menu Save): only the refused keys are left
+         * out, each named, and the rest are written (review F5). The
+         * deeper table [mods.camera.free] refuses "camera" by its own
+         * wording. */
+        const char *k[] = { "render.scale", "mods.alpha", "mods.camera", "mods.beta" };
+        const char *v[] = { "3", "false", "true", "false" };
+        static const char *const in =
+            "[render]\nscale = 2\n[mods.alpha]\nspeed = 3\n[mods.camera.free]\nspeed = 1\n";
+        char err[512], buf[1024];
+        char *got = recomp_cfg_patch_text(in, "t.toml", k, v, 4, err, sizeof err);
+        CHECK(got && !strcmp(got,
+              "[render]\nscale = 3\n[mods.alpha]\nspeed = 3\n[mods.camera.free]\nspeed = 1\n"
+              "\n[mods]\nbeta = false\n"));
+        CHECK(strstr(err, "t.toml: mods.alpha is the table [mods.alpha]") != NULL);
+        /* the file is named once, then each key */
+        CHECK(strstr(err, "; mods.camera cannot sit beside the table "
+                          "[mods.camera.free]; write that table's keys flat under [mods]")
+              != NULL);
+        CHECK(strstr(err, "beta") == NULL && strstr(err, "render") == NULL);
+        free(got);
+        CHECK(strstr(err, "t.toml: mods.camera") == NULL);
+        /* the file: written, and 2 says two keys were left out */
+        remove("rcp_mix.toml");
+        write_file("rcp_mix.toml", in);
+        CHECK(recomp_cfg_patch("rcp_mix.toml", k, v, 4, err, sizeof err) == 2);
+        CHECK(read_file("rcp_mix.toml", buf, sizeof buf) > 0);
+        CHECK(strstr(buf, "scale = 3\n") != NULL && strstr(buf, "beta = false\n") != NULL);
+        CHECK(strstr(err, "mods.alpha is the table") != NULL);
+        /* only refused keys: nothing to write, still 1 */
+        CHECK(recomp_cfg_patch("rcp_mix.toml", k + 1, v + 1, 1, err, sizeof err) == 1);
+        /* An error buffer of no room or one byte (review N3): nothing is
+         * written past it, and the count still says what was left out. */
+        {
+            char tiny[8];
+            memset(tiny, 'x', sizeof tiny);
+            got = recomp_cfg_patch_text(in, "t.toml", k, v, 4, tiny, 0);
+            CHECK(got && strstr(got, "beta = false\n") != NULL);
+            free(got);
+            for (size_t j = 0; j < sizeof tiny; j++)
+                CHECK(tiny[j] == 'x');
+            got = recomp_cfg_patch_text(in, "t.toml", k, v, 4, tiny, 1);
+            CHECK(got && tiny[0] == 0 && tiny[1] == 'x');
+            free(got);
+            got = recomp_cfg_patch_text(in, "t.toml", k, v, 4, NULL, 0);
+            CHECK(got != NULL);
+            free(got);
+            write_file("rcp_mix.toml", in);
+            memset(tiny, 'x', sizeof tiny);
+            CHECK(recomp_cfg_patch("rcp_mix.toml", k, v, 4, tiny, 0) == 2);
+            CHECK(tiny[0] == 'x');
+            write_file("rcp_mix.toml", in);
+            CHECK(recomp_cfg_patch("rcp_mix.toml", k, v, 4, tiny, 1) == 2);
+            CHECK(tiny[0] == 0 && tiny[1] == 'x');
+            write_file("rcp_mix.toml", in);
+            CHECK(recomp_cfg_patch("rcp_mix.toml", k, v, 4, NULL, 0) == 2);
+            CHECK(read_file("rcp_mix.toml", buf, sizeof buf) > 0);
+            CHECK(strstr(buf, "beta = false\n") != NULL);
+        }
+        remove("rcp_mix.toml");
+    }
+}
+
 static void test_array_comments(void)
 {
     /* one binding per line, a note on each: the same count keeps both */
@@ -355,6 +460,7 @@ int main(void)
     test_add();
     test_remove();
     test_actions_mods();
+    test_flat();
     test_array_comments();
     test_crlf();
     test_refusals();

@@ -13,6 +13,7 @@
 #include "enhance_actions.h"
 #include "enhance_cfg.h"
 #include "enhance_input.h"
+#include "enhance_menu.h"
 #include "host_pad.h"
 #include "input_backend.h"
 #include "input_names.h"
@@ -665,7 +666,7 @@ static int probe_init(const struct xbox_mod_api *api)
     s_probe_id = api->action_register("probe.go", "Probe", defs);
     return 0;
 }
-static const struct xbox_mod k_probe = { "probe", probe_init, NULL };
+static const struct xbox_mod k_probe = { "probe", probe_init, NULL, NULL };
 
 static void test_disarmed(void)
 {
@@ -1050,7 +1051,7 @@ static int v1_init(const struct xbox_mod_api *api)
     /* A mod built against version 1 touches nothing past batch_filter. */
     return api->on_frame(v1_frame, NULL) ? 0 : -1;
 }
-static const struct xbox_mod k_v1 = { "oldmod", v1_init, NULL };
+static const struct xbox_mod k_v1 = { "oldmod", v1_init, NULL, NULL };
 
 static const struct xbox_mod_api *s_v2_api;
 static int s_cam_id = -2, s_cam_armed = -1;
@@ -1064,7 +1065,7 @@ static int v2_init(const struct xbox_mod_api *api)
     s_cam_armed = api->actions_arm("camera.free");
     return 0;
 }
-static const struct xbox_mod k_v2 = { "camera", v2_init, NULL };
+static const struct xbox_mod k_v2 = { "camera", v2_init, NULL, NULL };
 
 static int bad_init(const struct xbox_mod_api *api)
 {
@@ -1072,7 +1073,7 @@ static int bad_init(const struct xbox_mod_api *api)
     api->actions_arm("bad.on");
     return -1;
 }
-static const struct xbox_mod k_bad = { "bad", bad_init, NULL };
+static const struct xbox_mod k_bad = { "bad", bad_init, NULL, NULL };
 
 static void test_mod_api(void)
 {
@@ -1080,7 +1081,7 @@ static void test_mod_api(void)
     const char *out;
     int id;
 
-    CHECK(XBOX_MOD_API_VERSION == 2u);
+    CHECK(XBOX_MOD_API_VERSION == 3u);
     out = start_with("[camera]\nfree = true\n", &k_fake, mods);
     CHECK(strstr(out, "[ENHANCE] actions hook=on (camera.free)\n") != NULL);
     CHECK(s_cam_armed == 1);
@@ -1946,6 +1947,150 @@ static void test_quiet(void)
     }
 }
 
+/* ---- descriptor mods: dormant actions (mod-settings D3) --------------- */
+
+/* A descriptor mod whose switch is live: its ACTION control is registered
+ * before init and is dormant while the switch is off. */
+static const char *const k_fly_defs[] = { "F6", NULL };
+static const struct xbox_mod_setting k_fly_set[] = {
+    { "free", "fly.free", NULL, NULL, NULL, NULL, NULL,
+      XBOX_SET_BOOL, ENHANCE_LIVE, XBOX_SET_ENABLE, 0, 0, 0, 0, NULL },
+};
+static const struct xbox_mod_control k_fly_ctl[] = {
+    { "toggle", "Free camera", NULL, NULL, XBOX_CTL_ACTION, k_fly_defs, NULL, "RECOMP_EXT_VMA" },
+};
+static const struct xbox_mod_desc k_fly_desc = {
+    XBOX_MOD_DESC_VERSION, sizeof(struct xbox_mod_desc), NULL, NULL, NULL, NULL,
+    k_fly_set, 1, k_fly_ctl, 1
+};
+static int s_fly_inits;
+static void fly_enable(int on, void *u) { (void)on; (void)u; }
+static int fly_init(const struct xbox_mod_api *api)
+{
+    s_fly_inits++;
+    api->on_enable(fly_enable, NULL);
+    api->actions_arm("fly.free");
+    return 0;
+}
+static const struct xbox_mod k_fly = { "fly", fly_init, NULL, &k_fly_desc };
+
+static void test_dormant(void)
+{
+    static const struct xbox_mod *const mods[] = { &k_fly, &k_probe, NULL };
+    char b[ENHANCE_ACTION_BINDS][ENHANCE_ACTION_TEXT];
+    char bound[ENHANCE_ACTION_TEXT];
+    const char *out;
+    int fly, id;
+
+    /* Off, the menu off: not inited, nothing arms the hook, and F6 fires
+     * nothing; the dormant default still keeps F6 from probe.go's. */
+    s_fly_inits = 0;
+    out = start_with(NULL, &k_fake, mods);
+    poll0();
+    fly = 0;
+    id = enhance_action_find("fly.toggle");
+    CHECK(id >= 0 && xbox_mod_control_action(fly, 0) == id);
+    CHECK(s_fly_inits == 0);
+    CHECK(strstr(out, "[ENHANCE] fly.free=off\n") != NULL);
+    CHECK(strstr(out, "[ENHANCE] actions hook=off\n") != NULL);
+    CHECK(strstr(out, "[INPUT] action probe.go: 'F6' refused: fly.toggle has it ('F6')")
+          != NULL);
+    CHECK(strstr(out, "[MOD] F6: fly.toggle keeps it over probe.go (dormant)\n") != NULL);
+    CHECK(enhance_action_dormant(id));
+    CHECK(enhance_action_owner("F6", -1, bound, sizeof bound) == id);
+    tap_key(VK_F6);
+    CHECK(enhance_action_pressed(id) == 0);
+    CHECK(enhance_action_pressed(s_probe_id) == 0);
+
+    /* The menu on: inited dormant, the hook armed by the menu only; F6
+     * still fires nothing. */
+    s_fly_inits = 0;
+    out = start_with(ARMED, &k_fake, mods);
+    poll0();
+    id = enhance_action_find("fly.toggle");
+    CHECK(s_fly_inits == 1);
+    CHECK(!strcmp(xbox_mod_init_outcome(fly), "dormant"));
+    CHECK(strstr(out, "[ENHANCE] actions hook=on (menu.enabled)\n") != NULL);
+    CHECK(enhance_action_dormant(id));
+    tap_key(VK_F6);
+    CHECK(enhance_action_pressed(id) == 0);
+    CHECK(enhance_action_pressed(s_probe_id) == 0);
+    /* The live switch: the table is rebuilt, F6 stays where it was and
+     * now fires; the mod's key arms the hook beside the menu's. */
+    xbox_mod_setting_set(fly, 0, 1);
+    CHECK(!enhance_action_dormant(id));
+    CHECK(enhance_action_bindings(id, b, ENHANCE_ACTION_BINDS) == 1 && !strcmp(b[0], "F6"));
+    CHECK(enhance_action_owner("F6", -1, bound, sizeof bound) == id);
+    CHECK(enhance_actions_armed());
+    poll0();
+    tap_key(VK_F6);
+    CHECK(enhance_action_pressed(id) == 1);
+    CHECK(enhance_action_pressed(s_probe_id) == 0);
+    /* And off again: dormant, F6 held, nothing fires. */
+    xbox_mod_setting_set(fly, 0, 0);
+    CHECK(enhance_action_dormant(id));
+    poll0();
+    tap_key(VK_F6);
+    CHECK(enhance_action_pressed(id) == 0);
+    CHECK(enhance_action_owner("F6", -1, bound, sizeof bound) == id);
+
+    /* On at start: inited, its key arms the hook. */
+    out = start_with("[fly]\nfree = true\n", &k_fake, mods);
+    CHECK(strstr(out, "[ENHANCE] fly.free=on\n") != NULL);
+    CHECK(strstr(out, "[ENHANCE] actions hook=on (fly.free)\n") != NULL);
+    CHECK(!enhance_action_dormant(enhance_action_find("fly.toggle")));
+
+    /* The env row replaces the bindings; F6 goes back to probe.go. */
+    set_env("RECOMP_EXT_VMA", "F8");
+    out = start_with("[fly]\nfree = true\n", &k_fake, mods);
+    poll0();
+    id = enhance_action_find("fly.toggle");
+    CHECK(enhance_action_bindings(id, b, ENHANCE_ACTION_BINDS) == 1 && !strcmp(b[0], "F8"));
+    CHECK(enhance_action_owner("F6", -1, bound, sizeof bound) == s_probe_id);
+    tap_key(VK_F8);
+    CHECK(enhance_action_pressed(id) == 1);
+    set_env("RECOMP_EXT_VMA", NULL);
+}
+
+/* ---- the arm keys switched live while another thread reads them ------- */
+
+#ifndef _WIN32
+static int s_arm_miss;
+
+static void *keyed_thread(void *u)
+{
+    (void)u;
+    while (!__atomic_load_n(&s_stop, __ATOMIC_ACQUIRE)) {
+        /* The menu's key never leaves the list: a torn compaction in
+         * disarm_match would drop it for a read. */
+        if (!enhance_actions_keyed("menu.enabled"))
+            __atomic_store_n(&s_arm_miss, 1, __ATOMIC_RELEASE);
+        enhance_actions_keyed("fly.free");
+    }
+    return NULL;
+}
+
+static void test_live_arm(void)
+{
+    static const struct xbox_mod *const mods[] = { &k_fly, &k_probe, NULL };
+    pthread_t k, p;
+
+    start_with(ARMED, &k_fake, mods);
+    __atomic_store_n(&s_stop, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_arm_miss, 0, __ATOMIC_RELEASE);
+    pthread_create(&k, NULL, keyed_thread, NULL);
+    pthread_create(&p, NULL, poll_thread, NULL);
+    for (int i = 0; i < 200; i++)
+        xbox_mod_setting_set(0, 0, (double)((i + 1) & 1));   /* ends off */
+    __atomic_store_n(&s_stop, 1, __ATOMIC_RELEASE);
+    pthread_join(k, NULL);
+    pthread_join(p, NULL);
+    CHECK(!__atomic_load_n(&s_arm_miss, __ATOMIC_ACQUIRE));
+    CHECK(enhance_actions_keyed("menu.enabled") && !enhance_actions_keyed("fly.free"));
+    CHECK(enhance_actions_armed());
+}
+#endif
+
 int main(void)
 {
     MKDIR("config");
@@ -1977,6 +2122,10 @@ int main(void)
     test_longest_ports();
     test_tick_rules();
     test_quiet();
+    test_dormant();
+#ifndef _WIN32
+    test_live_arm();
+#endif
     xbox_mod_shutdown();
     enhance_actions_reset();
     remove("config/config.toml");

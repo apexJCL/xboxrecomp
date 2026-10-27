@@ -45,13 +45,18 @@ enum enhance_item_kind {
 };
 
 /* When a change takes effect (design R1): the menu shows a dot for LIVE
- * and FLUSH, "next stage" for STAGE and "applies at restart" for RESTART,
- * and the footer names the selected row's class. */
+ * and FLUSH, "next stage" for STAGE, "next activation" for ACTIVATE and
+ * "applies at restart" for RESTART, and the footer names the selected
+ * row's class. */
 enum enhance_item_live {
     ENHANCE_LIVE = 0,       /* L: at the next flip */
     ENHANCE_LIVE_FLUSH,     /* F: at the flip, rebuilding a cache or a target */
     ENHANCE_LIVE_STAGE,     /* S: at a later game point */
-    ENHANCE_LIVE_RESTART    /* R: at the next start; a set() only records it */
+    ENHANCE_LIVE_RESTART,   /* R: at the next start; a set() only records it */
+    /* A: when the mod next turns its feature on (the free camera reads its
+     * HUD choice as flight starts); a mod setting's class (mod-settings D2).
+     * Last, so the earlier values keep their numbers. */
+    ENHANCE_LIVE_ACTIVATE
 };
 
 #define ENHANCE_ITEM_NUMERIC 0x1u   /* CHOICE values are numbers: saved bare */

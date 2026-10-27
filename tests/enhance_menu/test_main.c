@@ -328,10 +328,10 @@ static int tm_init(const struct xbox_mod_api *api)
     api->menu_add(&k_tm_level);
     return api->on_enable(tm_enable, NULL) ? 0 : -1;
 }
-static const struct xbox_mod k_tm = { "testmod", tm_init, NULL };
+static const struct xbox_mod k_tm = { "testmod", tm_init, NULL, NULL };
 
 static int pm_init(const struct xbox_mod_api *api) { (void)api; return 0; }
-static const struct xbox_mod k_pm = { "plainmod", pm_init, NULL };
+static const struct xbox_mod k_pm = { "plainmod", pm_init, NULL, NULL };
 
 static const struct xbox_mod *const k_mods[] = { &k_tm, &k_pm, NULL };
 
@@ -512,6 +512,89 @@ static void test_mods(void)
     tap(0x0D);
     CHECK(xbox_mod_state(1) == XBOX_MOD_RESTART);
     CHECK(strstr(enhance_menu_status(), "applies at restart") != NULL);
+    open_menu();
+}
+
+/* A descriptor mod's toggle is its enable setting (mod-settings D4): Save
+ * writes that key with the choice text, never mods."<id>", and turning it
+ * on drops a stale mods."<id>" = false that would hold it off again. */
+static const char *const k_dm_offon[] = { "off", "on", NULL };
+static const struct xbox_mod_setting k_dm_set[] = {
+    { "enabled", "dmod.enabled", NULL, NULL, "Descriptor mod", NULL, NULL,
+      XBOX_SET_ENUM, ENHANCE_LIVE, XBOX_SET_ENABLE, 0, 0, 0, 0, k_dm_offon },
+};
+static const struct xbox_mod_desc k_dm_desc = {
+    XBOX_MOD_DESC_VERSION, sizeof(struct xbox_mod_desc),
+    "Descriptor mod", NULL, NULL, NULL, k_dm_set, 1, NULL, 0
+};
+static void dm_enable(int on, void *u) { (void)u; (void)on; }
+static int dm_init(const struct xbox_mod_api *api)
+{
+    return api->on_enable(dm_enable, NULL) ? 0 : -1;
+}
+static const struct xbox_mod k_dm = { "dmod", dm_init, NULL, &k_dm_desc };
+static const struct xbox_mod *const k_dmods[] = { &k_dm, NULL };
+
+static int pending_has(const char *key, const char *val)
+{
+    const char *keys[16], *vals[16];
+    int n = enhance_menu_pending(keys, vals, 16);
+    for (int i = 0; i < n; i++)
+        if (!strcmp(keys[i], key))
+            return val ? vals[i] && !strcmp(vals[i], val) : vals[i] == NULL;
+    return 0;
+}
+
+static int pending_any(const char *key)
+{
+    const char *keys[16], *vals[16];
+    int n = enhance_menu_pending(keys, vals, 16);
+    for (int i = 0; i < n; i++)
+        if (!strcmp(keys[i], key))
+            return 1;
+    return 0;
+}
+
+static void test_mods_desc_toggle(void)
+{
+    const char *f;
+    start_with(ARMED, k_dmods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Mods"));
+    CHECK(row_value("dmod") && !strcmp(row_value("dmod"), "false"));
+    CHECK(enhance_menu_select_row("dmod"));
+    tap(0x27);
+    xbox_mod_frame();
+    CHECK(xbox_mod_enabled(0));
+    CHECK(pending_has("dmod.enabled", "\"on\""));
+    CHECK(!pending_any("mods.dmod"));
+    tap(VK_F5);
+    f = read_file("config/config.toml");
+    CHECK(strstr(f, "[dmod]\nenabled = \"on\"") != NULL);
+    CHECK(strstr(f, "dmod = ") == NULL);
+    open_menu();
+
+    /* Back off is the stock: the key goes, not a mods.dmod = false. */
+    start_with(ARMED "[dmod]\nenabled = \"on\"\n", k_dmods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Mods"));
+    CHECK(!strcmp(row_value("dmod"), "true"));
+    CHECK(enhance_menu_select_row("dmod"));
+    tap(0x25);
+    xbox_mod_frame();
+    CHECK(pending_has("dmod.enabled", NULL));
+    CHECK(!pending_any("mods.dmod"));
+    open_menu();
+
+    /* A stale switch off in the file goes when the toggle turns on. */
+    start_with(ARMED "[mods]\ndmod = false\n", k_dmods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Mods"));
+    CHECK(enhance_menu_select_row("dmod"));
+    tap(0x27);
+    xbox_mod_frame();
+    CHECK(pending_has("dmod.enabled", "\"on\""));
+    CHECK(pending_has("mods.dmod", NULL));
     open_menu();
 }
 
@@ -858,6 +941,56 @@ static void test_save_deep(void)
     rmdir("deep");
 }
 
+/* A Save that leaves keys out for [table]s in a config under a long path
+ * (a macOS ~/Library/Application Support/... one) names every key in the
+ * log, and the status line gives the count. */
+#define LONGROOT "lr_Library_Application_Support_with_a_long_user_name_and_a_game_folder" \
+                 "_name_that_runs_on_well_past_what_the_old_buffer_held_xx"
+static void test_save_tables(void)
+{
+    const char *f, *log;
+    MKDIR(LONGROOT);
+    MKDIR(LONGROOT "/config");
+    write_file(LONGROOT "/config/config.toml",
+               ARMED "[mods.testmod]\nx = 1\n[mods.plainmod]\ny = 1\n");
+    xbox_mod_shutdown();
+    enhance_menu_reset_for_test();
+    nv2a_overlay_reset_for_test();
+    xbox_InputSetBackend(&k_fake);
+    xbox_InputKeysClear();
+    pad_clear();
+    xbox_mod_register_table(k_mods);
+    capture_begin();
+    xbox_enhance_init(LONGROOT, NULL);
+    capture_end();
+    nv2a_overlay_set_placement(0, 0, 1920, 1080);
+    poll0();
+    open_menu();
+    CHECK(enhance_menu_set_page("Mods"));
+    CHECK(enhance_menu_select_row("testmod"));
+    tap(0x25);
+    CHECK(enhance_menu_select_row("plainmod"));
+    tap(0x0D);
+    CHECK(enhance_menu_set_page("Render"));
+    CHECK(enhance_menu_select_row("Scaling filter"));
+    tap(0x27);
+    capture_begin();
+    tap(VK_F5);
+    log = capture_end();
+    CHECK(strstr(enhance_menu_status(), "Saved; 2 keys left out") != NULL);
+    CHECK(strstr(log, "2 keys left out") != NULL);
+    CHECK(strstr(log, "mods.testmod is the table [mods.testmod]") != NULL);
+    CHECK(strstr(log, "; mods.plainmod is the table [mods.plainmod]; write its keys flat"
+                      " under [mods] (left as it is)\n") != NULL);
+    f = read_file(LONGROOT "/config/config.toml");
+    CHECK(strstr(f, "filter = \"linear\"") != NULL);
+    CHECK(strstr(f, "testmod = ") == NULL && strstr(f, "plainmod = ") == NULL);
+    open_menu();
+    remove(LONGROOT "/config/config.toml");
+    rmdir(LONGROOT "/config");
+    rmdir(LONGROOT);
+}
+
 int main(int argc, char **argv)
 {
     s_pin = argc > 1 && !strcmp(argv[1], "--pin");
@@ -869,6 +1002,7 @@ int main(int argc, char **argv)
     test_start();
     test_navigate();
     test_mods();
+    test_mods_desc_toggle();
     test_capture_and_save();
     test_capture_duplicate();
     test_capture_owned();
@@ -876,6 +1010,7 @@ int main(int argc, char **argv)
     test_snapshot();
     test_pages();
     test_save_deep();   /* after the pins: its Save moves the Debug page's options gen */
+    test_save_tables();
     xbox_mod_shutdown();
     enhance_menu_reset_for_test();
     enhance_actions_reset();
