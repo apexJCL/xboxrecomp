@@ -386,6 +386,14 @@ static int sh_trace(void)
     return s_sh_trace;
 }
 
+/* Each render encoder made, so a binding remembered against one is never
+ * taken for another's (an address can come back after a release). */
+static uint64_t s_enc_serial;
+/* What vertex buffer 1 of the encoder s_vc1.enc holds: c[] at generation
+ * s_vc1.gen while ok. */
+static struct { uint64_t enc; uint32_t gen; int ok; } s_vc1;
+static uint64_t s_c_uploads;   /* c[] writes to buffer 1; "consts" in the flip trace */
+
 static void end_encoder(void)
 {
     if (s_enc) {
@@ -476,6 +484,7 @@ static void begin_pass(RenderTarget *rt, int clear, const double c[4],
     }
     rp.visibilityResultBuffer = s_vis;
     s_enc = [[s_cmd renderCommandEncoderWithDescriptor:rp] retain];
+    s_enc_serial++;
     s_enc_rt = rt;
     s_enc_dt = dt;
     occ_pass_begin();
@@ -1318,13 +1327,40 @@ static int no_mips(void)
     return off;
 }
 
+/* Per-batch CPU memos (RECOMP_DEBUG=metal_memo=0 turns them off for A/B),
+ * as D3D11's d3d11_memo: each one gives what the full path would. */
+static int memo_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = recomp_env(RENV_METAL_MEMO);
+        on = !(e && *e == '0');
+    }
+    return on;
+}
+
 static void build_stages(void)
 {
+    extern uint32_t xbox_ContiguousAllocatedBytes(void);
     const uint32_t *regs = nv2a_pb_tex_regs();
     const uint8_t  *sets = nv2a_pb_tex_regs_set();
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
+    /* The stages are a function of the texture registers, the shader
+     * program and the DMA resolve, whose answer moves only with the
+     * contiguous arena's high-water mark: unchanged, the last decode
+     * stands (D3D11's build_stages). */
+    static struct { uint32_t gen, prog, contig; int set, ok; } memo;
+    uint32_t gen = nv2a_pb_tex_regs_gen(), contig = xbox_ContiguousAllocatedBytes();
     int n;
 
+    if (memo_on() && memo.ok && memo.gen == gen && memo.prog == v->shader_prog
+        && memo.set == v->shader_set && memo.contig == contig)
+        return;
+    memo.gen = gen;
+    memo.prog = v->shader_prog;
+    memo.set = v->shader_set;
+    memo.contig = contig;
+    memo.ok = 1;
     for (n = 0; n < 4; n++) {
         Stage *t = &s_stage[n];
         nv2a_stage_decode(n, &regs[(0x40u * n) / 4], &sets[(0x40u * n) / 4],
@@ -2462,11 +2498,23 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         }
         [s_enc setVertexBuffer:s_vb offset:vb_off atIndex:0];
         if (d->program) {
-            /* c[192] is 3 KB: under setVertexBytes' 4 KB. */
-            [s_enc setVertexBytes:v->c length:sizeof v->c atIndex:1];
+            /* c[192] is 3 KB: under setVertexBytes' 4 KB. An encoder keeps
+             * its bindings from draw to draw, so while it is the same
+             * encoder, buffer 1 still holds c[] and the generation says
+             * nothing wrote c[] since (nv2a_pb_vsh_consts_gen), the 3 KB
+             * copy is skipped: most batches of a busy frame. */
+            uint32_t cg = nv2a_pb_vsh_consts_gen();
+            if (!memo_on() || !s_vc1.ok || s_vc1.enc != s_enc_serial || s_vc1.gen != cg) {
+                [s_enc setVertexBytes:v->c length:sizeof v->c atIndex:1];
+                s_vc1.enc = s_enc_serial;
+                s_vc1.gen = cg;
+                s_vc1.ok = 1;
+                s_c_uploads++;
+            }
             [s_enc setVertexBytes:&vc length:sizeof vc atIndex:2];
         } else {
             [s_enc setVertexBytes:&vc length:sizeof vc atIndex:1];
+            s_vc1.ok = 0;              /* buffer 1 is vc now, not c[] */
         }
         [s_enc setFragmentBytes:&mpc length:sizeof mpc atIndex:0];
         for (k = 0; k < 4; k++) {
@@ -3207,7 +3255,7 @@ static void flip_log(uint32_t surface_offset, RenderTarget *rt)
     static int on = -1;
     static uint64_t p_draws, p_prog, p_skip, p_cull, p_clears, p_tex, p_up,
                     p_chg, p_re, p_fl, p_occ, p_vis, p_late, p_super, p_sync, p_ovf,
-                    p_set, p_stale, p_first;
+                    p_set, p_stale, p_first, p_cup;
     static int zt = -1;
     if (sh_trace() && (s_sh_flip.lib || s_sh_flip.pso || s_sh_flip.tex_ns >= 5000000))
         fprintf(stderr, LOGP "build flip %llu: %u libraries %.1f ms, %u pipelines %.1f ms,"
@@ -3234,7 +3282,7 @@ static void flip_log(uint32_t surface_offset, RenderTarget *rt)
         return;
     fprintf(stderr, "[METAL] flip %llu batches %llu prog %llu skipped %llu"
             " culled %llu clears %llu tex %llu uploads %llu changed %llu rehash %llu"
-            " flushes %llu occ %llu (visible %llu, pending %d, late %llu, superseded %llu,"
+            " flushes %llu consts %llu occ %llu (visible %llu, pending %d, late %llu, superseded %llu,"
             " settled %llu (stale %llu, first %llu), sync %llu us, slot overflow %llu)"
             " present 0x%08X walker 0x%08X\n",
             (unsigned long long)s_presents,
@@ -3248,6 +3296,7 @@ static void flip_log(uint32_t surface_offset, RenderTarget *rt)
             (unsigned long long)(s_tex_changed - p_chg),
             (unsigned long long)(s_tex_rehash - p_re),
             (unsigned long long)(s_flushes - p_fl),
+            (unsigned long long)(s_c_uploads - p_cup),
             (unsigned long long)(s_occ.reports - p_occ),
             (unsigned long long)(s_occ.vis - p_vis), s_occ.npend,
             (unsigned long long)(s_occ.late - p_late),
@@ -3264,7 +3313,7 @@ static void flip_log(uint32_t surface_offset, RenderTarget *rt)
     p_draws = s_draws; p_prog = s_draws_prog; p_skip = s_draws_skipped;
     p_cull = s_draws_culled; p_clears = s_clears; p_tex = s_draws_tex;
     p_up = s_tex_uploads; p_chg = s_tex_changed; p_re = s_tex_rehash;
-    p_fl = s_flushes;
+    p_fl = s_flushes; p_cup = s_c_uploads;
     if (rt && rt->pad && aspect_trace()) {
         static uint64_t p_stretch;
         fprintf(stderr, LOGP "flip %llu hor+: target %ux%u pad %u (%ux%u host),"

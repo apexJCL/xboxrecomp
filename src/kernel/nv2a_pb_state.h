@@ -256,6 +256,10 @@ const struct nv2a_pb_vsh *nv2a_pb_vsh_state(void);
 uint32_t nv2a_pb_vsh_consts_gen(void);
 const uint32_t *nv2a_pb_tex_regs(void);       /* NV_TEX_REGS words */
 const uint8_t  *nv2a_pb_tex_regs_set(void);   /* 1 where the title wrote one */
+/* Bumped whenever a texture register or its set flag changes value, so a
+ * backend can keep the stages it decoded from them (as with
+ * nv2a_pb_vsh_consts_gen, equal means no change in between). */
+uint32_t nv2a_pb_tex_regs_gen(void);
 
 /* A DMA-object offset (surface, zeta, semaphore) as a guest address. Vertex
  * array and texture offsets in the state above are already resolved. */

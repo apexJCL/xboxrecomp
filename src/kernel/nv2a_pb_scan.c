@@ -351,10 +351,13 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
         words++;
 
         if (s_left) {                         /* a parameter */
-            note(s_subch, s_method);
             /* Same walk, two consumers: the survey counts, the executor
              * acts. Keeping them on one decode means they can never
-             * disagree about what the stream said. */
+             * disagree about what the stream said. Only the survey reads
+             * the counts (nv2a_pb_scan_report), and under Wine the count
+             * costs ~1 ms of a 10k-batch frame, so it runs only then. */
+            if (s_scan_enabled)
+                note(s_subch, s_method);
             if (s_exec_enabled)
                 nv2a_pb_exec_method(s_subch, s_method, w);
             if (!s_noninc)

@@ -583,11 +583,18 @@ static int s_unhandled_count;
  * actually programs is what decides which ones are worth implementing. */
 static uint32_t s_tex_reg[NV_TEX_REGS];
 static uint8_t  s_tex_set[NV_TEX_REGS];
+static uint32_t s_tex_gen;    /* nv2a_pb_tex_regs_gen: every change of the two */
 
 static void record_tex_reg(uint32_t method, uint32_t param)
 {
-    s_tex_reg[(method - NV_TEX_FIRST) / 4] = param;
-    s_tex_set[(method - NV_TEX_FIRST) / 4] = 1;
+    uint32_t k = (method - NV_TEX_FIRST) / 4;
+    /* A title rewrites most of a stage's registers with the same values
+     * every batch, so only a change moves the generation. */
+    if (s_tex_reg[k] != param || !s_tex_set[k]) {
+        s_tex_reg[k] = param;
+        s_tex_set[k] = 1;
+        s_tex_gen++;
+    }
     /* Resolved on write, not at sample time, as SET_TEXTURE_OFFSET is. */
     if (method == 0x1B20u)              /* stage 0 SET_TEXTURE_PALETTE */
         nv2a_tex_palette_decode(param, dma_resolve, &s_gpu.tex.palette,
@@ -2659,7 +2666,13 @@ static int vsh_enabled(void)
     return on;
 }
 
-/* The transform-unit methods. Returns 1 if `method` was one of them. */
+/* Methods vsh_method has turned down, one bit per method (method >> 2):
+ * nv2a_pb_exec_method skips it for them. vsh_method's answer depends only
+ * on the method, never on the parameter or state, so a miss stays a miss. */
+static uint32_t s_not_vsh[0x2000 / 4 / 32];
+
+/* The transform-unit methods. Returns 1 if `method` was one of them. Its
+ * answer must depend on `method` alone (s_not_vsh). */
 static int vsh_method(uint32_t method, uint32_t param)
 {
     if (!s_vsh.ff_ready) {
@@ -6089,6 +6102,7 @@ const struct nv2a_pb_vsh *nv2a_pb_vsh_state(void) { return &s_vsh; }
 uint32_t nv2a_pb_vsh_consts_gen(void)             { return s_vsh_cgen; }
 const uint32_t *nv2a_pb_tex_regs(void)            { return s_tex_reg; }
 const uint8_t  *nv2a_pb_tex_regs_set(void)        { return s_tex_set; }
+uint32_t nv2a_pb_tex_regs_gen(void)               { return s_tex_gen; }
 uint32_t nv2a_pb_dma_resolve(uint32_t offset)     { return dma_resolve(offset); }
 const struct nv2a_pb_present *nv2a_pb_present_state(void) { return &s_present; }
 
@@ -6438,7 +6452,8 @@ static void draw_primitive(void)
     vsh_note_gpu();
     fb_prog_draw();
     if (s_backend->on_draw) {
-        uint64_t t0 = perf_draw_on() ? rt_now() : 0;
+        int timed = perf_draw_on();
+        uint64_t t0 = timed ? rt_now() : 0;
         struct nv2a_pb_draw d;
         d.prim         = s_gpu.prim;
         d.attr         = s_gpu.attr;
@@ -6460,7 +6475,7 @@ static void draw_primitive(void)
             cpu_px_report(before, zb);
         } else
             s_backend->on_draw(&d);
-        if (t0)
+        if (timed)
             s_perf.draw += rt_now() - t0;
         /* The CPU rasteriser already counts its batches into s_gpu.batches_*,
          * so counting it here too would double the [PACING] figure. */
@@ -6857,8 +6872,22 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         note_unhandled(method, param);
         return;
     }
-    if (vsh_method(method, param))
+    /* vsh_method's answer depends on the method alone, and a method it does
+     * not take (the draws, indices, vertex arrays, textures) walks its whole
+     * chain of ranges first: ~40 compares, a good part of the decode cost
+     * under Wine at ~100k methods a frame. Each such method is remembered
+     * on its first miss and goes straight to the switch after that. */
+    if (method < 0x2000) {
+        uint32_t bit = 1u << ((method >> 2) & 31);
+        uint32_t *w = &s_not_vsh[method >> 7];
+        if (!(*w & bit)) {
+            if (vsh_method(method, param))
+                return;
+            *w |= bit;
+        }
+    } else if (vsh_method(method, param)) {
         return;
+    }
     switch (method) {
     case NV097_SET_SURFACE_CLIP_HORIZONTAL:
         s_gpu.clip_x = param & 0xFFFF;

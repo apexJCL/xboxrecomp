@@ -269,6 +269,7 @@ static RenderTarget *s_cur;     /* the target of the batch being drawn */
 static uint64_t      s_tick;
 static uint64_t      s_seq;              /* draw/clear order */
 static uint64_t      s_rtt_binds;        /* textures served from a render target */
+static uint64_t      s_loop_hits;        /* setup_pixel stage loops served by its memo */
 
 /* ---- shaders --------------------------------------------------------------- */
 
@@ -790,8 +791,14 @@ static int init(void)
 
 /* ---- surfaces ------------------------------------------------------------- */
 
+/* Moves whenever the render-target set could answer a texture lookup
+ * (rt_texture) differently: a target made, grown, released or given another
+ * format. setup_pixel's stage memo keys on it. */
+static uint32_t s_rt_gen;
+
 static void rt_release(RenderTarget *rt)
 {
+    s_rt_gen++;
     if (s_drawn == rt)
         s_drawn = NULL;
     if (rt->srv)
@@ -899,6 +906,7 @@ static int rt_grow(RenderTarget *rt, UINT w, UINT h)
     ID3D11Texture2D_Release(rt->tex);
     rt->tex = tex;
     rt->rtv = rtv;
+    s_rt_gen++;
     rt->w = w;
     rt->h = h;
     rt->hw = hw;
@@ -931,6 +939,8 @@ static RenderTarget *surface(void)
             if (rt_drop_if_stale(rt, "reuse"))
                 break;
             rt->last_use = s_tick;
+            if (rt->fmt != g->format)
+                s_rt_gen++;
             rt->fmt = g->format;
             nv2a_rt_own_drawn(&rt->own, (uint32_t)s_presents);
             return rt;
@@ -957,6 +967,8 @@ static RenderTarget *surface(void)
         if ((rt->w >= w && rt->h >= h)
                 || rt_grow(rt, rt->w > w ? rt->w : w, rt->h > h ? rt->h : h)) {
             rt->last_use = s_tick;
+            if (rt->fmt != g->format)
+                s_rt_gen++;
             rt->fmt = g->format;
             nv2a_rt_own_drawn(&rt->own, (uint32_t)s_presents);
             return rt;
@@ -1017,6 +1029,7 @@ static RenderTarget *surface(void)
             return NULL;
         }
     }
+    s_rt_gen++;
     free_rt->offset = g->color_offset;
     free_rt->addr = nv2a_pb_dma_resolve(g->color_offset);
     free_rt->w = w;
@@ -1750,13 +1763,32 @@ static int no_mips(void)
     return off;
 }
 
+/* Moves each time build_stages decodes s_stage again. */
+static uint32_t s_stage_gen;
+
 static void build_stages(void)
 {
+    extern uint32_t xbox_ContiguousAllocatedBytes(void);
     const uint32_t *regs = nv2a_pb_tex_regs();
     const uint8_t  *sets = nv2a_pb_tex_regs_set();
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
+    /* The stages are a function of the texture registers, the shader
+     * program and the DMA resolve, whose answer moves only with the
+     * contiguous arena's high-water mark. Unchanged, the last decode
+     * stands: ~1.3 ms a flip on the Deck at 10k batches. */
+    static struct { uint32_t gen, prog, contig; int set, ok; } memo;
+    uint32_t gen = nv2a_pb_tex_regs_gen(), contig = xbox_ContiguousAllocatedBytes();
     int n;
 
+    if (memo_on() && memo.ok && memo.gen == gen && memo.prog == v->shader_prog
+        && memo.set == v->shader_set && memo.contig == contig)
+        return;
+    memo.gen = gen;
+    memo.prog = v->shader_prog;
+    memo.set = v->shader_set;
+    memo.contig = contig;
+    memo.ok = 1;
+    s_stage_gen++;
     for (n = 0; n < 4; n++) {
         Stage *t = &s_stage[n];
         int mode;
@@ -1867,8 +1899,15 @@ static int tex_alloc(TexEntry *e, uint32_t width, uint32_t height, uint32_t leve
  * pack's texels at the pack's size instead of the guest's. If the device
  * refuses a texture of the entry's size, the guest texels go up instead:
  * the pack only ever adds detail, never a black texture. */
+/* Moves whenever a cache entry's view may change (an upload or a free), so
+ * a view remembered from tex_bind is never one since released. */
+static uint32_t s_tc_gen;
+/* The entry tex_bind's last view came from (NULL for magenta or black). */
+static TexEntry *s_tex_last;
+
 static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
 {
+    s_tc_gen++;
     const uint32_t *src = NULL;
     const uint8_t *p;
     uint32_t width = t->width, height = t->height, levels = t->levels;
@@ -1918,6 +1957,7 @@ static int tex_upload(TexEntry *e, const Stage *t, uint64_t hash)
 
 static void tex_free(TexEntry *e)
 {
+    s_tc_gen++;
     if (e->srv) ID3D11ShaderResourceView_Release(e->srv);
     if (e->tex) ID3D11Texture2D_Release(e->tex);
     memset(e, 0, sizeof *e);
@@ -1942,6 +1982,8 @@ static ID3D11ShaderResourceView *tex_bind(const Stage *t)
     uint32_t bytes = tex_extent(t), i;
     TexEntry *e = NULL, *victim = &s_tc[0];
     uint32_t slot;
+
+    s_tex_last = NULL;
 
     if (!bytes) {
         /* A format with no decoder is magenta, and said once, loudly: white
@@ -2018,6 +2060,7 @@ static ID3D11ShaderResourceView *tex_bind(const Stage *t)
     }
     e->used = ++s_tc_clock;
     s_tc_hint[slot] = (uint16_t)(e - s_tc + 1);
+    s_tex_last = e;
     return e->srv;
 }
 
@@ -2497,9 +2540,42 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
             nv2a_bump_trace(v, s_stage, nv2a_pb_gpu_state()->flips);
     }
     nv2a_ps_consts_fill(v, s_stage, &pc);
-    for (n = 0; n < 4; n++) {
+    /* The stage loop's views, while nothing they come from has moved: the
+     * same decoded stages (s_stage_gen) in the same flip (tex_bind checks
+     * the texels once a flip), no texture uploaded or freed and no render
+     * target made, grown, dropped or reformatted since. Only a batch whose
+     * stages all came from the texture cache is remembered: a render
+     * target's view (and the self copy, made per draw) goes through
+     * rt_texture every time. Most batches of a busy frame repeat the last
+     * one's textures; the loop was ~2.4 ms a flip at 10k batches on the
+     * Deck. */
+    static struct {
+        uint32_t stage_gen, rt_gen, tc_gen, pack_gen;
+        uint64_t flip;
+        int ok, textured;
+        ID3D11ShaderResourceView *srv[4];
+        TexEntry *e[4];
+        const char *src[4];
+    } lm;
+    int lhit = memo_on() && lm.ok && lm.stage_gen == s_stage_gen && lm.rt_gen == s_rt_gen
+              && lm.tc_gen == s_tc_gen && lm.pack_gen == nv2a_tex_pack_gen()
+              && lm.flip == nv2a_pb_gpu_state()->flips;
+    if (lhit) {
+        for (n = 0; n < 4; n++) {
+            srv[n] = lm.srv[n];
+            s_stage_rt[n] = NULL;
+            s_stage_src[n] = lm.src[n];
+            if (lm.e[n])
+                lm.e[n]->used = ++s_tc_clock;   /* the LRU sees the use */
+            smp[n] = sampler(&s_stage[n], bump_src >> n & 1);
+        }
+        textured = lm.textured;
+        s_loop_hits++;
+    }
+    for (n = 0; !lhit && n < 4; n++) {
         const Stage *t = &s_stage[n];
         RenderTarget *src = (t->mode && t->mode != 4) ? rt_texture(t) : NULL;
+        lm.e[n] = NULL;
         s_stage_rt[n] = src;
         s_stage_src[n] = !t->mode ? "none" : t->mode == 4 ? "passthru" : "cache";
         if (src) {
@@ -2513,6 +2589,7 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
             textured = 1;
         } else if (t->mode && t->mode != 4) {
             srv[n] = tex_bind(t);
+            lm.e[n] = s_tex_last;
             if (srv[n] == s_magenta_srv) s_stage_src[n] = "MAGENTA(undecoded)";
             else if (srv[n] == s_black_srv) s_stage_src[n] = "BLACK(too large/failed)";
             textured = 1;
@@ -2520,6 +2597,25 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
             srv[n] = s_black_srv;
         }
         smp[n] = sampler(t, bump_src >> n & 1);
+    }
+    if (!lhit) {
+        /* Taken after the loop: tex_bind's own uploads moved the counters. */
+        lm.ok = !s_stage_rt[0] && !s_stage_rt[1] && !s_stage_rt[2] && !s_stage_rt[3];
+        /* Nor one that got a fallback view: tex_bind gives black for a
+         * failed re-upload only once, then the entry's old view for the
+         * rest of the flip, which a remembered black would hide. */
+        for (n = 0; n < 4; n++)
+            if (s_stage[n].mode && s_stage[n].mode != 4
+                && (srv[n] == s_black_srv || srv[n] == s_magenta_srv))
+                lm.ok = 0;
+        lm.stage_gen = s_stage_gen;
+        lm.rt_gen = s_rt_gen;
+        lm.tc_gen = s_tc_gen;
+        lm.pack_gen = nv2a_tex_pack_gen();
+        lm.flip = nv2a_pb_gpu_state()->flips;
+        lm.textured = textured;
+        memcpy(lm.srv, srv, sizeof srv);
+        memcpy(lm.src, s_stage_src, sizeof lm.src);
     }
     hp->place = NV2A_PLACE_CENTRE;
     if (s_cur && s_cur->pad) {
@@ -3888,7 +3984,7 @@ static void flip_log(uint32_t surface_offset)
     static uint64_t p_draws, p_prog, p_tex, p_rtt, p_clears, p_up, p_chg,
                     p_re, p_vn, p_ve, p_skip, p_cull, p_self, p_mip,
                     p_occ, p_occ_vis, p_occ_us, p_occ_late, p_occ_super,
-                    p_occ_set, p_occ_stale, p_occ_first;
+                    p_occ_set, p_occ_stale, p_occ_first, p_loop;
     static int zt = -1;
     /* With a pack, its hit count every 600 flips, flip trace or not. */
     if (nv2a_tex_pack_count() && s_presents % 600 == 0) {
@@ -3909,7 +4005,7 @@ static void flip_log(uint32_t surface_offset)
         return;
     fprintf(stderr, "[D3D11] flip %llu batches %llu prog %llu tex %llu rtt %llu (self %llu)"
             " skipped %llu culled %llu clears %llu uploads %llu (mip %llu) changed %llu rehash %llu"
-            " vb %llu/%llu bytes occ %llu (visible %llu, pending %d, late %llu, superseded %llu,"
+            " memo %llu vb %llu/%llu bytes occ %llu (visible %llu, pending %d, late %llu, superseded %llu,"
             " settled %llu (stale %llu, first %llu), sync %llu us)"
             " present 0x%08X walker 0x%08X\n",
             (unsigned long long)s_presents,
@@ -3925,6 +4021,7 @@ static void flip_log(uint32_t surface_offset)
             (unsigned long long)(s_tex_mip_uploads - p_mip),
             (unsigned long long)(s_tex_changed - p_chg),
             (unsigned long long)(s_tex_rehash - p_re),
+            (unsigned long long)(s_loop_hits - p_loop),
             (unsigned long long)(s_vb_native - p_vn),
             (unsigned long long)(s_vb_expanded - p_ve),
             (unsigned long long)(s_occ.reports - p_occ),
@@ -3946,7 +4043,7 @@ static void flip_log(uint32_t surface_offset)
     }
     p_draws = s_draws; p_prog = s_draws_prog; p_tex = s_draws_tex;
     p_rtt = s_rtt_binds; p_skip = s_draws_skipped; p_cull = s_draws_culled; p_clears = s_clears;
-    p_up = s_tex_uploads; p_chg = s_tex_changed; p_re = s_tex_rehash;
+    p_up = s_tex_uploads; p_chg = s_tex_changed; p_re = s_tex_rehash; p_loop = s_loop_hits;
     p_vn = s_vb_native; p_ve = s_vb_expanded; p_self = s_self_copies;
     p_mip = s_tex_mip_uploads;
     p_occ = s_occ.reports; p_occ_vis = s_occ.vis; p_occ_us = s_occ.sync_us;
