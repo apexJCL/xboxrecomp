@@ -135,11 +135,15 @@ static int memo_on(void)
 
 /* The pipeline state last bound, so a batch binding the same again skips
  * the call. Only state this file alone sets and nothing unbinds behind it;
- * SRVs (which the runtime nulls on a render-target hazard), the vertex and
- * index buffers (new offsets every batch) and the output merger's targets
- * and depth state are always set. Releasing a shader or input layout bumps
- * s_state_gen, since a new object can come back at a released one's
- * address. All 0xFF is "nothing known". */
+ * SRVs (which the runtime nulls on a render-target hazard) and the vertex
+ * and index buffers (new offsets every batch) are always set. Releasing a
+ * shader or input layout bumps s_state_gen, since a new object can come
+ * back at a released one's address. The output merger's targets need no
+ * such bump: the context holds a reference to the views it has bound, so a
+ * bound view cannot be freed and its address reused. Rebinding the same
+ * targets would only unbind SRVs of them, and the runtime already nulls
+ * those when they are bound after the targets. All 0xFF is "nothing
+ * known". */
 static uint32_t s_state_gen;
 static struct {
     uint32_t                  gen;
@@ -154,6 +158,10 @@ static struct {
     ID3D11SamplerState       *smp[4];
     D3D11_VIEWPORT            vp;
     D3D11_RECT                sr;
+    ID3D11RenderTargetView   *rtv;
+    ID3D11DepthStencilView   *dsv;
+    ID3D11DepthStencilState  *dss;
+    UINT                      sref;     /* the stencil reference with dss */
 } s_sc;
 static int s_sc_init;
 
@@ -3581,10 +3589,19 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
     {
         static uint8_t consts_shadow[sizeof v->c];
         static int consts_ok;
+        static uint32_t consts_gen;
+        uint32_t gen = nv2a_pb_vsh_consts_gen();
         D3D11_MAPPED_SUBRESOURCE m;
-        if (!d->program
-                || (memo_on() && consts_ok && !memcmp(consts_shadow, v->c, sizeof v->c))) {
+        /* Most batches find c[] untouched since the last upload (BLiNX 2's
+         * 1-2 writes it before one batch in fifteen of its ~10k a frame),
+         * and the 3 KB compare that finds that out was ~2 ms a frame under
+         * Proton, whose memcmp goes 8 bytes at a time. No write since the
+         * upload: nothing to compare. */
+        if (!d->program || (memo_on() && consts_ok && consts_gen == gen)) {
             /* the buffer already holds these bytes */
+        } else if (memo_on() && consts_ok
+                   && !memcmp(consts_shadow, v->c, sizeof v->c)) {
+            consts_gen = gen;
         } else if (SUCCEEDED(ID3D11DeviceContext_Map(
                 s_ctx, (ID3D11Resource *)s_cb_consts, 0,
                 D3D11_MAP_WRITE_DISCARD, 0, &m))) {
@@ -3592,6 +3609,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_cb_consts, 0);
             memcpy(consts_shadow, v->c, sizeof v->c);
             consts_ok = 1;
+            consts_gen = gen;
         }
     }
 
@@ -3625,9 +3643,23 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
                 s_draws_z++;
             }
         }
-        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rt->rtv, dsv);
-        ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, dss,
-                                                   use_s ? v->stencil_ref & 0xFFu : 0);
+        {
+            /* BLiNX 2's 1-2 rebinds the same target and depth state for
+             * nearly all of its ~10k batches a frame: ~2 ms a frame of
+             * DXVK under Proton on the Deck. */
+            UINT sref = use_s ? v->stencil_ref & 0xFFu : 0;
+            int sc = sc_on();
+            if (!sc || s_sc.rtv != rt->rtv || s_sc.dsv != dsv) {
+                ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 1, &rt->rtv, dsv);
+                s_sc.rtv = rt->rtv;
+                s_sc.dsv = dsv;
+            }
+            if (!sc || s_sc.dss != dss || s_sc.sref != sref) {
+                ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, dss, sref);
+                s_sc.dss = dss;
+                s_sc.sref = sref;
+            }
+        }
         {
             ID3D11BlendState *bs = blend_state();
             ID3D11InputLayout *il = input_layout(vs, fmts);
@@ -3994,6 +4026,7 @@ static void swap_resize(UINT cw, UINT ch)
     HRESULT hr;
 
     ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 0, NULL, NULL);
+    s_sc_init = 0;                  /* behind the draw path's state shadow */
     if (s_back_rtv) {
         ID3D11RenderTargetView_Release(s_back_rtv);
         s_back_rtv = NULL;

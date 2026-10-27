@@ -2633,6 +2633,7 @@ static void raster_indexed(uint32_t i0, uint32_t i1, uint32_t i2, uint32_t argb)
 
 /* XfVert and the s_vsh layout: nv2a_pb_state.h. */
 static struct nv2a_pb_vsh s_vsh;
+static uint32_t s_vsh_cgen;   /* nv2a_pb_vsh_consts_gen: every write of s_vsh.c */
 
 /* Distinct programs, by hash of the slots from START to FINAL. */
 #define VSH_MAX_PROGS 256
@@ -2690,8 +2691,10 @@ static int vsh_method(uint32_t method, uint32_t param)
     if (method >= NV097_SET_TRANSFORM_CONSTANT_M
             && method < NV097_SET_TRANSFORM_CONSTANT_M + 0x80) {
         uint32_t comp = ((method - NV097_SET_TRANSFORM_CONSTANT_M) / 4) & 3;
-        if (s_vsh.cload < NV2A_VSH_CONSTANTS)
+        if (s_vsh.cload < NV2A_VSH_CONSTANTS) {
             s_vsh.c[s_vsh.cload][comp] = u2f(param);
+            s_vsh_cgen++;
+        }
         if (comp == 3)
             s_vsh.cload++;
         s_vsh.const_dwords++;
@@ -2706,6 +2709,7 @@ static int vsh_method(uint32_t method, uint32_t param)
         uint32_t k = (method - NV097_SET_VIEWPORT_OFFSET_M) / 4;
         s_vsh.vp_off[k] = u2f(param);
         s_vsh.c[XF_VPOFF][k] = u2f(param);
+        s_vsh_cgen++;
         s_vsh.vp_dwords++;
         return 1;
     }
@@ -2713,6 +2717,7 @@ static int vsh_method(uint32_t method, uint32_t param)
         uint32_t k = (method - NV097_SET_VIEWPORT_SCALE_M) / 4;
         s_vsh.vp_scale[k] = u2f(param);
         s_vsh.c[XF_VPSCL][k] = u2f(param);
+        s_vsh_cgen++;
         s_vsh.vp_dwords++;
         return 1;
     }
@@ -2734,6 +2739,7 @@ static int vsh_method(uint32_t method, uint32_t param)
                 uint32_t slot = (method - xf[i].base) / 4;
                 uint32_t row = xf[i].row + (slot / 16) * xf[i].stride + (slot % 16) / 4;
                 s_vsh.c[row][slot % 4] = u2f(param);
+                s_vsh_cgen++;
                 if (i < 4)
                     s_vsh.ff_matrix_dwords++;
                 if (i == 0)
@@ -2981,6 +2987,7 @@ static int ff_begin(void)
     memcpy(s_ff_save.c, &s_vsh.c[NV2A_FF_LC_BASE], sizeof s_ff_save.c);
     memcpy(s_vsh.prog, s_ff_cache[e].prog, (size_t)s_ff_save.n * sizeof s_vsh.prog[0]);
     nv2a_ff_consts(&s_vsh.ff, &s_vsh.c[NV2A_FF_LC_BASE]);
+    s_vsh_cgen++;
     s_vsh.start = 0;
     s_vsh.prog_dwords = 0x80000000u | s_ff_cache[e].serial;
     s_ff_active = 1;
@@ -2994,6 +3001,7 @@ static void ff_end(void)
         return;
     memcpy(s_vsh.prog, s_ff_save.prog, (size_t)s_ff_save.n * sizeof s_vsh.prog[0]);
     memcpy(&s_vsh.c[NV2A_FF_LC_BASE], s_ff_save.c, sizeof s_ff_save.c);
+    s_vsh_cgen++;
     s_vsh.start = s_ff_save.start;
     s_vsh.prog_dwords = s_ff_save.prog_dwords;
     s_ff_active = 0;
@@ -3099,6 +3107,8 @@ static void vsh_transform(uint32_t index, XfVert *xv)
     vsh_inputs(index, v);
     nv2a_vsh_run((const uint32_t (*)[4])s_vsh.prog, s_vsh.start, s_vsh.c,
                  s_vsh.cxt_write, (const float (*)[4])v, &o);
+    if (s_vsh.cxt_write)
+        s_vsh_cgen++;
     s_vsh.verts_run++;
     xv->x = nv2a_screen_snap(o.o[NV2A_VSH_O_POS][0]);
     xv->y = nv2a_screen_snap(o.o[NV2A_VSH_O_POS][1]);
@@ -3335,6 +3345,17 @@ static struct {
 } s_perf;
 
 uint64_t nv2a_pb_now_ns(void) { return rt_now(); }
+
+/* Whether the [PB-PERF] line is printed. The draw share needs two clock reads
+ * a batch, which under Proton (RtlGetSystemTimePrecise) were ~4% of the
+ * walker at 10k batches a frame, so they are only taken when it is. */
+static int perf_draw_on(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = recomp_env(RENV_FLIP_LOG) != NULL;
+    return on;
+}
 void nv2a_pb_perf_scan_begin(void) { s_perf.scan_t0 = rt_now(); }
 void nv2a_pb_perf_scan_end(void)
 {
@@ -5527,6 +5548,7 @@ static void raster_batch_fast_ab(void)
     if (zn) memcpy(s_zbuf, zsave, zn * sizeof(float));
     if (sn) memcpy(s_sbuf, ssave, sn);
     s_gpu = gpu0; s_vsh = vsh0; s_zpass_count = zpass0;
+    s_vsh_cgen++;
     s_fast_force = 1;
     raster_batch_vsh_one();
     s_fast_force = -1;
@@ -6064,6 +6086,7 @@ const struct nv2a_pb_backend *nv2a_pb_cpu_backend(void) { return &s_cpu_backend;
 
 const struct nv2a_pb_gpu *nv2a_pb_gpu_state(void) { return &s_gpu; }
 const struct nv2a_pb_vsh *nv2a_pb_vsh_state(void) { return &s_vsh; }
+uint32_t nv2a_pb_vsh_consts_gen(void)             { return s_vsh_cgen; }
 const uint32_t *nv2a_pb_tex_regs(void)            { return s_tex_reg; }
 const uint8_t  *nv2a_pb_tex_regs_set(void)        { return s_tex_set; }
 uint32_t nv2a_pb_dma_resolve(uint32_t offset)     { return dma_resolve(offset); }
@@ -6415,7 +6438,7 @@ static void draw_primitive(void)
     vsh_note_gpu();
     fb_prog_draw();
     if (s_backend->on_draw) {
-        uint64_t t0 = rt_now();
+        uint64_t t0 = perf_draw_on() ? rt_now() : 0;
         struct nv2a_pb_draw d;
         d.prim         = s_gpu.prim;
         d.attr         = s_gpu.attr;
@@ -6437,7 +6460,8 @@ static void draw_primitive(void)
             cpu_px_report(before, zb);
         } else
             s_backend->on_draw(&d);
-        s_perf.draw += rt_now() - t0;
+        if (t0)
+            s_perf.draw += rt_now() - t0;
         /* The CPU rasteriser already counts its batches into s_gpu.batches_*,
          * so counting it here too would double the [PACING] figure. */
         if (s_backend != &s_cpu_backend)

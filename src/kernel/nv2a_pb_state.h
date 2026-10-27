@@ -249,6 +249,11 @@ const struct nv2a_pb_gpu *nv2a_pb_gpu_state(void);
  * 0xFFFF truncated to 16 bits. For the backend smoke test. */
 void nv2a_pb_exec_idx_stats(uint32_t *max, uint32_t *overflowed, uint32_t *over_ffff);
 const struct nv2a_pb_vsh *nv2a_pb_vsh_state(void);
+/* Bumped whenever the executor writes nv2a_pb_vsh_state()->c, so a backend
+ * can tell that c[] is unchanged since it last uploaded it without comparing
+ * its 3 KB per batch. Equal values mean no write in between; a changed
+ * value says nothing about the bytes (a title rewrites the same matrices). */
+uint32_t nv2a_pb_vsh_consts_gen(void);
 const uint32_t *nv2a_pb_tex_regs(void);       /* NV_TEX_REGS words */
 const uint8_t  *nv2a_pb_tex_regs_set(void);   /* 1 where the title wrote one */
 
