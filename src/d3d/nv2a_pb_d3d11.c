@@ -4678,11 +4678,19 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
                 nv2a_pb_gpu_state()->blend_color);
 }
 
-/* render.scale changed at this flip: every target, depth buffer and texture
- * was made at the old factor. Targets are released, their pixels lost as on
- * any eviction here (the title redraws its post chain every frame);
- * textures because a render-to-texture input is sized by scale. After the
- * present, so the frame being shown keeps the targets it was drawn in. */
+/* render.scale changed at this flip: every target and depth buffer was made
+ * at the old factor. Targets are released, their pixels lost as on any
+ * eviction here (the title redraws its post chain every frame). After the
+ * present, so the frame being shown keeps the targets it was drawn in.
+ *
+ * The texture cache stays, as on Metal. Its entries are guest texels at
+ * guest size (or a pack's), which no scale changes; a render-to-texture
+ * input binds the target itself (rt_texture, s_self resized by its own
+ * check), never a cache entry; and tex_bind rehashes each entry once a flip,
+ * so one under a released target's memory reads what a fresh decode would.
+ * Dropping it made the next flip decode and upload every texture again:
+ * 151-712 ms on Jet Set Radio Future under Proton, the freeze seen at each
+ * change. */
 static void scale_drop(void)
 {
     int i;
@@ -4697,9 +4705,6 @@ static void scale_drop(void)
         ID3D11Texture2D_Release(d->tex);
         memset(d, 0, sizeof *d);
     }
-    for (i = 0; i < TEX_CACHE; i++)
-        tex_free(&s_tc[i]);
-    memset(s_tc_hint, 0, sizeof s_tc_hint);
     /* Both point into s_rt, now zeroed; the stage list is only rebuilt by
      * the next textured batch, and the white-draw log reads it. */
     s_cur = NULL;
@@ -4711,7 +4716,7 @@ static void scale_drop(void)
         nv2a_occ_settle(&s_occ);
         nv2a_occ_set_scale(&s_occ, nv2a_host_render_scale());
     }
-    fprintf(stderr, LOGP "render.scale=%u from this flip: targets and textures dropped\n",
+    fprintf(stderr, LOGP "render.scale=%u from this flip: targets dropped\n",
             nv2a_host_render_scale());
 }
 
@@ -4995,11 +5000,32 @@ int nv2a_pb_d3d11_shown(uint32_t offset, uint32_t *tw, uint32_t *th,
     return 0;
 }
 
+/* For tests/d3d11_backend_smoke: the host size of the target at a colour
+ * offset (render.scale times its guest size), 0 when there is none. */
+int nv2a_pb_d3d11_host_size(uint32_t offset, uint32_t *hw, uint32_t *hh)
+{
+    int i;
+    for (i = 0; i < RT_MAX; i++)
+        if (s_rt[i].tex && s_rt[i].offset == offset) {
+            *hw = s_rt[i].hw;
+            *hh = s_rt[i].hh;
+            return 1;
+        }
+    return 0;
+}
+
 /* For tests/d3d11_backend_smoke: the swap chain's back-buffer size. */
 void nv2a_pb_d3d11_back_size(uint32_t *w, uint32_t *h)
 {
     *w = s_back_w;
     *h = s_back_h;
+}
+
+/* For tests/d3d11_backend_smoke: textures uploaded so far (a scale change
+ * keeps the cache, so it uploads none). */
+uint64_t nv2a_pb_d3d11_tex_uploads(void)
+{
+    return s_tex_uploads;
 }
 
 /* For tests/d3d11_backend_smoke: the back-buffer pixel the last flip read,

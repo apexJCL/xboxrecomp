@@ -23,6 +23,9 @@
  * own format, R5G6B5 or X1R5G5B5, as JSRF clears its logos.
  * Then the display mode's frame: with a 640x480 mode the crop case shows
  * 640x480, and a buffer drawn only at 320x240 is grown to it.
+ * Then live render.scale changes (scale_cache_cases): the texture cache is
+ * kept, so the flip at the new scale uploads nothing and still draws the
+ * texels, and render to texture binds the target made at the new scale.
  * Last, present.surface=internal: a live render.scale change resizes the
  * swap chain to the frame's host size.
  * With RECOMP_PB_BACKEND=d3d11 that reaches ClearRenderTargetView, a draw
@@ -48,6 +51,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param);
 uint32_t nv2a_pb_d3d11_pixel(uint32_t offset, int x, int y);
 uint32_t nv2a_pb_d3d11_back_pixel(int x, int y);
 void nv2a_pb_d3d11_back_size(uint32_t *w, uint32_t *h);
+uint64_t nv2a_pb_d3d11_tex_uploads(void);
+int nv2a_pb_d3d11_host_size(uint32_t offset, uint32_t *hw, uint32_t *hh);
 int nv2a_pb_d3d11_shown(uint32_t offset, uint32_t *tw, uint32_t *th,
                         uint32_t *sw, uint32_t *sh);
 ptrdiff_t xbox_GetMemoryOffset(void);
@@ -1023,6 +1028,109 @@ static int overscan_cases(uint32_t buf)
     return f;
 }
 
+/* buf (640x480) cleared black with the swizzled checker drawn one texel a
+ * pixel at (100,100)-(164,164); returns guest (120,120), texel (20,20)
+ * orange, and puts guest (112,120), texel (12,20) blue, in *blue; then
+ * flips to other. */
+static uint32_t checker_flip(uint32_t buf, uint32_t other, uint32_t *blue)
+{
+    static const float uv[4][2] = {{0, 0}, {1, 0}, {1, 1}, {0, 1}};
+    uint32_t c;
+    int a, k;
+
+    surf_clear(buf, 640, 480, 0xFF000000u);
+    for (a = 0; a < 16; a++)
+        M(0x1760 + 4 * a, a == 0 ? 0x42u : a == 3 ? 0x40u : a == 9 ? 0x22u : 0x02u);
+    M(0x1B00, TEX_GUEST);
+    M(0x1B04, (0x06u << 8) | (TEX_LOG2 << 20) | (TEX_LOG2 << 24) | (1u << 4) | (2u << 0));
+    M(0x1B08, 0x00000101u);
+    M(0x1B0C, 0x40000000u);
+    M(0x17FC, 8);
+    for (k = 0; k < 4; k++)
+        vertex_uv(k == 1 || k == 2 ? 164.0f : 100.0f, k >= 2 ? 164.0f : 100.0f,
+                  0xFFFFFFFFu, uv[k]);
+    M(0x17FC, 0);
+    M(0x1B0C, 0);
+    M(0x1760 + 4 * 9, 0x02u);
+    c = nv2a_pb_d3d11_pixel(buf, 120, 120);
+    *blue = nv2a_pb_d3d11_pixel(buf, 112, 120);
+    M(0x0210, other);
+    M(0x012C, 0);   /* FLIP_INCREMENT_WRITE: the flip count the cache rehashes by */
+    M(0x0130, 0);
+    return c;
+}
+
+/* Live render.scale changes, 1 to 2 to 3 to 1 (the in-game menu). The
+ * texture cache holds guest texels at guest size, so scale_drop keeps it:
+ * the flip at the new scale uploads no texture and draws the same texels.
+ * Dropping it re-uploaded every texture there, a 150-700 ms flip on the
+ * Deck. The kept cache still rehashes once a flip, so a texel the
+ * title rewrites after the change uploads that one texture again. A
+ * render-to-texture input binds the target, which is made again at the new
+ * scale, so the cache never stands in for it: each scale clears RTT_B to a
+ * colour of its own, which a target kept from the last scale would not
+ * show, and checks its host size. The request applies at the flip after
+ * it. Returns the failures. */
+static int scale_cache_cases(const uint32_t *buf)
+{
+    static const unsigned scales[3] = {2, 3, 1};
+    static const uint32_t rtt_c[3] = {0xFFFF0000u, 0xFF00FF00u, 0xFFFF00FFu};
+    struct nv2a_host_opts o = *nv2a_host_opts(), stock = o;
+    /* Texel (20,20), the one checker_flip returns: orange, made green. */
+    uint32_t *texel = (uint32_t *)(uintptr_t)TEX_GUEST
+                      + swizzle_offset(20, 20, 1u << TEX_LOG2, 1u << TEX_LOG2);
+    uint32_t c, b, hw, hh;
+    uint64_t u0;
+    int f = 0, i, ok;
+
+    checker_flip(buf[0], buf[1], &b);   /* the checker is in the cache */
+    for (i = 0; i < 3; i++) {
+        unsigned n = scales[i];
+        o.render_scale = n;
+        nv2a_host_opts_request(&o, NV2A_OPT_SCALE);
+        checker_flip(buf[0], buf[1], &b);   /* applied after this present */
+        u0 = nv2a_pb_d3d11_tex_uploads();
+        c = checker_flip(buf[0], buf[1], &b);
+        u0 = nv2a_pb_d3d11_tex_uploads() - u0;
+        ok = nv2a_host_render_scale() == n && !u0 && c == 0xFFFF8000u && b == 0xFF2040FFu;
+        fprintf(stderr, "[backend-smoke] scale cache x%u: scale %u, %llu uploads,"
+                " texels 0x%08X 0x%08X (want x%u, 0, 0xFFFF8000 0xFF2040FF) %s\n",
+                n, nv2a_host_render_scale(), (unsigned long long)u0, c, b, n,
+                ok ? "PASS" : "FAIL");
+        f += !ok;
+        /* The title rewrites a texel: the next flip's rehash uploads the
+         * checker again, once, and draws the new colour. */
+        *texel = 0xFF00FF00u;
+        u0 = nv2a_pb_d3d11_tex_uploads();
+        c = checker_flip(buf[0], buf[1], &b);
+        u0 = nv2a_pb_d3d11_tex_uploads() - u0;
+        *texel = 0xFFFF8000u;
+        ok = u0 == 1 && c == 0xFF00FF00u && b == 0xFF2040FFu;
+        fprintf(stderr, "[backend-smoke] scale cache x%u: rewritten texel, %llu uploads,"
+                " texels 0x%08X 0x%08X (want 1, 0xFF00FF00 0xFF2040FF) %s\n", n,
+                (unsigned long long)u0, c, b, ok ? "PASS" : "FAIL");
+        f += !ok;
+        checker_flip(buf[0], buf[1], &b);   /* uploads the restored texel */
+        surf_clear(RTT_B, 64, 64, rtt_c[i]);
+        surf_clear(buf[0], 640, 480, 0xFF000000u);
+        M(0x0210, buf[1]);
+        M(0x0130, 0);
+        hw = hh = 0;
+        ok = nv2a_pb_d3d11_host_size(RTT_B, &hw, &hh);
+        c = sample_rtt(buf[0], buf[1], RTT_B);
+        ok = ok && hw == 64u * n && hh == 64u * n && c == rtt_c[i];
+        fprintf(stderr, "[backend-smoke] scale cache x%u: render to texture %ux%u host,"
+                " samples 0x%08X (want %ux%u, 0x%08X) %s\n", n, hw, hh, c,
+                64u * n, 64u * n, rtt_c[i], ok ? "PASS" : "FAIL");
+        f += !ok;
+    }
+    nv2a_host_opts_set(&stock);
+    M(0x0200, 640u << 16);
+    M(0x0204, 480u << 16);
+    M(0x0210, buf[0]);
+    return f;
+}
+
 /* present.surface=internal follows a live render.scale change (the
  * in-game menu): the swap chain becomes the frame's host size, 1280x960 at
  * 2x, instead of staying at the starting 640x480 behind a scaling blit, and
@@ -1632,6 +1740,10 @@ int main(int argc, char **argv)
     if (overscan_cases(buf[0])) {
         fprintf(stderr, "[backend-smoke] FAIL: display.overscan present crop\n");
         return 13;
+    }
+    if (scale_cache_cases(buf)) {
+        fprintf(stderr, "[backend-smoke] FAIL: texture cache across a render.scale change\n");
+        return 14;
     }
     if (surface_cases(buf[0])) {
         fprintf(stderr, "[backend-smoke] FAIL: present.surface=internal scale change\n");
