@@ -3574,11 +3574,17 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
     prof_flip_end(t_flip0);
 }
 
-/* render.scale changed at this flip: every target, depth buffer and texture
- * was made at the old factor. Targets go with the eviction's write-back, so
- * the next one at that surface seeds from what was drawn at the new scale;
- * textures because a render-to-texture input is sized by scale. After the
- * present, so the frame being shown keeps the targets it was drawn in. */
+/* render.scale changed at this flip: every target and depth buffer was made
+ * at the old factor. Targets go with the eviction's write-back, so the next
+ * one at that surface seeds from what was drawn at the new scale. After the
+ * present, so the frame being shown keeps the targets it was drawn in.
+ *
+ * The texture cache stays. Its entries are guest texels at guest size, which
+ * no scale changes; a render-to-texture input binds the target itself
+ * (rt_texture, s_self resized by its own check), and the write-back marks
+ * every entry over a target's memory stale (tex_cache_stale). Dropping it
+ * made the next flip decode and upload every texture again: 180-550 ms on
+ * Jet Set Radio Future's title screen, the freeze seen at each change. */
 static void scale_drop(void)
 {
     int i;
@@ -3601,10 +3607,6 @@ static void scale_drop(void)
             [d->tex release];
             memset(d, 0, sizeof *d);
         }
-        for (i = 0; i < TEX_CACHE; i++) {
-            [s_tc[i].tex release];
-            memset(&s_tc[i], 0, sizeof s_tc[i]);
-        }
     }
     /* Queries issued at the old scale are read at it: a count taken at 2x
      * divided by 1 would report four times the samples. Retired results go
@@ -3615,7 +3617,7 @@ static void scale_drop(void)
         }
         nv2a_occ_set_scale(&s_occ, nv2a_host_render_scale());
     }
-    fprintf(stderr, LOGP "render.scale=%u from this flip: targets and textures dropped\n",
+    fprintf(stderr, LOGP "render.scale=%u from this flip: targets dropped\n",
             nv2a_host_render_scale());
 }
 

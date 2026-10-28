@@ -5902,10 +5902,39 @@ uint32_t xbox_ContiguousInUseBytes(void)
  * most one pass of one voice. */
 static volatile uint8_t g_phys_ram_named[CONTIG_PAGES];
 
+/* Image pages MmGetPhysicalAddress has handed out, kept apart from the heap
+ * record above and read only for sample data (mcpx_apu_phys_data).
+ *
+ * DirectSound keeps a buffer of digital zero in its own image section and
+ * points the voices that feed the mixbins (64-67) at it. Jet Set Radio
+ * Future's sits at 0x001A77B0, in DSOUND, on a page number the arena has also
+ * handed out: the second framebuffer, at window 0x8011C000. The APU read the
+ * window copy, which held zeros only because nothing wrote the framebuffer
+ * back to guest memory. A render-scale change does (scale_drop writes the
+ * live targets back), and the four voices then looped 32 samples of pixels
+ * into every mixbin: near-full-scale DC and a tone until quit.
+ *
+ * Not consulted for the voice array or other APU structures, which
+ * DirectSound takes from the arena and which can sit on a window page inside
+ * a large image's range (see mcpx_apu_phys).
+ *
+ * Never cleared, which is safe only because no image page is ever handed to
+ * another owner. On the console XeUnloadSection frees a section's pages and
+ * the allocator can give them out again, which would leave the mark naming
+ * memory the image no longer holds. Here every section keeps its range for
+ * the whole session: by default XeLoadSection and XeUnloadSection only count
+ * references, and with section paging (xbe_sections.c) unload drops the
+ * charge but keeps the bytes and the VA, and the heap sits above the whole
+ * image. If XeUnloadSection ever frees pages, it must clear their marks
+ * here. */
+static volatile uint8_t g_phys_image_named[CONTIG_PAGES];
+
 void xbox_PhysNoteRamName(uint32_t va)
 {
     if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE)
         g_phys_ram_named[va / CONTIG_PAGE] = 1;
+    else if (va >= g_xbox_image_lo && va < g_xbox_image_hi && va < XBOX_CONTIG_SIZE)
+        g_phys_image_named[va / CONTIG_PAGE] = 1;
 }
 
 /* Heap block m is free (and merged with any free neighbours): its pages name
@@ -5957,6 +5986,11 @@ static void heap_forget_ram_names(int m)
 const volatile uint8_t *xbox_PhysRamNameMap(void)
 {
     return g_phys_ram_named;
+}
+
+const volatile uint8_t *xbox_PhysImageNameMap(void)
+{
+    return g_phys_image_named;
 }
 
 void *xbox_McpxHost(void)

@@ -28,6 +28,9 @@
  *     one-shot at rate 1, a one-shot at rate 0.5 (the resampler returns a
  *     short count, then the voice is off) and a non-persist stream that runs
  *     out of packets.
+ *   - sample_reads_take_the_data_resolver: written with the data/phys split, so
+ *     it pins it: PCM and ADPCM samples come from mcpx_apu_phys_data, the
+ *     voice and SGE tables from mcpx_apu_phys.
  *
  * Run with: ctest --test-dir <build> */
 #include "../../src/apu/apu_vp.c"
@@ -63,6 +66,21 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
 }
 
 const char *mcpx_apu_phys_class(uint64_t addr) { (void)addr; return "fake"; }
+/* Sample data resolves as everything else does unless a check sets s_data:
+ * then it reads that second fake RAM, so a sample read that went back to
+ * mcpx_apu_phys, or a voice or SGE read moved to the data resolver, shows. */
+static uint8_t *s_data;
+uint8_t *mcpx_apu_phys_data(uint64_t addr)
+{
+    if (!s_data) return mcpx_apu_phys(addr);
+    if (addr >= RAM_SIZE) {
+        fprintf(stderr, "FAIL: sample read at 0x%llX is outside the fake RAM\n",
+                (unsigned long long)addr);
+        exit(1);
+    }
+    return s_data + addr;
+}
+const char *mcpx_apu_phys_data_class(uint64_t addr) { (void)addr; return "fake"; }
 int apu_env_on(const char *name) { (void)name; return 0; }
 void apu_lockstat_hold_end(int who) { (void)who; }
 void apu_lockstat_hold_begin(int who) { (void)who; }
@@ -615,6 +633,58 @@ static void gain_ramps_across_a_frame(void)
     }
 }
 
+/* The decoders read samples through mcpx_apu_phys_data (an image page the
+ * title named) and the voice and SGE tables through mcpx_apu_phys.
+ * The two fake RAMs hold different sample bytes and only s_ram holds the
+ * tables, so a read on the wrong resolver decodes the wrong samples. */
+static void sample_reads_take_the_data_resolver(void)
+{
+    static MCPXAPUState d;
+    float out[NUM_SAMPLES_PER_FRAME][2];
+    int16_t expect[65 * 2];
+    uint8_t *data = (uint8_t *)calloc(1, RAM_SIZE);
+    int n;
+
+    if (!data) { CHECK(0, "no memory for the second fake RAM"); return; }
+
+    /* ADPCM: one block, its bytes in data; s_ram's copy is scrambled. */
+    setup_adpcm_voice(&d, 1);
+    memcpy(data + DATA_BASE, s_ram + DATA_BASE, 36);
+    for (unsigned i = 4; i < 36; i++)
+        s_ram[DATA_BASE + i] ^= 0x5A;
+    adpcm_decode_block(expect, data + DATA_BASE, 36, 1);
+    s_data = data;
+    memset(out, 0, sizeof(out));
+    n = voice_get_samples(&d, 0, out, NUM_SAMPLES_PER_FRAME);
+    CHECK(n == NUM_SAMPLES_PER_FRAME, "ADPCM: %d samples", n);
+    for (int i = 0; i < n; i++)
+        if (out[i][0] != int16_to_float(expect[i])) {
+            CHECK(0, "ADPCM: sample %d is %f, the data resolver's block says %f",
+                  i, out[i][0], int16_to_float(expect[i]));
+            break;
+        }
+    s_data = NULL;
+
+    /* PCM S16: a looped frame, different values on each side. */
+    setup_pcm_loop_voice(&d, NUM_SAMPLES_PER_FRAME);
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+        int16_t x = (int16_t)(i * 211 + 3);
+        memcpy(data + DATA_BASE + 2 * i, &x, 2);
+        put_s16((unsigned)i, (int16_t)-x);
+    }
+    s_data = data;
+    n = resample_frame(&d, 1.0f, out);
+    CHECK(n == NUM_SAMPLES_PER_FRAME, "PCM: %d samples", n);
+    for (int i = 0; i < n; i++)
+        if (out[i][0] != int16_to_float((int16_t)(i * 211 + 3))) {
+            CHECK(0, "PCM: sample %d is %f, the data resolver's buffer has %f",
+                  i, out[i][0], int16_to_float((int16_t)(i * 211 + 3)));
+            break;
+        }
+    s_data = NULL;
+    free(data);
+}
+
 int main(void)
 {
     s_ram = (uint8_t *)calloc(1, RAM_SIZE);
@@ -635,6 +705,7 @@ int main(void)
     one_shot_half_rate_final_frame_reaches_mix_bins();
     stream_end_final_frame_reaches_mix_bins();
     gain_ramps_across_a_frame();
+    sample_reads_take_the_data_resolver();
 
     free(s_ram);
     if (s_failures) {
@@ -645,6 +716,7 @@ int main(void)
          "resampler plays each frame's source, no sample held back; a fetch "
          "ending before EBO still plays sample EBO; the frame a voice ends in "
          "is mixed (one-shot at rate 1 and 0.5, stream end); volume changes "
-         "ramp across a frame.");
+         "ramp across a frame; samples are read through the data resolver and the "
+         "voice and SGE tables through the other.");
     return 0;
 }

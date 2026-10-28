@@ -250,13 +250,18 @@ uint32_t xbox_ContiguousAllocatedBytes(void);
  * (or claimed). Read without the arena lock; a device model's view. */
 const volatile uint8_t *xbox_ContiguousPageMap(void);
 /* MmGetPhysicalAddress named this VA; recorded if it is a heap page below
- * 64 MB (the image and stacks are not recorded). */
+ * 64 MB (xbox_PhysRamNameMap) or an image page (xbox_PhysImageNameMap,
+ * kept apart); stacks are not recorded. */
 void xbox_PhysNoteRamName(uint32_t va);
 /* One byte per 4 KB physical page below 64 MB, nonzero while the title holds
  * a RAM name for a heap page there (see xbox_PhysNoteRamName); cleared when
  * no live heap block covers the page any more. Read without a lock; a device
  * model's view. */
 const volatile uint8_t *xbox_PhysRamNameMap(void);
+/* One byte per 4 KB physical page below 64 MB, nonzero once the title has
+ * named an image page there through MmGetPhysicalAddress. Never cleared.
+ * The APU reads sample data from RAM for these (mcpx_apu_phys_data). */
+const volatile uint8_t *xbox_PhysImageNameMap(void);
 /* Host address of the MCPX window (guest 0xFE800000, the APU at +0), or NULL
  * before the layout is up. The APU's DSP device runs its GP and EP on their
  * pages of it (+0x30000, +0x50000), which the title writes untrapped. */

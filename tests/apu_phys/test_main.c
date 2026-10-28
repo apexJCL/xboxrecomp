@@ -15,7 +15,8 @@
  * block shares with a live neighbour, which goes back once that neighbour is
  * freed too. Only heap pages are recorded: an image or stack page is never
  * freed, so its record would never clear (and a voice array at a window
- * number inside a large image must stay the window). */
+ * number inside a large image must stay the window). An image page named is
+ * recorded apart, and only sample data reads it from the image. */
 #include "kernel.h"
 #include "xbox_memory_layout.h"
 #include "apu_shim.h"
@@ -124,6 +125,43 @@ int main(int argc, char **argv)
           "an image page is not recorded");
     check(!xbox_PhysRamNameMap()[(XBOX_STACK_BASE + 0x100) >> 12],
           "a stack page is not recorded");
+
+    /* Sample data on an image page the title named reads the image, even
+     * where the arena has handed out the same number (DirectSound's zero
+     * buffer for the mixbin voices, under a framebuffer); the voice array
+     * and the other APU structures still read the window there. img is
+     * named first with no window page at its number, then the arena claims
+     * it; next, when the image has a second page, is claimed and unnamed. */
+    {
+        uint32_t img = g_xbox_image_lo & ~0xFFFu;
+        uint32_t next = img + 0x1000;
+        uintptr_t off;
+        xbox_MmGetPhysicalAddress((PVOID)(uintptr_t)img);
+        check(xbox_PhysImageNameMap()[img >> 12],
+              "an image page named is recorded apart");
+        check(!xbox_PhysImageNameMap()[next >> 12],
+              "  ...and only that page");
+        off = (uintptr_t)(mcpx_apu_phys_data(img + 0x10) - g_apu_ram_ptr);
+        check(off == img + 0x10 && side(img + 0x10) == 0,
+              "a named image page with no window page reads the image both ways");
+        check(!strcmp(mcpx_apu_phys_data_class(img), "imgnamed") &&
+              !strcmp(mcpx_apu_phys_class(img), "img"),
+              "  ...classed imgnamed for data and img for structures");
+
+        xbox_ContiguousClaim(XBOX_CONTIG_BASE + img, 0x2000);
+        off = (uintptr_t)(mcpx_apu_phys_data(img + 0x10) - g_apu_ram_ptr);
+        check(off == img + 0x10,
+              "under a window page, sample data on the named page still reads the image");
+        check(!strcmp(mcpx_apu_phys_data_class(img), "imgnamed"),
+              "  ...and its data trace class is imgnamed");
+        check(side(img + 0x10) == 1,
+              "the same number reads the window for APU structures");
+        if (next < g_xbox_image_hi) {
+            off = (uintptr_t)(mcpx_apu_phys_data(next + 0x10) - g_apu_ram_ptr);
+            check(off == 0x80000000u + (uintptr_t)next + 0x10,
+                  "sample data on an unnamed image page keeps the window");
+        }
+    }
 
     xbox_HeapFree(a);
     check(side(a + 0x10) == 1 && side(a + 0x2FF0) == 1,

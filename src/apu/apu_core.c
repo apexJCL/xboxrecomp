@@ -136,6 +136,23 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
     return g_apu_ram_ptr + (a & 0x03FFFFFFu);
 }
 
+/* Sample data: a voice's PCM or ADPCM, through its SGE list or a stream
+ * segment. An image page the title named through MmGetPhysicalAddress is the
+ * image here, before the page map: DirectSound's own zero buffer for the
+ * mixbin voices is a static in its image section, and a window page with the
+ * same number can be a framebuffer (xbox_PhysImageNameMap says what that
+ * played). The voice array, SGE and SSL tables and DSP memory keep
+ * mcpx_apu_phys, where a window page wins inside the image range. The same
+ * split as the OHCI's data buffers and descriptors. */
+uint8_t *mcpx_apu_phys_data(uint64_t addr)
+{
+    uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    if (a < (64u << 20) && xbox_PhysImageNameMap()[a >> 12] &&
+            a >= g_xbox_image_lo && a < g_xbox_image_hi)
+        return g_apu_ram_ptr + a;
+    return mcpx_apu_phys(addr);
+}
+
 /* Which of the cases above resolved an address, for the RECOMP_APU_TRACE
  * per-voice line and the doorbell line: "named" (a heap page
  * MmGetPhysicalAddress named), "win" (a page the contiguous allocator handed
@@ -143,7 +160,17 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
  * mark but not a live page), "ram" (plain RAM: below 64 MB, or above it
  * where the host mapped RAM) or "wrap" (above the mapping, folded into the
  * low 64 MB). A voice reading noise from "wrap" or "hiwin" is the address
- * resolution, not the decoder. */
+ * resolution, not the decoder. mcpx_apu_phys_data_class adds "imgnamed" (an
+ * image page the title named, which sample data reads from the image). */
+const char *mcpx_apu_phys_data_class(uint64_t addr)
+{
+    uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
+    if (a < (64u << 20) && xbox_PhysImageNameMap()[a >> 12] &&
+            a >= g_xbox_image_lo && a < g_xbox_image_hi)
+        return "imgnamed";
+    return mcpx_apu_phys_class(addr);
+}
+
 const char *mcpx_apu_phys_class(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;

@@ -917,7 +917,7 @@ static void vp_stat_samples(uint32_t v, const float samples[][2], int n,
     if (n <= 0) return;
     if (s->frames == 0) {
         s->addr = (uint32_t)first_addr;
-        s->cls = mcpx_apu_phys_class(first_addr);
+        s->cls = mcpx_apu_phys_data_class(first_addr);
         s->fmt = fmt;
     }
     for (int i = 0; i < n; i++) {
@@ -1052,7 +1052,7 @@ static uint64_t ring_hash_block(MCPXAPUState *d, uint32_t ba, uint32_t off,
         uint32_t lin = ba + off;
         uint32_t run = TARGET_PAGE_SIZE - lin % TARGET_PAGE_SIZE;
         if (run > len) run = len;
-        const uint8_t *p = mcpx_apu_phys(
+        const uint8_t *p = mcpx_apu_phys_data(
             get_data_ptr(d->regs[NV_PAPU_VPSGEADDR], 0xFFFFFFFF, lin));
         uint32_t i = 0;
         for (; i + 8 <= run; i += 8) {
@@ -1335,7 +1335,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 uint32_t linear_addr = block_index * (uint32_t)block_size;
                 if (stream) {
                     hwaddr addr = segment_offset + linear_addr;
-                    memcpy(adpcm_block, mcpx_apu_phys(addr),
+                    memcpy(adpcm_block, mcpx_apu_phys_data(addr),
                            block_size);
                 } else {
                     linear_addr += ba;
@@ -1344,7 +1344,7 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                         hwaddr addr = get_data_ptr(d->regs[NV_PAPU_VPSGEADDR],
                                                    0xFFFFFFFF, linear_addr);
                         adpcm_block[word_index] =
-                            ldl_le_phys(address_space_memory, addr);
+                            ldl_le_data(addr);
                         linear_addr += 4;
                     }
                 }
@@ -1374,19 +1374,19 @@ static int voice_get_samples(MCPXAPUState *d, uint32_t v, float samples[][2],
                 float fval;
                 switch (sample_size) {
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_U8:
-                    ival = ldub_phys(address_space_memory, addr);
+                    ival = ldub_data(addr);
                     fval = uint8_to_float((uint8_t)(ival & 0xff));
                     break;
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16:
-                    ival = lduw_le_phys(address_space_memory, addr);
+                    ival = lduw_le_data(addr);
                     fval = int16_to_float((int16_t)(ival & 0xffff));
                     break;
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S24:
-                    ival = ldl_le_phys(address_space_memory, addr);
+                    ival = ldl_le_data(addr);
                     fval = int24_to_float(ival);
                     break;
                 case NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S32:
-                    ival = ldl_le_phys(address_space_memory, addr);
+                    ival = ldl_le_data(addr);
                     fval = int32_to_float(ival);
                     break;
                 default:

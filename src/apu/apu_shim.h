@@ -179,6 +179,10 @@ extern uint8_t *g_apu_ram_ptr; /* Set at init to point at Xbox 64MB RAM */
 uint8_t *mcpx_apu_phys(uint64_t addr);
 /* Which case of mcpx_apu_phys resolved an address, for trace lines. */
 const char *mcpx_apu_phys_class(uint64_t addr);
+/* The same for sample data, which reads a named image page from the image
+ * first (see apu_core.c). */
+uint8_t *mcpx_apu_phys_data(uint64_t addr);
+const char *mcpx_apu_phys_data_class(uint64_t addr);
 
 /* Little-endian physical memory reads */
 static inline uint32_t ldl_le_phys(void *as, hwaddr addr) {
@@ -192,6 +196,17 @@ static inline uint16_t lduw_le_phys(void *as, hwaddr addr) {
 static inline uint8_t ldub_phys(void *as, hwaddr addr) {
     (void)as;
     return *(uint8_t *)mcpx_apu_phys(addr);
+}
+
+/* Sample-data reads: a voice's PCM and ADPCM words. */
+static inline uint32_t ldl_le_data(hwaddr addr) {
+    return *(uint32_t *)mcpx_apu_phys_data(addr);
+}
+static inline uint16_t lduw_le_data(hwaddr addr) {
+    return *(uint16_t *)mcpx_apu_phys_data(addr);
+}
+static inline uint8_t ldub_data(hwaddr addr) {
+    return *(uint8_t *)mcpx_apu_phys_data(addr);
 }
 
 /* Little-endian physical memory writes */
