@@ -1497,7 +1497,8 @@ static void fence_mirrors_tick(void)
  * number once the executor writes the fence. Against plain RAM the
  * register stays 0 and the wait only passes when the fence happens to be a
  * multiple of 32. The name is not confirmed; the behaviour is what the wait
- * needs. */
+ * needs. That is 5849's wait; 5558's compares bits 0..4 instead, see
+ * xbox_Nv2aPgraphFenceTick. */
 #define NV2A_PGRAPH_FENCE_MIRROR 0x400B10u
 
 /* What the title reads as "the GPU has finished through here": the
@@ -1542,20 +1543,37 @@ static int fence_completed(uint32_t *out)
     return 0;
 }
 
+/* Bits 2..6 is 5849's place for the fence. An older XDK keeps it lower
+ * (5558: bits 0..4); the executor reads the place off the 0x0310 word D3D
+ * writes next to each release (nv2a_pb_exec_fence_shift). */
+extern int nv2a_pb_exec_fence_shift(void);
+
 void xbox_Nv2aPgraphFenceTick(void)
 {
-    uint32_t v;
+    static uint32_t s_last_mask;   /* the ack loop's thread only */
+    uint32_t v, mask, old, want;
     volatile uint32_t *r;
+    int shift;
 
     if (!g_nv2a_memory)
         return;
     r = (volatile uint32_t *)((char *)g_nv2a_memory + NV2A_PGRAPH_FENCE_MIRROR);
     if (!fence_completed(&v))
         return;
-    if (((*r ^ (v << 2)) & 0x7Cu) != 0) {
-        *r = (*r & ~0x7Cu) | ((v << 2) & 0x7Cu);
+    shift = nv2a_pb_exec_fence_shift();
+    if (shift < 0)
+        shift = 2;
+    mask = 0x1Fu << shift;
+    /* A moved field clears the old one too: 5558's D3D reads reg >> 5 as
+     * how far the GPU has read, and the default shift's bits 5..6 would
+     * stay in it for the rest of the run. */
+    old = *r;
+    want = (old & ~(mask | s_last_mask)) | ((v << shift) & mask);
+    if (want != old) {
+        *r = want;
         xbox_SpinWake();   /* the wait-for-idle above may be sleeping */
     }
+    s_last_mask = mask;
 }
 
 static int s_nv2a_trace = 0;

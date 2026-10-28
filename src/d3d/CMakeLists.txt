@@ -103,6 +103,9 @@ if(NOT WIN32)
     # And PGRAPH 0x400B10 from the executor's releases or a fence mirror.
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pgraph_fence
                      ${CMAKE_CURRENT_BINARY_DIR}/pgraph_fence)
+    # And where in it the fence sits, per XDK (5558: bits 0..4).
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pgraph_fence_5558
+                     ${CMAKE_CURRENT_BINARY_DIR}/pgraph_fence_5558)
 endif()
 
 # The HLSL the parse -> generate pipeline emits, against recorded hashes

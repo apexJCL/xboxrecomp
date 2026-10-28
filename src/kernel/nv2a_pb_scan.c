@@ -416,9 +416,15 @@ void nv2a_pb_scan(uint32_t start_va, uint32_t end_va)
     if (why) {
         static unsigned said;
         extern void nv2a_pb_exec_flip_cancel(void);
+        extern void nv2a_pb_exec_fence_ref_forget(void);
         s_left = 0;                 /* out of step: drop the method in progress */
-        if (s_exec_enabled)
+        if (s_exec_enabled) {
             nv2a_pb_exec_flip_cancel();
+            /* The salvaged release below is not the partner of a fence word
+             * the walk stopped after; pairing them can move 0x400B10's
+             * fence field and hang the next wait-for-idle. */
+            nv2a_pb_exec_fence_ref_forget();
+        }
         uint32_t v = 0;
         const char *fence = stop_salvage(mem, at, end_va, &v);
         s_tot_stops++;

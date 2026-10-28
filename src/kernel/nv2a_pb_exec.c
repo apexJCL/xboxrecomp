@@ -450,6 +450,97 @@ uint32_t nv2a_pb_exec_semaphore_releases(void) { return s_sema_releases; }
 uint32_t nv2a_pb_exec_semaphore_last_va(void) { return s_sema_last_va; }
 uint32_t nv2a_pb_exec_semaphore_last_value(void) { return s_sema_last_value; }
 
+/* Where the fence sits in PGRAPH 0x400B10, learned from the pushbuffer.
+ *
+ * D3D inserts a fence as two methods back to back: 0x0310 on the object it
+ * binds to subchannel 5, then BACK_END_WRITE_SEMAPHORE_RELEASE with the
+ * fence value. The first carries the fence's low five bits, which the GPU
+ * keeps in 0x400B10 for D3D's wait-for-idle, but not at the same place in
+ * every XDK:
+ *
+ *   5849  ((pb << 3 | fence & 0x1F) << 2) | (dev[0x40] & 3)
+ *         wait: ((reg ^ fence << 2) & 0x7C) == 0
+ *   5558  (pb << 5) | (fence & 0x1F)
+ *         wait: ((reg ^ fence) & 0x1F) == 0
+ *
+ * With bits 2..6 fixed, a 5558 wait-for-idle spins for ever. So the field's
+ * shift is read off each such pair: the shift at which the 0x0310 word holds
+ * the released value's low five bits. Only a pair with nothing in between
+ * counts, and only a shift that alone fits: D3D's values are odd, so a 5558
+ * word fits nowhere but 0, while a 5849 word always fits at 2 and can fit
+ * at 0 as well for an unlucky value.
+ *
+ * The register tick places values that never had a 0x0310 beside them (a
+ * walk stop's salvaged release, a fence mirror's word), so it needs the
+ * shift, not just the last word. A wrong shift hangs the title's next wait
+ * for good, so the first pair sets it (a 5558 title's first wait needs it)
+ * and a different shift then takes NV_FENCE_SHIFT_AGREE pairs in a row.
+ * -1 until a pair has been seen; the tick then keeps bits 2..6, the layout
+ * every title had before.
+ *
+ * All of it runs on the walker thread, the ack loop's tick included. */
+#define NV_FENCE_REF_METHOD  0x0310   /* subchannel != 0: not Kelvin's dither */
+#define NV_FENCE_SHIFT_MAX   7
+#define NV_FENCE_SHIFT_AGREE 3
+static uint32_t s_fence_ref;
+/* Set by the 0x0310, cleared by the next method of any kind: "the method
+ * before this one was the fence word". */
+static int s_fence_ref_next;
+static int s_fence_shift = -1;
+static int s_fence_shift_cand = -1, s_fence_shift_votes;
+
+int nv2a_pb_exec_fence_shift(void) { return s_fence_shift; }
+
+/* A walk that stops out of step has lost the method order: the release its
+ * stop salvages is not the 0x0310's partner (nv2a_pb_scan.c). */
+void nv2a_pb_exec_fence_ref_forget(void) { s_fence_ref_next = 0; }
+
+static void fence_shift_say(const char *what, int fit, uint32_t value)
+{
+    static unsigned said;
+    if (said++ < 6) {
+        fprintf(stderr, "  [GPU] fence field in PGRAPH 0x400B10 %s bits"
+                " %d..%d (0x%04X word 0x%08X, release 0x%08X)\n", what,
+                fit, fit + 4, NV_FENCE_REF_METHOD, s_fence_ref, value);
+        fflush(stderr);
+    }
+}
+
+static void fence_shift_learn(int paired, uint32_t value)
+{
+    int s, fit = -1, fits = 0;
+
+    if (!paired)
+        return;
+    for (s = 0; s <= NV_FENCE_SHIFT_MAX; s++) {
+        if (((s_fence_ref >> s) & 0x1Fu) == (value & 0x1Fu)) {
+            fit = s;
+            fits++;
+        }
+    }
+    if (fits != 1)
+        return;                            /* no evidence either way */
+    if (fit == s_fence_shift) {
+        s_fence_shift_cand = -1;           /* the run of disagreeing pairs ends */
+        s_fence_shift_votes = 0;
+        return;
+    }
+    if (s_fence_shift >= 0) {
+        if (fit != s_fence_shift_cand) {
+            s_fence_shift_cand = fit;
+            s_fence_shift_votes = 0;
+        }
+        if (++s_fence_shift_votes < NV_FENCE_SHIFT_AGREE) {
+            fence_shift_say("stays; a pair fits", fit, value);
+            return;
+        }
+    }
+    s_fence_shift_cand = -1;
+    s_fence_shift_votes = 0;
+    fence_shift_say("at", fit, value);
+    s_fence_shift = fit;
+}
+
 /* The flip hold (nv2a_flip_hold.h). The executor arms it at FLIP_STALL; the
  * ack loop in xbox_memory_layout.c polls it each pass and, while it holds,
  * walks nothing and leaves the KickOff flush unacknowledged. Both run on the
@@ -6761,6 +6852,7 @@ static int imm_vertex_method(uint32_t method, uint32_t param)
 void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
 {
     static int inited;
+    int fence_paired;
     if (!inited) {
         int a;
         inited = 1;
@@ -6823,6 +6915,8 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     " samples guest memory\n");
     }
     s_perf.methods++;
+    fence_paired = s_fence_ref_next;
+    s_fence_ref_next = 0;
     /* Bring-up: the first parameters each surface method carries. A wrong
      * pitch or clip is indistinguishable from a method never arriving unless
      * the values are visible. Read once: this runs for every method. */
@@ -6869,6 +6963,10 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         }
     }
     if (subch != 0) {                      /* 3D class lives on subchannel 0 */
+        if (method == NV_FENCE_REF_METHOD) {
+            s_fence_ref = param;
+            s_fence_ref_next = 1;
+        }
         note_unhandled(method, param);
         return;
     }
@@ -7105,6 +7203,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
         *(volatile uint32_t *)(mem + va) = param;
         s_sema_last_va = va;
         s_sema_last_value = param;
+        fence_shift_learn(fence_paired, param);
         xbox_SpinWake();   /* a fence wait may be sleeping on this word */
         if (s_sema_releases++ == 0 || recomp_env(RENV_PB_SEMA_TRACE)) {
             static unsigned shown;
