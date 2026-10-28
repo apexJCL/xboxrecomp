@@ -389,6 +389,53 @@ int xbox_path_tree(const char *xbox_path)
     return XBOX_TREE_UNKNOWN;
 }
 
+/*
+ * Whether a guest path lands in the cache partition, for the RAM cache
+ * (kernel_ramfs.c). The same links and rules as xbox_translate_path, so the
+ * store takes exactly the paths that would go to <hdd>/Cache.
+ *
+ * Returns 1 with the part below the partition root in `out` (backslashes, no
+ * leading separator; "" for the root), 2 for a bare cache device
+ * (Partition3-5, which xbox_translate_path sends to the partition image), and
+ * 0 for anything else.
+ */
+int xbox_path_cache_rest(const char *xbox_path, char *out, size_t n)
+{
+    char linked[2][512];
+    const char *p = xbox_path;
+    int i, hop, skip, digit;
+
+    if (!p || !p[0] || !out || !n)
+        return 0;
+    for (hop = 0; hop < 8; hop++) {
+        if (!resolve_symlink(p, linked[hop & 1], sizeof linked[0]))
+            break;
+        p = linked[hop & 1];
+    }
+
+    digit = xbox_partition_device_digit(p);
+    if (digit)
+        return digit >= '3' && digit <= '5' ? 2 : 0;
+
+    for (i = 0; i < PATH_RULE_COUNT; i++) {
+        skip = match_rule(p, &s_rules[i]);
+        if (!skip)
+            continue;
+        if (!s_rules[i].sub_posix || strcmp(s_rules[i].sub_posix, "/Cache") != 0)
+            return 0;
+        p += skip;
+        while (*p == '\\' || *p == '/')
+            p++;
+        if (strlen(p) >= n)
+            return 0;
+        for (i = 0; p[i]; i++)
+            out[i] = p[i] == '/' ? '\\' : p[i];
+        out[i] = '\0';
+        return 1;
+    }
+    return 0;
+}
+
 #if defined(_WIN32)
 /* ======================================================================== */
 

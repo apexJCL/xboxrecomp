@@ -591,6 +591,9 @@ enum {
     XBOX_TREE_DEVICE,   /* a bare device: CdRom0, a PartitionN image        */
 };
 int xbox_path_tree(const char *xbox_path);
+/* 1 with the rest below the root when a guest path lands in the cache
+ * partition (<hdd>/Cache), 2 for a bare Partition3-5 device, else 0. */
+int xbox_path_cache_rest(const char *xbox_path, char *out, size_t n);
 
 /* 1 when the directory holding host_path exists (kernel_file.c, per backend). */
 int xbox_host_parent_exists(const xbox_host_char *host_path);

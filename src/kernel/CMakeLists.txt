@@ -10,6 +10,7 @@ set(KERNEL_SOURCES
     kernel_rtl.c
     kernel_memory.c
     kernel_file.c
+    kernel_ramfs.c
     kernel_missing.c
     kernel_thread.c
     kernel_user_apc.c

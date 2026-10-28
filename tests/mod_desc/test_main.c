@@ -61,6 +61,9 @@ static int s_fail, s_checks;
 
 void xbox_PacingSetMode(int mode);
 void xbox_PacingSetMode(int mode) { (void)mode; }
+/* kernel_ramfs.c's switch, which this test does not link. */
+void xbox_RamCacheEnable(int on);
+void xbox_RamCacheEnable(int on) { (void)on; }
 int nv2a_overlay_arm(uint32_t layers, uint32_t out_h)
 {
     (void)layers;

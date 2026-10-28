@@ -77,6 +77,9 @@ int xbox_PacingMode(void);
 int xbox_PacingMode(void) { return s_pacing; }
 void xbox_PacingSetMode(int mode);
 void xbox_PacingSetMode(int mode) { s_pacing = mode; }
+/* kernel_ramfs.c's switch, which this test does not link. */
+void xbox_RamCacheEnable(int on);
+void xbox_RamCacheEnable(int on) { (void)on; }
 
 ptrdiff_t xbox_GetMemoryOffset(void);
 ptrdiff_t xbox_GetMemoryOffset(void) { return 0; }

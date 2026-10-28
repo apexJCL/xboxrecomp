@@ -168,6 +168,7 @@ the stock settings, `present.pacing = "spin"` included.
 | `textures.text` | string | `"on"`, `"off"`: the pack's baked-text entries | `"on"` | `RECOMP_TEXTURES_TEXT` |
 | `overlay.stats` | bool | the stats strip in the window's top right corner: fps, frame ms (average and worst of the last second), pacing, scale and backend, at 2 Hz; never in a frame dump | `false` | `RECOMP_OVERLAY_STATS` |
 | `menu.enabled` | bool | the in-game menu, opened by the `menu.open` action ([In-game menu](#in-game-menu-menuenabled)) | `false` | `RECOMP_MENU` |
+| `storage.ram_cache` | bool | the title's cache partition (`Z:`, `Partition3`-`5`) lives in memory: capped at the stock 750 MB (a full one answers `STATUS_DISK_FULL`, as FATX does), seeded read-only from `<hdd>/Cache` at the first file call, never written back. For a title that rewrites its cache all the time (BLiNX 1: about 7 GB an hour); the console clears these partitions anyway. Read before the guest starts | `false` | `RECOMP_STORAGE_RAM_CACHE` |
 | `mods.<name>` | bool | a mod ([Mods](#mods)) runs; `false` leaves its init out at start. The menu's Mods page writes it | `true` | none |
 
 A title adds its own tables (`[fps]`, `[fx]`, ...) in the same files, and
@@ -1097,6 +1098,7 @@ exist only when the layer is built (`RECOMP_ENV_HAVE_ENHANCE_KEYS`):
 | `RECOMP_MENU` | overrides `menu.enabled` |
 | `RECOMP_KEYBOARD` | overrides `input.keyboard` (an older name, outside the naming rule) |
 | `RECOMP_MOUSE` | overrides `input.mouse` |
+| `RECOMP_STORAGE_RAM_CACHE` | overrides `storage.ram_cache`; a row of the main table, so the kernel reads it without the layer too |
 | `RECOMP_MODS_DESCRIBE` | `json` writes the mods' descriptor dump and exits before the game starts (see "Mods", "The descriptor dump"). Any other value logs one `[MOD]` line and is ignored |
 | `RECOMP_MODS_DESCRIBE_OUT` | the file the dump replaces; unset, it goes to stdout. A Windows or Proton launcher needs it, since the game has no stdout there |
 

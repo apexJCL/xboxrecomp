@@ -13,6 +13,7 @@
 #include "enhance_input.h"
 #include "enhance_menu.h"
 #include "kernel_pacing.h"
+#include "kernel_ramfs.h"
 #include "mod.h"
 #include "nv2a_backend_common.h"
 #include "nv2a_overlay.h"
@@ -112,6 +113,9 @@ int xbox_enhance_init(const char *root, const char *title)
      * can keep it, and without this layer the kernel stays at spin. */
     pacing = enhance_cfg_choice("present.pacing", s_pacing, XBOX_PACING_SLEEP);
     xbox_PacingSetMode(pacing);
+    /* The cache partition in memory (kernel_ramfs.h): stock off. Set before
+     * the guest opens a file; the store fixes on or off at its first use. */
+    xbox_RamCacheEnable(enhance_cfg_bool("storage.ram_cache", 0));
     /* Who scales the frame to the screen. Under gamescope the compositor
      * should: its filter (Steam's FSR) upscales only a surface smaller than
      * its output, and a window at the screen size leaves it nothing to do.

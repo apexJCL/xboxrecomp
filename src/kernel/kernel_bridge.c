@@ -28,6 +28,7 @@
 #include "kernel.h"
 #include "kernel_missing.h"
 #include "kernel_pacing.h"
+#include "kernel_ramfs.h"
 #include "recomp_env.h"
 #include "platform/host_time.h"
 #include "platform/host_prof.h"
@@ -7162,8 +7163,16 @@ static void bridge_NtDuplicateObject(void)
     if (STACK_ARG(2) & 0x1) opts |= DUPLICATE_CLOSE_SOURCE;
     if (STACK_ARG(2) & 0x2) opts |= DUPLICATE_SAME_ACCESS;
 
-    if (!DuplicateHandle(GetCurrentProcess(), src, GetCurrentProcess(),
-                         &dup, 0, FALSE, opts)) {
+    /* A RAM cache handle is an event to the host: duplicating that would
+     * give an event the store does not know. The store makes the handle. */
+    if (xbox_ramfs_active()
+            && xbox_ramfs_duplicate(src, &dup, (opts & DUPLICATE_CLOSE_SOURCE) != 0)) {
+        if (!dup) {
+            g_eax = 0xC0000001u;   /* STATUS_UNSUCCESSFUL */
+            return;
+        }
+    } else if (!DuplicateHandle(GetCurrentProcess(), src, GetCurrentProcess(),
+                                &dup, 0, FALSE, opts)) {
         static int logged = 0;
         if (logged++ < 8) {
             fprintf(stderr, "  [KERNEL] NtDuplicateObject: token=0x%08X "

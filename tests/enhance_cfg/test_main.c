@@ -962,6 +962,10 @@ static void test_migration(void)
 static int s_pacing_mode = -1;
 void xbox_PacingSetMode(int mode);
 void xbox_PacingSetMode(int mode) { s_pacing_mode = mode; }
+/* The kernel's RAM cache switch (kernel_ramfs.c), likewise. */
+static int s_ram_cache = -1;
+void xbox_RamCacheEnable(int on);
+void xbox_RamCacheEnable(int on) { s_ram_cache = on; }
 /* mod.c and enhance_input.c's links into the runtime; no mods run here
  * (tests/enhance_mod has them). */
 ptrdiff_t xbox_GetMemoryOffset(void);
@@ -1236,6 +1240,20 @@ static void test_enhance_init(void)
     recomp_env_set(RENV_PRESENT_PACING, "nap");
     CHECK(xbox_enhance_init(".", NULL) == 0 && s_pacing_mode == 1);
     recomp_env_set(RENV_PRESENT_PACING, NULL);
+
+    /* storage.ram_cache: off unless asked, on from the file, and the
+     * variable over the file. */
+    recomp_env_set(RENV_CONFIG, "none");
+    s_ram_cache = -1;
+    CHECK(xbox_enhance_init(".", NULL) == 0 && s_ram_cache == 0);
+    write_file("ecfg_ram.toml", "[storage]\nram_cache = true\n");
+    recomp_env_set(RENV_CONFIG, "ecfg_ram.toml");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && s_ram_cache == 1);
+    recomp_env_set(RENV_STORAGE_RAM_CACHE, "0");
+    CHECK(xbox_enhance_init(".", NULL) == 0 && s_ram_cache == 0);
+    CHECK(enhance_cfg_report_unused() == 0);
+    recomp_env_set(RENV_STORAGE_RAM_CACHE, NULL);
+    recomp_env_set(RENV_CONFIG, "none");
 
     /* overlay.stats: stock arms neither the actions hook nor the overlay
      * (no atlas line in a golden). A feature key arms the stats and toast
