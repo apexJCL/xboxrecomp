@@ -9,13 +9,103 @@ blinx2-v0.3.2; earlier tags are described by their commits.
 
 ## [Unreleased]
 
+## [blinx2-v0.7.0] - 2026-10-28
+
+### Added
+- An in-game menu behind `XBOXRECOMP_ENHANCE`, off unless `menu.enabled`
+  (`RECOMP_MENU`) is set: Game, Mods, Controls and Debug pages, binding
+  capture that refuses an input another action owns, and Save, which
+  writes only the changed keys to `config.toml`. `menu.open` defaults to
+  F10, Guide+A and paddle1. Its options (aniso, movie, overscan, filter,
+  fullscreen, pacing) switch live at the next flip on Metal and D3D11.
+  While the menu is open, the game sees released pads.
+- The overlay core: a stats strip and toasts on Metal, D3D11 and the SDL
+  presenter, armed only when a feature key asks for them. Host actions
+  bind keys, pad buttons, paddles and stick directions without passing
+  them to the game.
+- Mod API v2 (`menu_add`, `on_enable`) and settings API v3: a mod can
+  describe its info, typed settings and rebindable controls, and the menu
+  gives each mod its own page. `RECOMP_MODS_DESCRIBE` dumps the
+  descriptors as JSON.
+- Pad setups (`[input.pad]`): remaps, stick swap and inversion, deadzone,
+  pad families for glyphs and Steam Input detection, applied in one place
+  for every backend. Without `[input.pad]` the pad path is unchanged.
+- `storage.ram_cache` (`RECOMP_STORAGE_RAM_CACHE`, off by default): the
+  cache partition (`Z:`, `Partition3`-`5`) lives in memory, capped at
+  750 MB and never written back, so a title that rewrites its cache all
+  the time does not wear the SSD.
+- A `[MEM] exit` line on every exit path with the process's RAM and GPU
+  memory (Metal, D3D11); the `mem` trace key samples it while running.
+- An on-disk cache of compiled D3D11 shader bytecode (`RECOMP_DXBC_CACHE`,
+  on by default; `0` turns it off). A warm cache cut JSRF's title load
+  gap on the Deck from 1132 ms to 330 ms.
+- A USB pad source (`usb_gamepad_set_source`), so a title that reads its
+  pads through the OHCI controller (BLiNX 1) gets slots, scripts, rumble
+  and hot-plug.
+- Opt-in XBE section paging (`RECOMP_XBE_PAGING`): non-preload sections
+  load on `XeLoadSection`, as on the console, for titles whose sections do
+  not fit in 64 MB at once (BLiNX 1).
+- Opt-in features for debugging and benches: the APU DSP on the MIT
+  dsp56300 JIT (`XBOXRECOMP_APU_DSP`, `RECOMP_APU_DSP`), the heap
+  quarantine for freed guest blocks (`RECOMP_HEAP_QUARANTINE`), the
+  event-driven KickOff wait (`kick_event`), the run-ahead walker with the
+  PGRAPH notify interrupt (`run_ahead`), guest-priority scheduling under
+  the guest lock (`guest_sched`), the in-process sampling profiler
+  (`RECOMP_TRACE=prof`), flip-timed pad scripts and the pad recorder
+  (`pad_record`).
+- x86-64 Linux host groundwork: the toolkit runs natively there.
+
 ### Changed
+- Merged upstream xboxrecomp v0.15.0 ("Second Reading") and v0.16.0
+  ("Small Print"). The fork's host-pad table is now `pad_map`, so
+  upstream's `input_map` keeps its name.
+- Input bindings use upstream's names (`left_trigger`, `left_thumb`, SDL
+  scancode key names). The fork's old names are refused and named in the
+  log.
 - POSIX hosts link SDL3 (3.2 or newer) instead of SDL2 or sdl2-compat:
   window, input, gamepad hot-plug and audio. SDL2's `SDL_AUDIODRIVER` and
   `SDL_VIDEODRIVER` are still accepted.
 - `RECOMP_VBLANK` set to `0` or empty is off, like every other switch.
   Upstream v0.16 reads any set value as its plain tick; other values keep
   that meaning and `paced` is unchanged.
+- Contiguous allocations stay off the XBE image's physical pages while
+  there is room, as the console's kernel does
+  (`RECOMP_CONTIG_AVOID_IMAGE=0` restores the old order).
+- On macOS, `present.fullscreen` is a borderless window instead of a
+  fullscreen Space.
+- Metal and D3D11 keep their texture caches across a `render.scale`
+  change, so a change no longer stalls while every texture uploads again.
+- Cheaper pushbuffer decode and per-batch setup on D3D11 and Metal: the
+  draw time of a heavy BLiNX 2 frame on the Deck went from about 18.5 to
+  14.4 ms. Metal's runtime shaders compile as MSL 3.0.
+- Host rumble on SDL hosts changes at most once per 100 ms; a stop is
+  sent at once.
+
+### Fixed
+- Every guest thread has its own non-zero id, and oversized contiguous
+  requests are placed top-down, as the console does (Test Drive: Eve of
+  Destruction).
+- Draws with the depth test off are no longer clipped at the far plane on
+  Metal and D3D11.
+- Sample data on pages the image names is read from the image, so JSRF's
+  music no longer turns into a tone after a `render.scale` change.
+- The fence field of register 0x400B10 sits where the title's D3D expects
+  it (XDK 5558), so BLiNX 1 passes its first wait-for-idle.
+- `KeSetBasePriorityThread` reaches the host thread (SSX 3's crackle on
+  native Windows), but only where the host makes a priority exclusive
+  (JSRF under Proton).
+- APU voices: the frame a voice ends in is mixed, the last sample of a
+  buffer plays, and the resampler holds no sample back.
+- Late occlusion results amend a settled report (Burnout 3's sun flare
+  on D3D11); Metal and D3D11 share one render-target read rule.
+- Hor+ seams: perspective screen quads, letterbox band pieces and flat
+  near layers.
+- A switch arm after a `ret` is never taken for a gap function (SSX 3's
+  memcpy).
+- Under Proton without raw input, growing the window no longer traps the
+  cursor re-centre fallback.
+- The POSIX file backend's `O_APPEND` mapping: a `GENERIC_WRITE` handle no
+  longer sends positioned writes to end of file.
 
 ## [blinx2-v0.6.0] - 2026-10-21
 
