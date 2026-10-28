@@ -17,7 +17,10 @@
  *                             Each used to fault in the bridge or the heap.
  *                             A whole read-only host page does fault on
  *                             write, and a host page allows what its most
- *                             permissive guest page asks for.
+ *                             permissive guest page asks for. A page
+ *                             allocation handed the rest of a host page
+ *                             behind a read-only one is zeroed without a
+ *                             fault.
  *   NtSetInformationFile (226) FileRenameInformation: a title that writes
  *                             x.tmp and renames it to x.dat must find x.dat.
  *   FATX overwrite            an overwrite followed by a smaller end-of-file
@@ -356,6 +359,72 @@ static void test_protect(void)
     CALL(ORD_MMFREE, again);
 }
 
+/* JSRF on the Mac died in the heap's own zeroing (__bzero under
+ * xbox_HeapAlloc, from NtAllocateVirtualMemory) about 40 s into the intro.
+ * The title had made a page allocation read-only that ended inside a 16 KB
+ * host page; the next page allocation was handed the rest of that host page,
+ * and the host protection, rounded out to the whole page, covered it. Run
+ * first, on a heap with no free blocks yet, so the second allocation is the
+ * bump right behind the first. A fault here leaves the heap lock held, so it
+ * ends the run rather than going on. */
+static sigjmp_buf g_alloc_jb;
+static void on_alloc_fault(int sig)
+{
+    (void)sig;
+    siglongjmp(g_alloc_jb, 1);
+}
+
+static void test_protect_next_alloc(void)
+{
+    char d[160];
+    uint32_t pbase = g_scratch, psize = g_scratch + 4, pold = g_scratch + 8;
+    uint32_t hp = (uint32_t)sysconf(_SC_PAGESIZE);
+    uint32_t next = g_scratch + 0x1000, gap = (hp - next % hp) % hp;
+    uint32_t a, b = 0, st = 0;
+    struct sigaction sa, old_segv, old_bus;
+
+    printf("allocation behind a read-only page allocation (host page %u bytes)\n", hp);
+    if (gap) {                          /* the next block starts a host page */
+        G32(pbase) = 0;
+        G32(psize) = gap;
+        CALL(ORD_NTALLOC, pbase, 0, psize, 0x3000, 4);
+    }
+    G32(pbase) = 0;
+    G32(psize) = 0x2000;
+    CALL(ORD_NTALLOC, pbase, 0, psize, 0x3000, 4);
+    a = G32(pbase);
+    snprintf(d, sizeof d, "got 0x%08X", a);
+    check(a && a % hp == 0, "a page allocation at the start of a host page", d);
+    G32(pbase) = a;
+    G32(psize) = 0x2000;
+    CALL(ORD_NTPROTECT, pbase, psize, 0x02 /* PAGE_READONLY */, pold);
+
+    memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_alloc_fault;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGSEGV, &sa, &old_segv);
+    sigaction(SIGBUS, &sa, &old_bus);
+    if (sigsetjmp(g_alloc_jb, 1)) {
+        check(0, "the next allocation is zeroed without a fault",
+              "faulted in the heap's zeroing");
+        printf("\n%d failure(s)\n", failures);
+        _exit(1);
+    }
+    G32(pbase) = 0;
+    G32(psize) = 0x1000;
+    st = CALL(ORD_NTALLOC, pbase, 0, psize, 0x3000, 4);
+    b = G32(pbase);
+    sigaction(SIGSEGV, &old_segv, NULL);
+    sigaction(SIGBUS, &old_bus, NULL);
+    snprintf(d, sizeof d, "status 0x%08X, got 0x%08X", st, b);
+    check(st == 0 && b == a + 0x2000, "the next allocation follows it", d);
+    check(!faults(GP(b + 0xFFF), 1), "and is writable", NULL);
+    if (hp == 0x1000)
+        check(faults(GP(a), 1), "the read-only block still faults on write", NULL);
+    /* Both stay allocated: freed, they would leave a hole the later tests'
+     * "released region is reused" checks find first under reclaim. */
+}
+
 /* ---- contiguous arena -------------------------------------------------- */
 static void test_contiguous(void)
 {
@@ -660,6 +729,7 @@ int main(int argc, char **argv)
     xbox_kernel_set_thunk_address(g_thunks, NORDS + 1);
     xbox_kernel_bridge_init();
 
+    test_protect_next_alloc();
     test_virtual_memory();
     test_protect();
     test_contiguous();
