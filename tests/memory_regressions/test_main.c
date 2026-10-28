@@ -209,13 +209,15 @@ int main(int argc, char **argv)
     int ext128 = !strcmp(mode, "ext-vma-128");
     int ext = ext128 || !strcmp(mode, "ext-vma");
     int avoid = !strcmp(mode, "contig-avoid-image");
+    int fill_image = !strcmp(mode, "contig-fill-image");
     size_t xbe_len = 0;
     unsigned char *xbe;
     char d[160];
     int i;
 
     setvbuf(stdout, NULL, _IONBF, 0);
-    if (!reclaim && !zero && !ext && !quar && !avoid && strcmp(mode, "default")) {
+    if (!reclaim && !zero && !ext && !quar && !avoid && !fill_image
+            && strcmp(mode, "default")) {
         printf("unknown mode '%s'\n", mode);
         return 2;
     }
@@ -231,6 +233,8 @@ int main(int argc, char **argv)
     }
     if (avoid)
         set_env("RECOMP_CONTIG_AVOID_IMAGE", "1");
+    if (fill_image)
+        set_env("RECOMP_CONTIG_AVOID_IMAGE", "0");
     if (ext128)
         xbox_SetTotalRam(XBOX_DEVKIT_RAM);
 
@@ -258,18 +262,19 @@ int main(int argc, char **argv)
     }
     printf("mode: %s\n", mode);
 
-    /* 0. A contiguous block and the loaded image share physical numbers
-     * unless RECOMP_CONTIG_AVOID_IMAGE keeps the block out of the image. */
+    /* 0. A contiguous block stays off the loaded image's physical numbers;
+     * RECOMP_CONTIG_AVOID_IMAGE=0 brings back the bottom-up fill through the
+     * image (tests/contig_image_alias covers the rest). */
     if (!ext) {
         uint32_t c = xbox_ContiguousAlloc(1024u * 1024u, 4096);
         uint32_t phys = c - XBOX_CONTIG_BASE;
         int overlaps = phys < g_xbox_image_hi && phys + 1024u * 1024u > g_xbox_image_lo;
         snprintf(d, sizeof d, "block 0x%08X, image 0x%08X..0x%08X",
                  c, g_xbox_image_lo, g_xbox_image_hi);
-        if (avoid)
-            check(c && !overlaps, "avoid-image: a 1 MB block lands outside the image", d);
+        if (fill_image)
+            check(c && overlaps, "fill-image: a 1 MB block fills from the bottom", d);
         else
-            check(c && overlaps, "a 1 MB block still fills from the bottom by default", d);
+            check(c && !overlaps, "a 1 MB block lands outside the image", d);
         xbox_ContiguousFree(c);
     }
 

@@ -19,7 +19,8 @@ One test per mode, one process each, because the switches are read once and cach
 | `memory_regressions_reclaim_zero` | `RECOMP_HEAP_RECLAIM=0`, which must mean off: a game may default the switch on, and 0 is how a run turns it back off. The default mode's checks. |
 | `memory_regressions_heap_reclaim` | `RECOMP_HEAP_RECLAIM=1`. The first table below. |
 | `memory_regressions_heap_quarantine` | `RECOMP_HEAP_RECLAIM=1` with `RECOMP_HEAP_QUARANTINE=64`. The quarantine table below. |
-| `memory_regressions_contig_avoid_image` | `RECOMP_CONTIG_AVOID_IMAGE=1`: a contiguous block lands outside the loaded image. The default and heap-reclaim modes check that a block still fills from the bottom. |
+| `memory_regressions_contig_avoid_image` | `RECOMP_CONTIG_AVOID_IMAGE=1`, the default spelled out: a contiguous block lands outside the loaded image, as in every mode but the next. |
+| `memory_regressions_contig_fill_image` | `RECOMP_CONTIG_AVOID_IMAGE=0`: a contiguous block fills from the bottom through the image again, the order before the default changed. |
 | `memory_regressions_ext_vma` | `RECOMP_EXT_VMA=1`. The second table. |
 | `memory_regressions_ext_vma_128` | `RECOMP_EXT_VMA=1` on a 128 MB map. The tracker stays off. |
 

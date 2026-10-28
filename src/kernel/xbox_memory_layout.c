@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <setjmp.h>
 #if !defined(_WIN32)
 #include <unistd.h>   /* _exit */
@@ -5629,37 +5630,72 @@ static void contig_take(uint32_t first, uint32_t n)
         g_contig_first_free++;
 }
 
+/* Image pages MmGetPhysicalAddress has named (see the definition below). */
+static volatile uint8_t g_phys_image_named[CONTIG_PAGES];
+
 /* Whether page q may start or extend a new block.
  *
- * The first pass also keeps out of the loaded image's physical range. Here
- * the window and the RAM the image sits in are separate storage, so a block
+ * The first pass keeps out of the loaded image's physical range. Here the
+ * window and the RAM the image sits in are separate storage, so a block
  * placed at an image page gives one physical number two meanings, and a
- * device model holding only the number has to guess. Darkwatch's XPP lost
- * that guess both ways: a 1200 KB block at 0x0045C000 covered its .data
- * control-transfer buffer (0x004C20D4), and its OHCI descriptors, allocated
- * inside the block, resolved to the image and read back zero, so the pad
- * never enumerated. The console never has the overlap: its kernel keeps the
- * image's pages out of the pool. The second pass allows them, because an
- * image whose BSS runs past 48 MB would otherwise leave almost no window.
+ * device model holding only the number has to guess. The guesses were wrong
+ * more than once:
+ * - Darkwatch's XPP: a 1200 KB block at 0x0045C000 covered its .data
+ *   control-transfer buffer (0x004C20D4), its OHCI descriptors, allocated
+ *   inside the block, resolved to the image and read back zero, and the pad
+ *   never enumerated.
+ * - Jet Set Radio Future: the second framebuffer at window 0x8011C000 got
+ *   the page of DirectSound's zero buffer (0x001A77B0, in DSOUND), and after
+ *   a render-scale change wrote the framebuffer back the APU played pixels
+ *   into every mixbin.
+ * The console never has the overlap: its kernel keeps the image's pages out
+ * of the pool. So this is the default; RECOMP_CONTIG_AVOID_IMAGE=0 (or off,
+ * false, no) restores the old bottom-up fill through the image exactly, for
+ * an A/B. Any other value keeps it on: with the default on, a stray "on" or
+ * "true" read as a number would have turned the fix off.
  *
- * Opt-in (RECOMP_CONTIG_AVOID_IMAGE=1): it moves every block above the
- * image, and game glue names some of them by address (a DSP doorbell, say). */
+ * The second pass allows image pages, because an image whose sections run
+ * past 48 MB (BLiNX 2: 73 sections, all resident here, where the console
+ * loads them on demand) leaves too little window above it. Even then it
+ * never takes a page the title has already named through
+ * MmGetPhysicalAddress: that number is the image's for good. A page named
+ * after a block took it is still shared, and xbox_PhysNoteRamName reports
+ * it. */
 static int contig_avoid_image(void)
 {
     static int on = -1;
     if (on < 0) {
-        on = recomp_env_int(RENV_CONTIG_AVOID_IMAGE, 0) != 0;
+        const char *v = recomp_env(RENV_CONTIG_AVOID_IMAGE);
+        int c = v ? tolower((unsigned char)v[0]) : 0;
+        on = !(c == '0' || c == 'f' || c == 'n'
+               || (c == 'o' && tolower((unsigned char)v[1]) == 'f'));
     }
     return on;
 }
 
+static int contig_in_image(uint32_t q)
+{
+    return g_xbox_image_hi
+        && q >= g_xbox_image_lo / CONTIG_PAGE
+        && q < (g_xbox_image_hi + CONTIG_PAGE - 1) / CONTIG_PAGE;
+}
+
+/* The first page past the image: where the first pass resumes instead of
+ * testing every image page (12,000 of them for BLiNX 2) on each call. */
+static uint32_t contig_image_end(void)
+{
+    return (g_xbox_image_hi + CONTIG_PAGE - 1) / CONTIG_PAGE;
+}
+
+/* With the switch off the named-page refusal goes too, so =0 is the old
+ * order bit for bit. */
 static int contig_page_free(uint32_t q, int avoid_image)
 {
     if (g_contig_used[q])
         return 0;
-    return !(avoid_image && g_xbox_image_hi
-             && q >= g_xbox_image_lo / CONTIG_PAGE
-             && q < (g_xbox_image_hi + CONTIG_PAGE - 1) / CONTIG_PAGE);
+    if (!contig_in_image(q))
+        return 1;
+    return !avoid_image && !(contig_avoid_image() && g_phys_image_named[q]);
 }
 
 uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
@@ -5694,6 +5730,11 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
                 p = (CONTIG_LOW_RESERVE_END + align_pages - 1) & ~(align_pages - 1);
                 continue;
             }
+            if (avoid && g_xbox_image_hi && p < contig_image_end()
+                    && p + n > g_xbox_image_lo / CONTIG_PAGE) {
+                p = (contig_image_end() + align_pages - 1) & ~(align_pages - 1);
+                continue;
+            }
             for (q = p; q < p + n && contig_page_free(q, avoid); q++)
                 ;
             if (q == p + n) {
@@ -5702,7 +5743,8 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
                 break;
             }
             /* Skip the run that stopped us, then realign. */
-            while (q < limit && !contig_page_free(q, avoid)) q++;
+            while (q < limit && !contig_page_free(q, avoid))
+                q = avoid && contig_in_image(q) ? contig_image_end() : q + 1;
             p = (q + align_pages - 1) & ~(align_pages - 1);
         }
     }
@@ -5732,7 +5774,7 @@ uint32_t xbox_ContiguousAllocEx(uint32_t size, uint32_t alignment,
 
         p = (limit - n) & ~(align_pages - 1);
         while (n > below && n > above && p >= lo_page) {
-            for (q = p; q < p + n && !g_contig_used[q]; q++)
+            for (q = p; q < p + n && contig_page_free(q, 0); q++)
                 ;
             if (q == p + n) {
                 contig_take(p, n);
@@ -5921,20 +5963,23 @@ uint32_t xbox_ContiguousInUseBytes(void)
 static volatile uint8_t g_phys_ram_named[CONTIG_PAGES];
 
 /* Image pages MmGetPhysicalAddress has handed out, kept apart from the heap
- * record above and read only for sample data (mcpx_apu_phys_data).
+ * record above. (Declared above the arena, which reads it.)
  *
- * DirectSound keeps a buffer of digital zero in its own image section and
- * points the voices that feed the mixbins (64-67) at it. Jet Set Radio
- * Future's sits at 0x001A77B0, in DSOUND, on a page number the arena has also
- * handed out: the second framebuffer, at window 0x8011C000. The APU read the
- * window copy, which held zeros only because nothing wrote the framebuffer
- * back to guest memory. A render-scale change does (scale_drop writes the
- * live targets back), and the four voices then looped 32 samples of pixels
- * into every mixbin: near-full-scale DC and a tone until quit.
- *
- * Not consulted for the voice array or other APU structures, which
- * DirectSound takes from the arena and which can sit on a window page inside
- * a large image's range (see mcpx_apu_phys).
+ * The arena keeps blocks off the image's pages (contig_page_free), so for
+ * most titles no window page ever has an image page's number and this
+ * record decides nothing. It matters where the image is too large for that:
+ * the arena's second pass may then place a block inside the image's range,
+ * and while RECOMP_CONTIG_AVOID_IMAGE is on it skips every page recorded
+ * here (at =0 it takes them, as before). A page the title names only after
+ * a block took it is still shared; xbox_PhysNoteRamName reports it, and the
+ * APU reads sample data on such a page from the image (mcpx_apu_phys_data).
+ * That rule came first (Jet Set Radio Future): DirectSound's
+ * buffer of digital zero for the mixbin voices sat at 0x001A77B0, in
+ * DSOUND, under the second framebuffer at window 0x8011C000, and after a
+ * render-scale change wrote the framebuffer back, the four voices looped
+ * 32 samples of pixels into every mixbin. The voice array and other APU
+ * structures do not consult it: they are arena blocks, and a window page
+ * inside a large image's range is theirs (see mcpx_apu_phys).
  *
  * Never cleared, which is safe only because no image page is ever handed to
  * another owner. On the console XeUnloadSection frees a section's pages and
@@ -5945,14 +5990,32 @@ static volatile uint8_t g_phys_ram_named[CONTIG_PAGES];
  * charge but keeps the bytes and the VA, and the heap sits above the whole
  * image. If XeUnloadSection ever frees pages, it must clear their marks
  * here. */
-static volatile uint8_t g_phys_image_named[CONTIG_PAGES];
 
 void xbox_PhysNoteRamName(uint32_t va)
 {
-    if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE)
+    if (va >= XBOX_HEAP_BASE && va < XBOX_HEAP_TOP && va < XBOX_CONTIG_SIZE) {
         g_phys_ram_named[va / CONTIG_PAGE] = 1;
-    else if (va >= g_xbox_image_lo && va < g_xbox_image_hi && va < XBOX_CONTIG_SIZE)
-        g_phys_image_named[va / CONTIG_PAGE] = 1;
+    } else if (va >= g_xbox_image_lo && va < g_xbox_image_hi
+               && va < XBOX_CONTIG_SIZE) {
+        uint32_t q = va / CONTIG_PAGE;
+        static int reported;
+        int shared;
+
+        if (g_phys_image_named[q])
+            return;
+        /* Under the arena's lock, so a block being placed either sees the
+         * mark or is already live here and gets reported. */
+        contig_lock();
+        g_phys_image_named[q] = 1;
+        shared = g_contig_used[q] == 1;
+        contig_unlock();
+        if (shared && reported++ < 8) {
+            fprintf(stderr, "  [CONTIG] image page 0x%08X named while a window "
+                    "block holds its number: two owners for one physical "
+                    "page\n", q * CONTIG_PAGE);
+            fflush(stderr);
+        }
+    }
 }
 
 /* Heap block m is free (and merged with any free neighbours): its pages name

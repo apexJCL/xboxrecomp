@@ -231,7 +231,10 @@ void xbox_DisplayModeBump(void);
 uint32_t xbox_DisplayModeGeneration(void);
 
 /* Allocate from the contiguous (physical-mirror) arena. Returns a guest VA
- * below 256 MB, or 0 when the arena is exhausted. */
+ * below 256 MB, or 0 when the arena is exhausted. Blocks stay off the loaded
+ * image's physical numbers while there is room elsewhere, and never take an
+ * image page the title has named (RECOMP_CONTIG_AVOID_IMAGE=0: the old
+ * bottom-up fill through the image). */
 uint32_t xbox_ContiguousAlloc(uint32_t size, uint32_t alignment);
 /* The same, constrained to physical addresses [phys_lo, phys_hi] (inclusive),
  * as MmAllocateContiguousMemoryEx asks. Alignment is rounded up to a page and
@@ -260,7 +263,9 @@ void xbox_PhysNoteRamName(uint32_t va);
 const volatile uint8_t *xbox_PhysRamNameMap(void);
 /* One byte per 4 KB physical page below 64 MB, nonzero once the title has
  * named an image page there through MmGetPhysicalAddress. Never cleared.
- * The APU reads sample data from RAM for these (mcpx_apu_phys_data). */
+ * The arena never places a block on one (unless RECOMP_CONTIG_AVOID_IMAGE=0);
+ * the APU reads sample data from RAM for these (mcpx_apu_phys_data), for a
+ * page named after a block took it. */
 const volatile uint8_t *xbox_PhysImageNameMap(void);
 /* Host address of the MCPX window (guest 0xFE800000, the APU at +0), or NULL
  * before the layout is up. The APU's DSP device runs its GP and EP on their

@@ -578,12 +578,15 @@ static uint32_t bus_resolve(uint32_t addr, unsigned long *count)
  * and XAPI's OHCD takes them from MmAllocateContiguousMemory, because the
  * controller is a bus master that reads them by physical address. When that
  * allocation's physical number falls inside the image (the window is
- * separate storage here, so the allocator hands such numbers out), image
- * first reads code. Jet Set Radio Future's XAPI (XDK 4134) gets its HCCA at
- * 0x80082000 and writes HcHCCA = 0x00082000, inside an image that runs to
+ * separate storage here, and the arena hands such numbers out once a large
+ * image leaves it no other room), image first reads code. Jet Set Radio
+ * Future's XAPI (XDK 4134) gets its HCCA at 0x80082000 and writes
+ * HcHCCA = 0x00082000, inside an image that runs to
  * 0x00288620: the walker read the interrupt table out of .text, found
  * garbage EDs, never moved a transfer, and the pad never enumerated -- one
  * root hub change, one done queue, then only start-of-frame interrupts.
+ * (The arena keeps its blocks above that image now, so the two orders
+ * agree there.)
  *
  * The cost: a descriptor a driver kept statically in its image, on a page
  * the arena has also handed out, now reads the window copy. No title known

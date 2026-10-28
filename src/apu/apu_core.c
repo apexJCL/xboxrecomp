@@ -143,7 +143,12 @@ uint8_t *mcpx_apu_phys(uint64_t addr)
  * same number can be a framebuffer (xbox_PhysImageNameMap says what that
  * played). The voice array, SGE and SSL tables and DSP memory keep
  * mcpx_apu_phys, where a window page wins inside the image range. The same
- * split as the OHCI's data buffers and descriptors. */
+ * split as the OHCI's data buffers and descriptors.
+ *
+ * The arena now keeps blocks off the image (contig_page_free), so this rule
+ * decides something only for an image too large for that, on a page the
+ * title named after a block took it. Kept for that case and for a block a
+ * title pins inside its own image (xbox_ContiguousClaim). */
 uint8_t *mcpx_apu_phys_data(uint64_t addr)
 {
     uint32_t a = (uint32_t)addr & 0x0FFFFFFFu;
