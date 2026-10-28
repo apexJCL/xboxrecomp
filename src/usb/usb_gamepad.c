@@ -68,6 +68,19 @@ static uint8_t s_configuration[USB_GAMEPAD_MAX];
 uint8_t usb_gamepad_address(int pad) { return s_address[pad & 3]; }
 int usb_gamepad_configured(int pad) { return s_configuration[pad & 3] != 0; }
 
+void usb_gamepad_detach(int pad)
+{
+    s_address[pad & 3] = 0;
+    s_configuration[pad & 3] = 0;
+}
+
+/* The game's input layer (usb_gamepad.h). Set once before the controller
+ * thread starts and read on it, so a plain pointer is enough. */
+static const UsbPadSource *s_source;
+
+void usb_gamepad_set_source(const UsbPadSource *src) { s_source = src; }
+const UsbPadSource *usb_gamepad_source(void) { return s_source; }
+
 /* ---- control transfers ------------------------------------------------- */
 
 #define REQ_GET_STATUS         0x00
@@ -346,6 +359,8 @@ void usb_gamepad_flip(uint32_t flip)
     s_flip = flip;
 }
 
+uint32_t usb_gamepad_flips(void) { return s_flip; }
+
 static void pad_script_load(void)
 {
     const char *spec = recomp_env(RENV_PAD_SCRIPT);
@@ -516,6 +531,53 @@ static void pad_script_apply(int pad, uint8_t *out, uint32_t flip)
     }
 }
 
+/* The pads the toolkit's own inputs drive: the script's (every pad a step
+ * has named, kept after the step ends, so a pad does not leave the bus
+ * between two presses), the live file's pad 1, the synthetic press's pad 1.
+ * With a source installed these stay plugged in whatever the source says,
+ * so a run driven by RECOMP_PAD_SCRIPT alone gets the pad it gets today. */
+static uint32_t script_pads(void)
+{
+    static uint32_t named;
+    int i;
+
+    if (s_script_len < 0)
+        pad_script_load();
+    for (i = 0; i < s_script_len; i++)
+        named |= 1u << (s_script[i].pad & 3);
+    {
+        const char *live = recomp_env(RENV_PAD_LIVE);
+        if (live && *live)
+            named |= 1u;
+    }
+    {
+        const char *press = recomp_env(RENV_PAD_PRESS);
+        if (press && *press && strtoul(press, NULL, 0) & 0xFFu)
+            named |= 1u;
+    }
+    return named;
+}
+
+uint32_t usb_gamepad_present(void)
+{
+    uint32_t m = script_pads();
+    if (s_source && s_source->present)
+        m |= s_source->present();
+    return m & ((1u << USB_GAMEPAD_MAX) - 1u);
+}
+
+void usb_gamepad_rumble(int pad, uint16_t left, uint16_t right)
+{
+    if (s_source && s_source->rumble) {
+        s_source->rumble(pad, left, right);
+    } else {
+        XBOX_VIBRATION v;
+        v.wLeftMotorSpeed  = (WORD)left;
+        v.wRightMotorSpeed = (WORD)right;
+        xbox_InputSetState((DWORD)pad, &v);
+    }
+}
+
 /* RECOMP_DEBUG=pad_record=<file>: the report as the title gets it, after the
  * script, as flip-timed steps. Each step is written when it ends and flushed,
  * and the steps still held are written at exit (atexit, or the window's exit
@@ -659,10 +721,15 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
         }
     }
 
-    /* The synthetic press and the host pad drive pad n from host pad n. */
+    /* The synthetic press and the host pad drive pad n from host pad n;
+     * with a game's source installed the source drives it instead. */
     if (pad != 0)
         synth = 0;
-    if (xbox_InputGetState((DWORD)pad, &state) != 0) {
+    if (s_source) {
+        memset(&state, 0, sizeof state);
+        if (!s_source->get_state || !s_source->get_state(pad, &state.Gamepad))
+            memset(&state, 0, sizeof state);
+    } else if (xbox_InputGetState((DWORD)pad, &state) != 0) {
         out[2] = synth;
         pad_script_apply(pad, out, flip);
         pad_record(pad, out, flip);

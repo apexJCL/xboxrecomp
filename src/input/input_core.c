@@ -376,8 +376,19 @@ DWORD xbox_InputLastState(DWORD dwPort, XBOX_INPUT_STATE *pState)
     return rc;
 }
 #define KEEP(port, rc, st) ((port) == 0 ? keep_last((rc), (st)) : (rc))
+
+void xbox_InputKeepLastState(DWORD dwPort, DWORD rc, const XBOX_INPUT_STATE *pState)
+{
+    if (dwPort == 0 && pState)
+        keep_last(rc, pState);
+}
 #else
 #define KEEP(port, rc, st) (rc)
+
+void xbox_InputKeepLastState(DWORD dwPort, DWORD rc, const XBOX_INPUT_STATE *pState)
+{
+    (void)dwPort; (void)rc; (void)pState;
+}
 #endif
 
 #ifdef XBOXRECOMP_ENHANCE

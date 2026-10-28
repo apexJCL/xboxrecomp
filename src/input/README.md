@@ -75,6 +75,9 @@ BOOL xbox_InputIsConnected(DWORD dwPort);
 
 // Query controller capabilities
 DWORD xbox_InputGetCapabilities(DWORD dwPort, DWORD dwFlags, XBOX_INPUT_CAPABILITIES *pCaps);
+
+// Record port 0's state as the title got it, from a pad source (below)
+void xbox_InputKeepLastState(DWORD dwPort, DWORD rc, const XBOX_INPUT_STATE *pState);
 ```
 
 ## Types
@@ -375,6 +378,45 @@ Proton, where Wine's XInput sits on winebus) is not gated: `XInputSetState`
 goes to the XInput driver and shares no lock with the input reads in the
 game's process, and the macOS synchronous write the gate guards against
 is not on that path.
+
+## A pad source behind the emulated USB pad
+
+A title that links its own XAPI reads the pad through the emulated OHCI
+controller (`src/usb/ohci.c`), not `xbox_InputGetState`, so a game has no
+call to override there. `usb_gamepad_set_source(&src)` (`src/usb/usb_gamepad.h`)
+gives it one place to stand instead. Install it once, before `xbox_OhciInit`;
+with none installed, host pad N drives pad N on a fixed set of ports, as before.
+
+```c
+typedef struct {
+    int      (*get_state)(int pad, struct XBOX_GAMEPAD *out);  // 0: not driven
+    uint32_t (*present)(void);                // bit N: pad N should be plugged
+    void     (*rumble)(int pad, uint16_t left, uint16_t right);  // NULL: host pad
+} UsbPadSource;
+```
+
+- `get_state` is called for every input report, and `present` once per
+  controller pass (about 4 ms). Both run on the controller thread, not the
+  title's, and must not call back into the USB model.
+- `present` decides what is on the bus. A pad joins when the source names
+  it, one at a time, about 200 ms after the last one configured. It leaves
+  after it has been missing for about 250 ms, so a source that drops a pad
+  for a poll or two causes no pull. A pad that leaves enumerates from
+  address 0 when it comes back, and only after the bus settles, so the
+  driver sees the disconnect first.
+- A transfer to an address no pad holds completes with DEVICE NOT RESPONDING
+  while a source is installed. That is how XAPI learns that a pad is gone.
+- `RECOMP_PAD_PRESS`, `RECOMP_PAD_SCRIPT` and `RECOMP_PAD_LIVE` still press
+  on top of `get_state`, and the pads they name stay plugged in.
+  `RECOMP_USB_PADS` keeps that many plugged even without host pads.
+- The enhancements layer's `xbox_InputLastState` answers from what
+  `xbox_InputGetState` returned, and a source bypasses that call. A source
+  therefore passes port 0's state on with `xbox_InputKeepLastState(0, rc, &st)`.
+  Without the enhancements layer this is a no-op.
+
+`tests/usb_pad_source` covers the report, rumble, the plug and unplug
+timing, the port's change bits and the no-device answer, all without a title.
+BLiNX 1's `src/pad_input.c` is a source.
 
 ## Ports
 

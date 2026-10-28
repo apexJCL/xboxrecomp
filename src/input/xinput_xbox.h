@@ -122,6 +122,14 @@ DWORD xbox_InputLastState(DWORD dwPort, XBOX_INPUT_STATE *pState);
 #endif
 
 /**
+ * Record port 0's state as the title got it, for xbox_InputLastState, from
+ * a game whose pad does not come through xbox_InputGetState (a pad source
+ * behind the emulated USB pad, usb_gamepad.h). A no-op without the
+ * enhancements layer, and for other ports.
+ */
+void xbox_InputKeepLastState(DWORD dwPort, DWORD rc, const XBOX_INPUT_STATE *pState);
+
+/**
  * The keyboard-and-mouse state `kb` merged on top of the pad state `pad`,
  * as xbox_InputGetState does on port 0: buttons OR-ed, analog values the
  * larger, a non-zero key or mouse axis replacing the stick's, and the
