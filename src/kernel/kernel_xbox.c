@@ -79,7 +79,9 @@ XBOX_LAUNCH_DATA_PAGE* xbox_LaunchDataPage = &g_launch_data_page;
  * XeLoadSection/XeUnloadSection manage on-demand loading of XBE sections.
  * On Xbox, some sections are demand-paged from disc. In our recompilation,
  * the entire executable is loaded into memory, so these are reference-counting
- * no-ops.
+ * no-ops. Recompiled code never reaches them: ordinals 327/328 go through
+ * bridge_XeSection (kernel_bridge.c), which is where section paging
+ * (xbe_sections.c) lives -- change that path, not this one.
  * ============================================================================ */
 
 NTSTATUS __stdcall xbox_XeLoadSection(PXBE_SECTION_HEADER Section)

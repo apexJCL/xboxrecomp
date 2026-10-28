@@ -76,7 +76,18 @@ extern size_t g_xbox_total_ram;
  * Zero means "same as RAM", which is the existing behaviour for every title
  * that does not ask. Set before xbox_MemoryLayoutInit(). */
 extern size_t g_xbox_map_size;
+/* Where the heap stops when section paging grew the map (0: the map's top).
+ * Set by xbox_MemoryLayoutInit; xbox_ReserveAlloc hands out VAs above it. */
+extern uint32_t g_xbox_heap_cap;
 void xbox_SetMapSize(size_t bytes);
+
+/* XBE section paging (xbe_sections.h): load only the preload sections at
+ * boot and the rest on the title's XeLoadSection, with the mapping grown so
+ * the heap sits above the whole image. For a title whose sections add up to
+ * more than RAM leaves for its heap (BLiNX 1). Off by default; the
+ * RECOMP_XBE_PAGING key overrides either way. Set before
+ * xbox_MemoryLayoutInit(). */
+void xbox_SetSectionPaging(int on);
 
 /* Carve a pure address-space reservation from the mapped range above RAM.
  * Returns 0 if the mapping is no larger than RAM, or if it is exhausted.
@@ -546,8 +557,9 @@ extern RECOMP_TLS uint32_t g_fs_base;
  * Letting the ordinary heap serve the whole mapped range keeps every
  * allocation inside one allocator the guest already understands.
  */
-#define XBOX_HEAP_TOP       ((uint32_t)(g_xbox_map_size ? g_xbox_map_size \
-                                                        : g_xbox_total_ram))
+#define XBOX_HEAP_TOP       ((uint32_t)(g_xbox_heap_cap ? g_xbox_heap_cap \
+                                    : g_xbox_map_size ? g_xbox_map_size \
+                                                      : g_xbox_total_ram))
 
 /** No static mirror/guard region. RAM mirror is handled via file mapping
  *  views that alias the same physical pages as the base 64 MB region. */

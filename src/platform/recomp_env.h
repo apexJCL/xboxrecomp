@@ -129,6 +129,7 @@ extern "C" {
     X(APU_HRTF,          CONFIG, "RECOMP_APU_HRTF",          NULL, "0: no HRTF filter on 3D voices (default on)") \
     X(HEAP_RECLAIM,      CONFIG, "RECOMP_HEAP_RECLAIM",      NULL, "1: on, the heap splits and merges freed blocks (upstream); 0 or empty: off; a game may default it on") \
     X(HEAP_QUARANTINE,   CONFIG, "RECOMP_HEAP_QUARANTINE",   NULL, "=KiB: freed heap blocks held back from reuse, oldest first, up to that much; a larger block is freed at once (8192 suggested); 0 or empty: off") \
+    X(XBE_PAGING,        CONFIG, "RECOMP_XBE_PAGING",        NULL, "1: XBE sections not flagged preload load on the title's XeLoadSection, as on the console, and the mapping grows so the heap sits above the image; 0: every section at boot; default: the title's choice (xbox_SetSectionPaging), else off") \
     X(EXT_VMA,           CONFIG, "RECOMP_EXT_VMA",           NULL, "set: honour reservations at fixed addresses above the RAM mirrors (upstream, default off)") \
     X(KEYBOARD,          CONFIG, "RECOMP_KEYBOARD",          NULL, "1: keyboard drives pad 1") \
     X(MOUSE,             CONFIG, "RECOMP_MOUSE",             NULL, "1: the mouse drives pad 1 (a stick and buttons); 0: off") \

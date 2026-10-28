@@ -33,6 +33,7 @@
 #include "platform/host_prof.h"
 #include "recomp_exit_hook.h"
 #include "guest_vmem.h"
+#include "xbe_sections.h"
 #include "kernel_missing.h"
 #include "xbox_memory_layout.h"
 #include "platform/host_time.h"
@@ -5037,39 +5038,35 @@ static void bridge_complete_file_io(uint32_t event_token, uint32_t apc_routine,
  *
  * On hardware a section marked non-preload is paged in from disc on demand,
  * and a title that keeps its video decoder in one -- Wreckless keeps WMVDEC
- * there -- calls this before touching it. Every section is already resident
- * here, so the work is the bookkeeping: hand back success and keep the
- * reference count the title can read.
+ * there -- calls this before touching it. By default every section is
+ * already resident here, so the work is the bookkeeping: hand back success
+ * and keep the reference count the title can read. With section paging on
+ * (xbe_sections.h) a 0 -> 1 load copies the section in from the image and a
+ * 1 -> 0 unload gives its RAM back, as the console does.
  *
  * Done against guest memory rather than the PXBE_SECTION_HEADER struct: the
  * on-disc header is nine 32-bit fields and a digest, and the native struct
  * declares some of them as pointers, so on x64 its layout is not the 56 bytes
  * actually there.
- *
- *   +0x14  section name address      +0x18  section reference count
  */
-#define XBE_SECTION_REFCOUNT_OFFSET 0x18
-
 static void bridge_XeSection(int load)
 {
     uint32_t section = STACK_ARG(0);
-    uint32_t count;
+    uint32_t count = 0, st;
+    uint8_t *mem = (uint8_t *)(uintptr_t)g_xbox_mem_offset;
+    size_t mapped = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
 
-    if (!section) {
-        g_eax = 0xC000000Du;              /* STATUS_INVALID_PARAMETER */
-        return;
-    }
-    count = BRIDGE_MEM32(section + XBE_SECTION_REFCOUNT_OFFSET);
-    if (load)
-        count++;
-    else if (count)
-        count--;
-    BRIDGE_MEM32(section + XBE_SECTION_REFCOUNT_OFFSET) = count;
-
-    if (KERNEL_LOG_ON())
-        fprintf(stderr, "  [XBE] Xe%sSection(0x%08X) refcount=%u\n",
-                load ? "Load" : "Unload", section, count);
-    g_eax = 0;
+    st = load ? xbe_section_load(mem, mapped, section, &count)
+              : xbe_section_unload(mem, mapped, section, &count);
+    /* The edges are what matter when a title runs out of memory: which
+     * sections it holds at that point. Logged with paging on; every call
+     * with the kernel log. */
+    if (KERNEL_LOG_ON()
+        || (xbe_sections_paging() && st == 0 && count == (load ? 1u : 0u)))
+        fprintf(stderr, "  [XBE] Xe%sSection(0x%08X) refcount=%u, %u resident (%llu KB)\n",
+                load ? "Load" : "Unload", section, count, xbe_sections_resident(),
+                (unsigned long long)(xbe_sections_resident_bytes() >> 10));
+    g_eax = st;
 }
 
 static void bridge_XeLoadSection(void)   { bridge_XeSection(1); }

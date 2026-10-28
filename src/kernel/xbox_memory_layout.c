@@ -25,6 +25,7 @@
 #include "nv2a_gr_notify.h"
 #include "apu/apu_wav.h"  /* the watchdog finalises the WAV dump */
 #include "guest_vmem.h"
+#include "xbe_sections.h"
 #include "platform/host_time.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,6 +59,7 @@ static ptrdiff_t g_memory_offset = 0;  /* actual_base - XBOX_BASE_ADDRESS */
 /* Actual mapped RAM for this run; see the header. Default retail 64 MB. */
 size_t g_xbox_total_ram = XBOX_TOTAL_RAM;
 size_t g_xbox_map_size = 0;   /* 0 = same as RAM */
+uint32_t g_xbox_heap_cap = 0; /* 0 = the heap runs to the top of the map */
 
 void xbox_SetTotalRam(size_t bytes)
 {
@@ -68,6 +70,54 @@ void xbox_SetTotalRam(size_t bytes)
 void xbox_SetMapSize(size_t bytes)
 {
     g_xbox_map_size = bytes;
+}
+
+void xbox_SetSectionPaging(int on)
+{
+    xbe_sections_set_paging(on);
+}
+
+/*
+ * With section paging, the address space the image claims and the RAM it
+ * occupies come apart: every section keeps its VA, but only the preload ones
+ * hold RAM at boot. The heap still has to sit above the whole image, so the
+ * mapping grows until the heap above it can hold what RAM has left after the
+ * preload sections -- what the console's allocator would have -- rounded up
+ * to a whole number of RAM sizes so the mirrors keep their usual stride.
+ * Returns the map size to use, or 0 to keep the configured one; *heap_top
+ * gets the unrounded end, where the heap stops (xbox_ReserveAlloc).
+ */
+static size_t paging_map_size(const uint8_t *xbe, size_t xbe_size, uint32_t *heap_top)
+{
+    DWORD base_addr, num_sections, off;
+    uint64_t image_hi = 0, preload = 0, need, ram = g_xbox_total_ram;
+    size_t have = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
+
+    if (xbe_size < XBE_SECTION_HEADERS_OFFSET + 4) return 0;
+    base_addr = *(const DWORD *)(xbe + XBE_BASE_ADDR_OFFSET);
+    num_sections = *(const DWORD *)(xbe + XBE_SECTION_COUNT_OFFSET);
+    off = *(const DWORD *)(xbe + XBE_SECTION_HEADERS_OFFSET) - base_addr;
+    for (DWORD si = 0; si < num_sections; si++) {
+        const uint8_t *sh;
+        DWORD va, vsize;
+        if ((uint64_t)off + (si + 1) * SECTHDR_SIZE > xbe_size) break;
+        sh = xbe + off + si * SECTHDR_SIZE;
+        va = *(const DWORD *)(sh + SECTHDR_VA);
+        vsize = *(const DWORD *)(sh + SECTHDR_VSIZE);
+        if (va < XBOX_BASE_ADDRESS || (uint64_t)va + vsize > XBOX_TOTAL_RAM)
+            continue;
+        if ((uint64_t)va + vsize > image_hi) image_hi = (uint64_t)va + vsize;
+        if (*(const DWORD *)(sh + SECTHDR_FLAGS) & XBE_SECTION_FLAG_PRELOAD)
+            preload += vsize;
+    }
+    image_hi = (image_hi + 0xFFFFu) & ~(uint64_t)0xFFFFu;
+    if (image_hi < XBOX_REGION_MIN) image_hi = XBOX_REGION_MIN;
+    need = image_hi + XBOX_REGION_STACK_OFF + 8ull * 1024 * 1024
+         + (ram > preload ? ram - preload : 0);
+    need = (need + 0xFFFFu) & ~(uint64_t)0xFFFFu;
+    *heap_top = (uint32_t)need;
+    need = (need + ram - 1) / ram * ram;
+    return need > have ? (size_t)need : 0;
 }
 
 /* File mapping handle for the Xbox memory region.
@@ -3695,6 +3745,28 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
     /* The mapped range, which is not necessarily RAM. Mirrors are placed
      * at multiples of this, so growing it is what stops a title's
      * above-RAM allocations from aliasing low memory. */
+    {
+        const char *pg = recomp_env(RENV_XBE_PAGING);
+        if (pg && *pg) xbe_sections_set_paging(*pg != '0');
+    }
+    g_xbox_heap_cap = 0;
+    if (xbe_sections_paging()) {
+        uint32_t heap_top = 0;
+        size_t grown = paging_map_size(xbe, xbe_size, &heap_top);
+        xbe_sections_reset();
+        if (grown) {
+            /* The heap stops at the unrounded end, which is what RAM can
+             * back; the rounding slack above it is xbox_ReserveAlloc's. With
+             * both reaching the top of the map, a large MEM_RESERVE in a
+             * fragmented heap would be granted over live heap blocks. */
+            fprintf(stderr, "  XBE section paging: mapping %zu MB for %zu MB of RAM "
+                    "so the heap sits above the whole image (heap to 0x%08X, "
+                    "reservations above)\n",
+                    grown >> 20, g_xbox_total_ram >> 20, heap_top);
+            g_xbox_map_size = grown;
+            g_xbox_heap_cap = heap_top;
+        }
+    }
     g_memory_size = g_xbox_map_size ? g_xbox_map_size : g_xbox_total_ram;
 
     /*
@@ -4004,9 +4076,29 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
             /* Determine copy size (raw_size may exceed vsize due to alignment) */
             DWORD copy_size = (sec_raw_size < sec_vsize) ? sec_raw_size : sec_vsize;
+            DWORD sec_flags = *(const DWORD *)(sh + SECTHDR_FLAGS);
+            int have_data = (copy_size == 0) ||
+                            (sec_raw_off + copy_size <= xbe_size);
+
+            /* Paging: every section is registered with its bytes; only the
+             * preload ones are copied now. The others keep their VA (they
+             * still count in the image range below) and stay zeroed until
+             * the title's XeLoadSection, as on the console. */
+            int deferred = 0;
+            if (xbe_sections_paging()) {
+                DWORD hdr_va = sect_headers_va + si * SECTHDR_SIZE;
+                if (xbe_sections_add(hdr_va, sec_flags, sec_va, sec_vsize,
+                                     have_data && copy_size ? xbe + sec_raw_off : NULL,
+                                     have_data ? copy_size : 0) != 0)
+                    fprintf(stderr, "  WARNING: section %u (%s) not registered for "
+                            "paging -- loaded at boot\n", si, sec_name);
+                else if (!(sec_flags & XBE_SECTION_FLAG_PRELOAD))
+                    deferred = 1;
+            }
 
             /* Zero the full virtual size first (handles BSS) */
-            memset(XBOX_VA(sec_va), 0, sec_vsize);
+            if (!deferred)
+                memset(XBOX_VA(sec_va), 0, sec_vsize);
 
             /*
              * Copy initialized data from XBE.
@@ -4019,16 +4111,18 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
              * including the kernel thunk table, which then resolved 0 imports
              * and looked like a title that calls no kernel functions.
              */
-            int have_data = (copy_size == 0) ||
-                            (sec_raw_off + copy_size <= xbe_size);
-            if (copy_size > 0 && have_data) {
-                memcpy(XBOX_VA(sec_va), xbe + sec_raw_off, copy_size);
-            } else if (!have_data) {
+            if (!have_data) {
+                /* Deferred or not: a paged section registered without its
+                 * bytes would load as zeroes later, with nothing said. */
                 fprintf(stderr,
                         "  WARNING: section %u (%s) raw data 0x%08X+%u runs past "
                         "the %zu-byte image -- left zeroed\n",
                         si, sec_name, sec_raw_off, copy_size, xbe_size);
                 sections_short++;
+            } else if (deferred) {
+                /* Copied on XeLoadSection. */
+            } else if (copy_size > 0) {
+                memcpy(XBOX_VA(sec_va), xbe + sec_raw_off, copy_size);
             }
 
             /* Every loaded section, executable or not. Anything that writes
@@ -4043,7 +4137,7 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
 
             /* Executable sections define the range indirect calls may target.
              * XBE section flag 0x04 is EXECUTABLE. */
-            if (*(const DWORD *)(sh + SECTHDR_FLAGS) & 0x00000004u) {
+            if (sec_flags & 0x00000004u) {
                 if (!g_xbox_code_lo || sec_va < g_xbox_code_lo)
                     g_xbox_code_lo = sec_va;
                 if (sec_va + sec_vsize > g_xbox_code_hi)
@@ -4055,13 +4149,25 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
                 total_bytes += copy_size;
             }
 
-            fprintf(stderr, "  [%2u] %-12s VA=0x%08X vsize=%-8u raw=0x%08X rsize=%-8u%s\n",
+            fprintf(stderr, "  [%2u] %-12s VA=0x%08X vsize=%-8u raw=0x%08X rsize=%-8u%s%s\n",
                     si, sec_name, sec_va, sec_vsize, sec_raw_off, sec_raw_size,
-                    (sec_raw_size < sec_vsize) ? " (BSS)" : "");
+                    (sec_raw_size < sec_vsize) ? " (BSS)" : "",
+                    deferred ? " (on load)" : "");
         }
 
         fprintf(stderr, "  Loaded %d/%u sections (%zu bytes total)\n",
                 sections_loaded, num_sections, total_bytes);
+        if (xbe_sections_paging()) {
+            /* The console's loader runs XeLoadSection on each preload section
+             * at boot: refcount 1, shared pages counted. Before the thunk
+             * table is patched below, since the copy rewrites .rdata. */
+            xbe_sections_load_preload((uint8_t *)g_memory_base, g_memory_size);
+            fprintf(stderr, "  XBE section paging: %u/%u sections resident at boot "
+                    "(%llu KB of %zu MB RAM), the rest on XeLoadSection\n",
+                    xbe_sections_resident(), xbe_sections_count(),
+                    (unsigned long long)(xbe_sections_resident_bytes() >> 10),
+                    g_xbox_total_ram >> 20);
+        }
         if (sections_short) {
             fprintf(stderr,
                     "  ERROR: %d section(s) had no data in the image -- the XBE "
@@ -4934,6 +5040,8 @@ void xbox_MemoryLayoutShutdown(void)
  *
  * Returns 0 when the mapping is no larger than RAM -- the default for titles
  * that never call xbox_SetMapSize -- which leaves the old behaviour untouched.
+ * When section paging grew the map, the heap stops at g_xbox_heap_cap and
+ * reservations start there, so the two never share a page.
  *
  * ponytail: a bump allocator with no free. A reservation is address space, the
  * range is large, and a title that reserves and releases repeatedly would need
@@ -4950,7 +5058,10 @@ uint32_t xbox_ReserveAlloc(uint32_t size, uint32_t align)
     if (!align)
         align = 4096;
     if (!g_reserve_next)
-        g_reserve_next = (uint32_t)g_xbox_total_ram;
+        g_reserve_next = g_xbox_heap_cap > g_xbox_total_ram
+                       ? g_xbox_heap_cap : (uint32_t)g_xbox_total_ram;
+    else if (g_reserve_next < g_xbox_heap_cap)
+        g_reserve_next = g_xbox_heap_cap;
 
     base = (g_reserve_next + align - 1) & ~(align - 1);
     if ((size_t)base + size > g_memory_size)

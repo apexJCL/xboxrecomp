@@ -388,6 +388,41 @@ int main(int argc, char **argv)
             munmap(sentinel, (size_t)host_page);
     }
 
+    /*
+     * 8. Section paging grows the map but stops the heap where RAM ends, and
+     *    a pure reservation comes from above that, never over a heap block.
+     *
+     * With the heap and xbox_ReserveAlloc both reaching the top of a grown
+     * map, a large MEM_RESERVE in a fragmented heap was granted at
+     * 0x04000000 -- inside the heap, over live blocks.
+     */
+    {
+        xbox_SetSectionPaging(1);
+        BOOL ok8 = xbox_MemoryLayoutInit(xbe, n);
+        check(ok8, "init succeeds with section paging", NULL);
+        if (ok8) {
+            char d[160];
+            uint32_t hi = 0, blk, res;
+            snprintf(d, sizeof d, "map %zu MB, RAM %zu MB, heap top 0x%08X",
+                     g_xbox_map_size >> 20, g_xbox_total_ram >> 20,
+                     (uint32_t)XBOX_HEAP_TOP);
+            check(g_xbox_map_size > g_xbox_total_ram, "paging: the map grew past RAM", d);
+            check(XBOX_HEAP_TOP > g_xbox_total_ram && XBOX_HEAP_TOP < g_xbox_map_size,
+                  "paging: the heap stops below the top of the map", d);
+            while ((blk = xbox_HeapAlloc(0x100000, 0x1000)) != 0)
+                if (blk + 0x100000 > hi) hi = blk + 0x100000;
+            res = xbox_ReserveAlloc(0x400000, 0x1000);
+            snprintf(d, sizeof d, "heap blocks end 0x%08X, reserve 0x%08X, heap top 0x%08X",
+                     hi, res, (uint32_t)XBOX_HEAP_TOP);
+            check(hi <= XBOX_HEAP_TOP, "paging: no heap block past the heap top", d);
+            check(res && res >= XBOX_HEAP_TOP && res + 0x400000 <= g_xbox_map_size,
+                  "paging: a reservation lands above the heap", d);
+            xbox_MemoryLayoutShutdown();
+        }
+        xbox_SetSectionPaging(0);
+        xbox_SetMapSize(0);
+    }
+
     printf("\n%d failure(s)\n", failures);
     free(xbe);
     return failures ? 1 : 0;
