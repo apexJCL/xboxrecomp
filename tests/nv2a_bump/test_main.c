@@ -142,8 +142,9 @@ int main(void)
     CHECK(d3d8_combiners_generate_hlsl(&cs, text, (int)sizeof text) > 0);
     CHECK(strstr(text, "float4 bump[4]; float4 bumpls[4];"));
     CHECK(strstr(text, "float2 ds = round(x8.bg * 255.0);"));
-    CHECK(strstr(text, "ds = (ds >= 128.0 ? ds - 256.0 : ds) / 127.0;"));
-    CHECK(!strstr(text, "/ 128.0"));
+    /* the NV2A decodes s/128 (pgraph Bump_map hardware goldens), not /127 */
+    CHECK(strstr(text, "ds = (ds >= 128.0 ? ds - 256.0 : ds) / 128.0;"));
+    CHECK(!strstr(text, "/ 127.0"));
     CHECK(strstr(text, "ds = float2(dot(ds, bump[1].xw), dot(ds, bump[1].yz));"));
     /* the offset in the coordinate's units, before tex_scale */
     CHECK(strstr(text, "x9 = tex1.Sample(samp1, (i.tc1.xy + ds) * tex_scale[1].xy);"));
@@ -156,7 +157,8 @@ int main(void)
     CHECK(d3d8_combiners_generate_msl(&cs, text, (int)sizeof text) > 0);
     CHECK(strstr(text, "float4 bump[4]; float4 bumpls[4];"));
     CHECK(strstr(text, "float2 ds = round(x8.bg * 255.0);"));
-    CHECK(strstr(text, "ds = select(ds, ds - 256.0, ds >= 128.0) / 127.0;"));
+    CHECK(strstr(text, "ds = select(ds, ds - 256.0, ds >= 128.0) / 128.0;"));
+    CHECK(!strstr(text, "/ 127.0"));
     CHECK(strstr(text, "ds = float2(dot(ds, pc.bump[1].xw), dot(ds, pc.bump[1].yz));"));
     CHECK(strstr(text, "x9 = tex1.sample(samp1, (i.t1.xy + ds) * pc.tex_scale[1].xy,"
                        " bias(pc.tex_bias[1]));"));

@@ -146,7 +146,9 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
                                       || m == NV2A_TEXMODE_BUMPENVMAP_LUM)) {
             /* The input stage's blue and green are du and dv as signed
              * bytes: textures arrive as unsigned BGRA8, so the byte is taken
-             * back to two's complement and over 127, as xemu's sign3. The
+             * back to two's complement and over 128. The NV2A decodes s/128
+             * (-1 to 127/128), not xemu's s/127: the nxdk_pgraph_tests
+             * Bump_map hardware goldens match /128 and miss with /127. The
              * matrix is bump[] as the slots hold it, 00 01 11 10
              * (nv2a_ps_consts.bump). The offset is added in the
              * coordinate's own units, before tex_scale (texels for a
@@ -154,7 +156,7 @@ int d3d8_combiners_generate_hlsl(const NV2ACombinerState *state,
             int in = state->tex_input[i];
             EMIT("    {\n");
             EMIT("        float2 ds = round(x%d.bg * 255.0);\n", 8 + in);
-            EMIT("        ds = (ds >= 128.0 ? ds - 256.0 : ds) / 127.0;\n");
+            EMIT("        ds = (ds >= 128.0 ? ds - 256.0 : ds) / 128.0;\n");
             EMIT("        ds = float2(dot(ds, bump[%d].xw), dot(ds, bump[%d].yz));\n", i, i);
             if (state->rt_offset)
                 EMIT("        x%d = tex%d.Sample(samp%d, (i.tc%d.xy + ds) * tex_scale[%d].xy"

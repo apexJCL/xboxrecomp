@@ -164,7 +164,7 @@ static int snap_check(void)
 }
 
 /* BUMPENVMAP (bump_on): stage 1 in mode 6 reads stage 0, stage 2 in mode 7
- * reads stage 1. The input's blue and green over 127, the matrix as the
+ * reads stage 1. The input's blue and green over 128, the matrix as the
  * slots hold it (00 01 11 10: .xw and .yz), the offset before tex_scale,
  * the luminance on the whole texel. Without bump_on the same modes are the
  * plain 2D sample, so the hashed cases above stay the stock text. */
@@ -186,7 +186,7 @@ static int bump_check(void)
         return 1;
     if (!strstr(text, "float2 ds = round(x8.bg * 255.0);")
             || !strstr(text, "float2 ds = round(x9.bg * 255.0);")
-            || !strstr(text, "ds = (ds >= 128.0 ? ds - 256.0 : ds) / 127.0;")
+            || !strstr(text, "ds = (ds >= 128.0 ? ds - 256.0 : ds) / 128.0;")
             || !strstr(text, "ds = float2(dot(ds, bump[1].xw), dot(ds, bump[1].yz));")
             || !strstr(text, "x9 = tex1.Sample(samp1, (i.tc1.xy + ds) * tex_scale[1].xy);")) {
         printf("FAIL: the BUMPENVMAP stage 1 text\n");

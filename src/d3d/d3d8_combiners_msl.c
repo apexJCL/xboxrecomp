@@ -133,13 +133,15 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
         } else if (state->bump_on && (m == NV2A_TEXMODE_BUMPENVMAP
                                       || m == NV2A_TEXMODE_BUMPENVMAP_LUM)) {
             /* As the HLSL: the input's blue and green as signed bytes over
-             * 127 (xemu's sign3), the matrix as the slots hold it (00 01 11
-             * 10), the offset in the coordinate's own units before
-             * tex_scale; mode 7 scales the whole texel by the input's red. */
+             * 128, as the NV2A decodes them (the pgraph Bump_map hardware
+             * goldens; xemu's sign3 divides by 127), the matrix as the
+             * slots hold it (00 01 11 10), the offset in the coordinate's
+             * own units before tex_scale; mode 7 scales the whole texel by
+             * the input's red. */
             int in = state->tex_input[i];
             EMIT("    {\n");
             EMIT("        float2 ds = round(x%d.bg * 255.0);\n", 8 + in);
-            EMIT("        ds = select(ds, ds - 256.0, ds >= 128.0) / 127.0;\n");
+            EMIT("        ds = select(ds, ds - 256.0, ds >= 128.0) / 128.0;\n");
             EMIT("        ds = float2(dot(ds, pc.bump[%d].xw), dot(ds, pc.bump[%d].yz));\n",
                  i, i);
             if (state->rt_offset)
