@@ -60,6 +60,12 @@ void enhance_actions_drop_owner(int owner);
  * never fires, consumes an input or reads as down. */
 void enhance_actions_set_dormant(int owner, int on);
 int enhance_action_dormant(int id);
+/* Whose action it is, for the Controls page's groups: the mod table index,
+ * ENHANCE_ACT_TOOLKIT for enhance_actions_init's own, ENHANCE_ACT_GAME for
+ * one the title registered with no owner. */
+#define ENHANCE_ACT_TOOLKIT (-1)
+#define ENHANCE_ACT_GAME    (-2)
+int enhance_action_mod(int id);
 /* Which row its bindings come from: an ENHANCE_ACT_SRC_*, with the file
  * key it read in key (empty for env, menu and default), and the row's name
  * as the descriptor dump spells it ("env", "user_alias", ...). */

@@ -151,6 +151,18 @@ int enhance_cfg_report_unused(void);
  * not typos. "camera.freecam" is not the mod's and is still reported. */
 void enhance_cfg_mark_read_prefix(const char *prefix);
 
+/* The mods' ids (xbox_mod_init adds each; NULL clears), so a stray key
+ * names its owner: the longest id that prefixes the key, after an optional
+ * "mods.", "input.controls." or "input.actions.", at mark_read_prefix's
+ * boundary. The report then reads "unused key mods.lod.distnce,
+ * config/config.toml:3 (mod lod)". enhance_cfg_owner_of gives that id or
+ * NULL; enhance_cfg_unused_of lists the owner's unread keys (the Mods
+ * page's "Unknown keys"; pointers valid until the next load) and returns
+ * how many it filled. */
+void enhance_cfg_owner_add(const char *id);
+const char *enhance_cfg_owner_of(const char *key);
+int enhance_cfg_unused_of(const char *owner, const char **keys, int max);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1866,6 +1866,52 @@ static void test_input_pad(void)
     (void)id;
 }
 
+/* A stray key names the mod it belongs to (mod-settings B.11): the
+ * longest id that prefixes it, under mods., input.controls. or
+ * input.actions. or at the mod's own prefix, at the same boundary as
+ * mark_read_prefix. */
+static void test_owners(void)
+{
+    const char *keys[8], *out;
+
+    config_reset_env();
+    remove_defaults();
+    MKDIR("ecfg_own");
+    MKDIR("ecfg_own/config");
+    write_file("ecfg_own/config/config.toml",
+               "[camera]\nfree = true\nfreecam = 1\n[mods.lod]\ndistnce = 2\n"
+               "[input.actions]\n\"cam.toggle\" = [\"F6\"]\n");
+    CHECK(enhance_cfg_init("ecfg_own", NULL) == 1);
+    enhance_cfg_owner_add(NULL);
+    enhance_cfg_owner_add("cam");
+    enhance_cfg_owner_add("camera.free");
+    enhance_cfg_owner_add("lod");
+    CHECK(!strcmp(enhance_cfg_owner_of("camera.free_speed"), "camera.free"));
+    CHECK(!strcmp(enhance_cfg_owner_of("mods.lod.distnce"), "lod"));
+    CHECK(!strcmp(enhance_cfg_owner_of("input.actions.cam.toggle"), "cam"));
+    CHECK(!strcmp(enhance_cfg_owner_of("input.controls.lod.near"), "lod"));
+    CHECK(enhance_cfg_owner_of("camera.freecam") == NULL);   /* not at a boundary */
+    CHECK(enhance_cfg_owner_of("camera") == NULL);
+    CHECK(enhance_cfg_owner_of("lodge.x") == NULL);
+
+    CHECK(enhance_cfg_bool("camera.free", 0) == 1);
+    CHECK(enhance_cfg_unused_of("lod", keys, 8) == 1 && !strcmp(keys[0], "mods.lod.distnce"));
+    CHECK(enhance_cfg_unused_of("cam", keys, 8) == 1 &&
+          !strcmp(keys[0], "input.actions.cam.toggle"));
+    CHECK(enhance_cfg_unused_of("camera.free", keys, 8) == 0);
+    CHECK(enhance_cfg_unused_of(NULL, keys, 8) == 0);
+    capture_begin();
+    CHECK(enhance_cfg_report_unused() == 3);
+    out = capture_end();
+    CHECK(strstr(out, "[ENHANCE] unused key mods.lod.distnce, ecfg_own/config/config.toml:5 (mod lod)\n")
+          != NULL);
+    CHECK(strstr(out, "[ENHANCE] unused key camera.freecam, ecfg_own/config/config.toml:3\n")
+          != NULL);
+    enhance_cfg_owner_add(NULL);
+    CHECK(enhance_cfg_owner_of("mods.lod.distnce") == NULL);
+    enhance_cfg_shutdown();
+}
+
 int main(void)
 {
     test_subset();
@@ -1882,6 +1928,7 @@ int main(void)
     test_input();
     test_input_pad();
     test_exe_dir();
+    test_owners();
     printf("enhance_cfg: %d checks, %d failed\n", s_checks, s_fail);
     return s_fail ? 1 : 0;
 }

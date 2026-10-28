@@ -32,6 +32,12 @@ command -v ninja >/dev/null && gen=(-G Ninja)
 # sdl2-compat) reads SDL_AUDIODRIVER.
 export SDL_AUDIO_DRIVER=${SDL_AUDIO_DRIVER:-${SDL_AUDIODRIVER:-dummy}}
 export SDL_AUDIODRIVER=${SDL_AUDIODRIVER:-$SDL_AUDIO_DRIVER}
+# The tests read the runtime's env rows, so a RECOMP_* left in the shell
+# (RECOMP_MENU=0 from a golden run) turns passing tests into failures. Each
+# test sets the rows it needs itself.
+while IFS= read -r v; do
+    unset "$v"
+done < <(compgen -e | grep '^RECOMP_' || true)
 
 is_project() {
     grep -qiE '^[[:space:]]*project[[:space:]]*\(' "$1/CMakeLists.txt"

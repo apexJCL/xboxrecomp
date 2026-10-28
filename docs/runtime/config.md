@@ -972,21 +972,58 @@ a second after the close.
 The pages are Render, Pack, Game (a title's own items, from
 `enhance_menu_add`), Mods, Stats, Controls, Debug and Save.
 
-- **Controls** lists every action with its bindings. A on a row captures a
+- **Controls** lists every action with its bindings, grouped by owner
+  under a header: Toolkit first, then Game (actions a title registered),
+  then one group per mod under its title. A mod that is off has
+  "(mod off)" on its header; its bindings still hold their inputs, so
+  enabling it moves nothing. A mod's captured controls (BUTTON, STICK)
+  are on its own page only. A on a row captures a
   new one: the next key, or the pad buttons held together for 400 ms (one
   button, a two-button chord, or a modifier chord such as `guide+a`). It
   is checked by the rules above: a key or a single button the game uses is
   refused with the reason in the footer, as at load. The binding is live
   at once and is added to the row's list; X clears the list (`menu.open`
-  always keeps one). Esc or 10 s without input cancels. A Mouse group
+  always keeps one). An input another action holds is refused with its
+  owner and label ("F6 refused: Free camera: Toggle flight has it (F6)
+  (mod off); clear it there first"), a mod that is off included, and so
+  is a key a mod's captured control names ("R refused: Free camera: Rise
+  uses it"). Esc or 10 s without input cancels. A Mouse group
   ends the page: `input.mouse_capture` as a choice, the release key and
   the free keys as information, and the capture state now (`captured`,
   `free: click to capture`, `free: F9`).
-- **Mods** has one row per mod: its `mods.<name>` toggle, and, entered
-  with A, the items the mod added. A mod that gave `on_enable` turns off
-  and on at once; one that did not shows "applies at restart". Turning a
-  mod off stops nothing by itself: its frame hooks and armed actions keep
-  running, and the mod gates them while off.
+- **Mods** has one row per mod, under its descriptor title (else its name):
+  its switch (left and right), and, entered
+  with A, the mod's page. A mod that gave `on_enable` turns off and on at
+  once; one that did not shows "applies at restart". Turning a mod off
+  stops nothing by itself: its frame hooks and armed actions keep
+  running, and the mod gates them while off. The page lists, top down:
+  - the title and `v<version>`, then Author, About (the summary,
+    wrapped to the panel at any width) and State: `On`, `Off`,
+    `Off (mods."<id>" = false)` when that key holds it off, `Failed:
+    <reason>`, or `On at restart` / `Off at restart` for a change waiting
+    for the next start;
+  - Enabled, the same switch as the list's. Turning it on with
+    `mods."<id>" = false` in the file stages removing that key;
+  - for a v3 mod, **Controls**: an action as on the Controls page (its
+    help in the footer, "(mod off)" after its bindings while the mod is
+    off); a BUTTON or STICK control with its bindings and the keys behind
+    them (`rt, R (keys R)`), its `when` note dimmed, read only for now
+    (the footer names the `[input.controls]` key to edit); an INFO
+    control as text;
+  - **Settings**, one row per descriptor setting: a toggle, a choice or a
+    slider by `step`, with its `unit` after the value and its live class
+    (below). A row an environment variable forces is dimmed with "set by
+    `RECOMP_...`" and never saved;
+  - the items the mod added with `menu_add` (a v2 mod has only these);
+  - **Reset this mod**: stages the mod's settings and action bindings
+    back to the stock: the defaults file's value, else the descriptor's
+    default (Save writes it, which removes the keys). Enabled is not
+    reset, and other mods and unknown keys are left alone;
+  - **Unknown keys**: the mod's keys nothing read, "not read; kept".
+
+  A mod that failed lists its controls and settings as "unavailable" and
+  has no Reset. The footer shows the selected row's help whenever no
+  message is showing.
 - **Pack** shows the pack loaded, its toggles and the last misses, a copy
   of the miss ring taken at the flip while the page is shown.
 - **Stats** and **Debug** show live numbers: frame rate and time, the
@@ -1005,17 +1042,21 @@ The pages are Render, Pack, Game (a title's own items, from
   `config.toml` that is a symlink is written at its target. The log says
   `[ENHANCE] menu: saved 2 keys to ./config/config.toml`. Under
   `RECOMP_CONFIG=none` Save is off. "Reset to defaults" asks once, then
-  puts every item and binding back to its default; Save keeps that.
+  puts every item and binding back to its default; Save keeps that. A
+  mod setting or action read from a retired key in the player's file is
+  moved to its current key by the first Save, even one with no change.
 
-A value forced by an environment variable shows "(environment)" and is
-read only. Each item takes effect at one of four points, its live class;
-the footer names the selected row's:
+A value forced by an environment variable shows "set by `RECOMP_...`"
+(or "(environment)" when the row has no variable name) and is read only;
+changing it says so in the footer. Each item takes effect at one of five
+points, its live class; the footer names the selected row's:
 
 | Class | Takes effect | Items |
 |---|---|---|
 | live | at the next flip | `render.aniso`, `present.filter`, `present.pacing`, `display.overscan`, `display.movie`, `overlay.stats`, `input.mouse_capture`, every action binding, a mod with `on_enable` |
 | at the flip | at the next flip, rebuilding the targets or the texture cache | `render.scale`, `present.fullscreen`, `textures.pack`, `textures.font`, `textures.text` |
 | next stage | at a later game point (a title's item) | none of the toolkit's |
+| next activation | when the mod next turns its feature on | a mod setting the descriptor marks so (the free camera's HUD choice) |
 | at restart | at the next start; the change is saved, not applied | `display.aspect`, `present.surface`, a mod without `on_enable` |
 
 The `textures.pack` toggle turns the loaded pack off for this session only
@@ -1313,7 +1354,11 @@ never bound.
 **Unknown keys.** A `mods."<id>..."` key a descriptor does not declare,
 a key of an id the build does not have, and an `[input.controls]` key no
 control declares are reported as `unused key`. Neither Save nor Reset
-removes them.
+removes them. The line names the mod a key belongs to, the longest mod
+id that prefixes it (under `mods.`, `input.controls.` or
+`input.actions.`, or at the id itself, followed by `.`, `_` or nothing):
+`[ENHANCE] unused key mods.lod.distnce, config/config.toml:5 (mod lod)`.
+The mod's page lists the same keys under "Unknown keys".
 
 ### The descriptor dump
 

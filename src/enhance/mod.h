@@ -319,6 +319,16 @@ int xbox_mod_items(int i, const struct enhance_item **out, int max);
  * (xbox_mod_fail_reason says why). Settings are by index into it. */
 const struct xbox_mod_desc *xbox_mod_desc_of(int i);
 const char *xbox_mod_fail_reason(int i);    /* "" unless failed */
+/* What the detail view lists: the descriptor of a valid mod, or of a
+ * refused one whose tables passed the count checks (its rows are marked
+ * unavailable; a name or a label may be NULL there). NULL otherwise. */
+const struct xbox_mod_desc *xbox_mod_desc_shown(int i);
+/* Setting idx's stock value: config.default.toml's key, then its aliases,
+ * else def, adjusted as at load. A Save that stages it removes the key. */
+double xbox_mod_setting_stock(int i, uint32_t idx);
+/* v as the TOML literal the key is written with ("1.0", "true", "\"keep\"");
+ * 0 for a bad index. */
+int xbox_mod_setting_literal(int i, uint32_t idx, double v, char *out, size_t n);
 double xbox_mod_setting_value(int i, uint32_t idx);
 /* The precedence row the value came from: "env", "user", "user_alias",
  * "defaults", "defaults_alias", "default" (or "menu" once set live). */

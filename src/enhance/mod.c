@@ -100,6 +100,8 @@ struct ctl_rt {
 struct mod_rt {
     struct xbox_mod_desc d;     /* the descriptor, fields past its size zeroed */
     int has_desc;               /* m->desc was given */
+    int tables_ok;              /* its tables passed the count checks: the
+                                 * menu may list a refused one's rows */
     int valid;                  /* it passed validation */
     int enable;                 /* the enable setting's index, or -1 */
     const char *outcome;        /* "yes", "dormant", "no", "failed" */
@@ -375,6 +377,7 @@ static int desc_check(struct mod_rt *r, const struct xbox_mod *m)
         REFUSE("%u controls and no table", d->n_controls);
     if (d->n_settings > SET_MAX || d->n_controls > SET_MAX)
         REFUSE("more than %d settings or controls", SET_MAX);
+    r->tables_ok = 1;
     for (i = 0; i < d->n_settings; i++) {
         const struct xbox_mod_setting *s = &d->settings[i];
         if (!s->name || !*s->name)
@@ -904,6 +907,7 @@ static int mod_init(int describe)
     memset(s_mod, 0, sizeof s_mod);
     memset(&s_api, 0, sizeof s_api);
     enhance_actions_drop_mods();
+    enhance_cfg_owner_add(NULL);
     if (!s_table || !s_table[0]) {
         if (!describe)
             nv2a_batch_filter_set(NULL);
@@ -956,6 +960,8 @@ static int mod_init(int describe)
         /* The Mods page's key: a mod switched off there is not even inited
          * at the next start, so it registers nothing and costs nothing. */
         s_want[i] = enhance_cfg_bool(s_key[i], 1);
+        if (m->name && *m->name)
+            enhance_cfg_owner_add(m->name);
         r->has_desc = m->desc != NULL;
         if (r->has_desc) {
             if (!desc_check(r, m) || !desc_resolve(i)) {
@@ -1222,6 +1228,44 @@ const struct xbox_mod_desc *xbox_mod_desc_of(int i)
 int xbox_mod_has_desc(int i)
 {
     return i >= 0 && i < s_count && s_mod[i].has_desc;
+}
+
+const struct xbox_mod_desc *xbox_mod_desc_shown(int i)
+{
+    if (i < 0 || i >= s_count || !s_mod[i].has_desc)
+        return NULL;
+    return s_mod[i].valid || s_mod[i].tables_ok ? &s_mod[i].d : NULL;
+}
+
+double xbox_mod_setting_stock(int i, uint32_t idx)
+{
+    const struct set_rt *r = set_of(i, idx);
+    const struct xbox_mod_setting *s;
+    const recomp_cfg *c = enhance_cfg_defaults();
+    char raw[256];
+    double v;
+    int k, bad = 0;
+
+    if (!r)
+        return 0;
+    s = &s_mod[i].d.settings[idx];
+    /* The defaults file's row as setting_resolve reads it (its key, then
+     * its aliases), without the user files and the env: what Reset and a
+     * Save that removes the key fall back to. */
+    if (c && from_file(s, c, r->key, &v, &bad, raw, sizeof raw))
+        return bad ? s->def : adjust(s, v);
+    for (k = 0; c && s->aliases && s->aliases[k]; k++)
+        if (from_file(s, c, s->aliases[k], &v, &bad, raw, sizeof raw))
+            return bad ? s->def : adjust(s, v);
+    return s->def;
+}
+
+int xbox_mod_setting_literal(int i, uint32_t idx, double v, char *out, size_t n)
+{
+    if (!set_of(i, idx) || !out || !n)
+        return 0;
+    literal(&s_mod[i].d.settings[idx], v, out, n);
+    return 1;
 }
 
 const char *xbox_mod_fail_reason(int i)

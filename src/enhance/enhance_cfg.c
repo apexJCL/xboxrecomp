@@ -617,24 +617,95 @@ void enhance_cfg_mark_read_prefix(const char *prefix)
         }
 }
 
+/* The mods' ids, for naming a stray key's owner (mod-settings B.11). */
+#define OWNERS_MAX 64
+static char s_owner[OWNERS_MAX][64];
+static int s_nowner;
+
+void enhance_cfg_owner_add(const char *id)
+{
+    if (!id) {
+        s_nowner = 0;
+        return;
+    }
+    if (s_nowner < OWNERS_MAX && *id && strlen(id) < sizeof s_owner[0])
+        snprintf(s_owner[s_nowner++], sizeof s_owner[0], "%s", id);
+}
+
+const char *enhance_cfg_owner_of(const char *key)
+{
+    static const char *const pre[] = { "mods.", "input.controls.", "input.actions." };
+    const char *best = NULL;
+    size_t bn = 0, n, k;
+    int i;
+
+    if (!key)
+        return NULL;
+    /* A mod's keys sit under its tables or at its own prefix
+     * ("camera.free_speed"); the boundary rule is mark_read_prefix's. */
+    for (k = 0; k < sizeof pre / sizeof pre[0]; k++)
+        if (!strncmp(key, pre[k], strlen(pre[k]))) {
+            key += strlen(pre[k]);
+            break;
+        }
+    for (i = 0; i < s_nowner; i++) {
+        n = strlen(s_owner[i]);
+        if (n > bn && !strncmp(key, s_owner[i], n) &&
+            (!key[n] || key[n] == '.' || key[n] == '_')) {
+            best = s_owner[i];
+            bn = n;
+        }
+    }
+    return best;
+}
+
+/* A key nothing read, in no higher file: what the report lists. */
+static int unused_at(int i, size_t k)
+{
+    const char *key = recomp_cfg_key_at(s_file[i], k);
+    int used = s_flags[i] ? s_flags[i][k] & 1 : 1, j;
+    /* A key a higher file overrides (the title file over the user file,
+     * either over the defaults) is used even if this copy was never read. */
+    for (j = 0; !used && j < i; j++)
+        used = recomp_cfg_find(s_file[j], key) >= 0;
+    return !used;
+}
+
+int enhance_cfg_unused_of(const char *owner, const char **keys, int max)
+{
+    const char *o;
+    int i, n = 0;
+    size_t k;
+
+    for (i = 0; owner && i < ENHANCE_FILES; i++)
+        for (k = 0; k < recomp_cfg_count(s_file[i]); k++) {
+            const char *key = recomp_cfg_key_at(s_file[i], k);
+            if (!unused_at(i, k) || !(o = enhance_cfg_owner_of(key)) || strcmp(o, owner))
+                continue;
+            if (n < max && keys)
+                keys[n] = key;
+            n++;
+        }
+    return n < max ? n : max;
+}
+
 int enhance_cfg_report_unused(void)
 {
     int i, n = 0;
     size_t k;
     for (i = 0; i < ENHANCE_FILES; i++)
         for (k = 0; k < recomp_cfg_count(s_file[i]); k++) {
-            const char *key = recomp_cfg_key_at(s_file[i], k);
-            int used = s_flags[i] ? s_flags[i][k] & 1 : 1, j;
-            /* A key a higher file overrides (the title file over the user
-             * file, either over the defaults) is used even if this copy
-             * was never read. */
-            for (j = 0; !used && j < i; j++)
-                used = recomp_cfg_find(s_file[j], key) >= 0;
-            if (!used) {
+            const char *key = recomp_cfg_key_at(s_file[i], k), *o;
+            if (!unused_at(i, k))
+                continue;
+            o = enhance_cfg_owner_of(key);
+            if (o)
+                fprintf(stderr, "[ENHANCE] unused key %s, %s:%d (mod %s)\n", key,
+                        recomp_cfg_name(s_file[i]), recomp_cfg_line(s_file[i], key), o);
+            else
                 fprintf(stderr, "[ENHANCE] unused key %s, %s:%d\n", key,
                         recomp_cfg_name(s_file[i]), recomp_cfg_line(s_file[i], key));
-                n++;
-            }
+            n++;
         }
     return n;
 }

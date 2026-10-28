@@ -509,7 +509,7 @@ static void test_mods(void)
 
     /* A mod without on_enable: the toggle is for the next start. */
     CHECK(enhance_menu_select_row("plainmod"));
-    tap(0x0D);
+    tap(0x27);
     CHECK(xbox_mod_state(1) == XBOX_MOD_RESTART);
     CHECK(strstr(enhance_menu_status(), "applies at restart") != NULL);
     open_menu();
@@ -561,8 +561,8 @@ static void test_mods_desc_toggle(void)
     start_with(ARMED, k_dmods);
     open_menu();
     CHECK(enhance_menu_set_page("Mods"));
-    CHECK(row_value("dmod") && !strcmp(row_value("dmod"), "false"));
-    CHECK(enhance_menu_select_row("dmod"));
+    CHECK(row_value("Descriptor mod") && !strcmp(row_value("Descriptor mod"), "false"));
+    CHECK(enhance_menu_select_row("Descriptor mod"));
     tap(0x27);
     xbox_mod_frame();
     CHECK(xbox_mod_enabled(0));
@@ -578,8 +578,8 @@ static void test_mods_desc_toggle(void)
     start_with(ARMED "[dmod]\nenabled = \"on\"\n", k_dmods);
     open_menu();
     CHECK(enhance_menu_set_page("Mods"));
-    CHECK(!strcmp(row_value("dmod"), "true"));
-    CHECK(enhance_menu_select_row("dmod"));
+    CHECK(!strcmp(row_value("Descriptor mod"), "true"));
+    CHECK(enhance_menu_select_row("Descriptor mod"));
     tap(0x25);
     xbox_mod_frame();
     CHECK(pending_has("dmod.enabled", NULL));
@@ -590,7 +590,7 @@ static void test_mods_desc_toggle(void)
     start_with(ARMED "[mods]\ndmod = false\n", k_dmods);
     open_menu();
     CHECK(enhance_menu_set_page("Mods"));
-    CHECK(enhance_menu_select_row("dmod"));
+    CHECK(enhance_menu_select_row("Descriptor mod"));
     tap(0x27);
     xbox_mod_frame();
     CHECK(pending_has("dmod.enabled", "\"on\""));
@@ -615,7 +615,9 @@ static void test_capture_duplicate(void)
     poll0();
     CHECK(!enhance_menu_capturing());
     CHECK(strstr(enhance_menu_status(), "is bound already") != NULL);
-    CHECK(!strcmp(row_value("Poke"), "Left_Stick_Click+BACK@400"));
+    /* The table parses pad names in lowercase only, so the row says this
+     * one never fires (mod-settings B.4). */
+    CHECK(!strcmp(row_value("Poke"), "Left_Stick_Click+BACK@400 (refused)"));
     CHECK(enhance_menu_unsaved() == 0);
     hold_btn(XBOX_GAMEPAD_BACK | XBOX_GAMEPAD_LEFT_THUMB, 0);
     advance(16);
@@ -868,6 +870,372 @@ static void test_snapshot(void)
 
 /* ---- 8. each page's draw list -------------------------------------------- */
 
+/* ---- 3b. a descriptor mod's page (mod-settings D5) ----------------------- */
+
+static const char *const k_bm_hud[] = { "keep", "hide", NULL };
+static const char *const k_bm_speed_alias[] = { "bmod_old_speed", NULL };
+static const struct xbox_mod_setting k_bm_set[] = {
+    { "enabled", "bmod.enabled", NULL, NULL, "Enabled", NULL, NULL,
+      XBOX_SET_BOOL, ENHANCE_LIVE, XBOX_SET_ENABLE, 1, 0, 0, 0, NULL },
+    { "speed", "bmod.speed", NULL, k_bm_speed_alias, "Speed",
+      "Units per second, times the base speed.", "x",
+      XBOX_SET_FLOAT, ENHANCE_LIVE, 0, 1, 0.05, 20, 0.05, NULL },
+    { "hud", "bmod.hud", NULL, NULL, "HUD while flying", "Keep or hide the HUD.", NULL,
+      XBOX_SET_ENUM, ENHANCE_LIVE_ACTIVATE, 0, 0, 0, 0, 0, k_bm_hud },
+    { "quality", "bmod.quality", NULL, NULL, "Quality", NULL, NULL,
+      XBOX_SET_INT, ENHANCE_LIVE_RESTART, 0, 2, 0, 4, 1, NULL },
+    { "pinned", "bmod.pinned", "RECOMP_HEAP_QUARANTINE", NULL, "Pinned", NULL, NULL,
+      XBOX_SET_INT, ENHANCE_LIVE, 0, 0, 0, 100, 1, NULL },
+};
+static const char *const k_bm_toggle_def[] = { "F7", NULL };
+static const char *const k_bm_rise_def[] = { "rt", "x", "R", NULL };
+static const char *const k_bm_move_def[] = { "left_stick", NULL };
+static const char *const k_bm_mouse_def[] = { "Look", NULL };
+static const struct xbox_mod_control k_bm_ctl[] = {
+    { "toggle", "Toggle flight", "Start or stop flying.", NULL, XBOX_CTL_ACTION, k_bm_toggle_def,
+      NULL, NULL },
+    { "rise", "Rise", NULL, "while flying", XBOX_CTL_BUTTON, k_bm_rise_def, NULL, NULL },
+    { "move", "Move", NULL, "while flying", XBOX_CTL_STICK, k_bm_move_def, NULL, NULL },
+    { "mouse", "Mouse", NULL, "while flying", XBOX_CTL_INFO, k_bm_mouse_def, NULL, NULL },
+};
+#define BM_SUMMARY "Fly a detached camera around the stage. The game pauses its camera " \
+                   "while you fly, and the HUD can hide so the shot is clean."
+static const struct xbox_mod_desc k_bm_desc = {
+    XBOX_MOD_DESC_VERSION, sizeof(struct xbox_mod_desc),
+    "B mod", BM_SUMMARY, "The test suite", "1.0",
+    k_bm_set, 5, k_bm_ctl, 4
+};
+static void bm_enable(int on, void *u) { (void)u; (void)on; }
+static int bm_init(const struct xbox_mod_api *api)
+{
+    return api->on_enable(bm_enable, NULL) ? 0 : -1;
+}
+static const struct xbox_mod k_bm = { "bmod", bm_init, NULL, &k_bm_desc };
+
+/* Refused at validation (a second "speed"), its tables fine: the page
+ * still lists what it offers, marked unavailable. */
+static const struct xbox_mod_setting k_fm_set[] = {
+    { "speed", "fmod.speed", NULL, NULL, "Speed", NULL, NULL,
+      XBOX_SET_FLOAT, ENHANCE_LIVE, 0, 1, 0, 2, 0, NULL },
+    { "speed", "fmod.speed2", NULL, NULL, "Speed again", NULL, NULL,
+      XBOX_SET_FLOAT, ENHANCE_LIVE, 0, 1, 0, 2, 0, NULL },
+};
+static const char *const k_fm_def[] = { "F4", NULL };
+static const struct xbox_mod_control k_fm_ctl[] = {
+    { "go", "Go", NULL, NULL, XBOX_CTL_ACTION, k_fm_def, NULL, NULL },
+    { "aim", "Aim", NULL, NULL, XBOX_CTL_INFO, k_bm_mouse_def, NULL, NULL },
+};
+static const struct xbox_mod_desc k_fm_desc = {
+    XBOX_MOD_DESC_VERSION, sizeof(struct xbox_mod_desc),
+    "Failing mod", "Never runs.", NULL, NULL, k_fm_set, 2, k_fm_ctl, 2
+};
+static const struct xbox_mod k_fm = { "fmod", bm_init, NULL, &k_fm_desc };
+static const struct xbox_mod *const k_bmods[] = { &k_tm, &k_bm, &k_fm, NULL };
+
+static int row_index(const char *label)
+{
+    char l[96];
+    for (int i = 0; i < enhance_menu_rows(); i++) {
+        enhance_menu_row(i, l, sizeof l, NULL, 0, NULL);
+        if (!strcmp(l, label))
+            return i;
+    }
+    return -1;
+}
+
+/* The row after the one labelled label (the next row of a group). */
+static const char *row_after(const char *label, int k)
+{
+    int i = row_index(label);
+    if (i < 0 || !enhance_menu_row(i + k, NULL, 0, s_val, sizeof s_val, NULL))
+        return NULL;
+    return s_val;
+}
+
+static void open_detail(const char *mod)
+{
+    CHECK(enhance_menu_set_page("Mods"));
+    CHECK(enhance_menu_select_row(mod));
+    tap(0x0D);
+}
+
+static void test_detail_rows(void)
+{
+    int i;
+    set_env("RECOMP_HEAP_QUARANTINE", "7");
+    start_with(ARMED "[bmod]\ntypo = 1\n", k_bmods);
+    set_env("RECOMP_HEAP_QUARANTINE", NULL);
+    open_menu();
+    open_detail("B mod");
+    /* The header, then Author, About (wrapped), State and Enabled. */
+    CHECK(enhance_menu_row(0, NULL, 0, s_val, sizeof s_val, NULL) && !strcmp(s_val, "v1.0"));
+    CHECK(row_value("B mod") != NULL);
+    CHECK(row_value("Author") && !strcmp(s_val, "The test suite"));
+    CHECK(row_value("About") != NULL);
+    CHECK(row_value("State") && !strcmp(s_val, "On"));
+    CHECK(row_value("Enabled") && !strcmp(s_val, "true"));
+    /* No selectable text: the first stop is Enabled. */
+    CHECK(!strcmp(selected_label(), "Enabled"));
+
+    /* Controls: the action's bindings, the captured ones with the keys the
+     * guest names come from, the info row; each with its note. */
+    CHECK(row_value("Toggle flight") && !strcmp(s_val, "F7"));
+    i = row_index("Toggle flight");
+    CHECK(i >= 0 && !strcmp(enhance_menu_row_help(i), "Start or stop flying."));
+    /* Two guest bindings and a host key: one separator each, none left
+     * by the host key (the test's input map gives RT 3 and X C). */
+    CHECK(row_value("Rise") && !strcmp(s_val, "rt, x, R (keys 3, C)"));
+    CHECK(row_value("Move") && !strncmp(s_val, "left_stick", 10));
+    CHECK(row_value("Mouse") && !strcmp(s_val, "Look"));
+    i = row_index("Rise");
+    CHECK(i >= 0 && strstr(enhance_menu_row_help(i), "[input.controls] \"bmod.rise\"") != NULL);
+    CHECK(enhance_menu_select_row("Rise"));
+    tap(0x0D);
+    CHECK(strstr(enhance_menu_status(), "read-only for now") != NULL);
+
+    /* Settings: each class as the descriptor gives it, the forced one
+     * read-only with its env row named. */
+    CHECK(row_value("Speed") && !strcmp(s_val, "1.00"));
+    CHECK(enhance_menu_row_live(row_index("Speed")) == ENHANCE_LIVE);
+    CHECK(!strcmp(enhance_menu_row_help(row_index("Speed")),
+                  "Units per second, times the base speed."));
+    CHECK(row_value("HUD while flying") && !strcmp(s_val, "keep"));
+    CHECK(enhance_menu_row_live(row_index("HUD while flying")) == ENHANCE_LIVE_ACTIVATE);
+    CHECK(row_value("Quality") && !strcmp(s_val, "2"));
+    CHECK(enhance_menu_row_live(row_index("Quality")) == ENHANCE_LIVE_RESTART);
+    CHECK(row_value("Pinned") && !strcmp(s_val, "7"));
+    CHECK(enhance_menu_select_row("Pinned"));
+    tap(0x27);
+    CHECK(strstr(enhance_menu_status(), "Set by RECOMP_HEAP_QUARANTINE") != NULL);
+    CHECK(row_value("Pinned") && !strcmp(s_val, "7"));
+    CHECK(!pending_any("bmod.pinned"));
+    CHECK(row_index("Reset this mod") >= 0);
+    /* The key under the mod's name nothing reads, kept. */
+    CHECK(row_value("Unknown keys") != NULL);
+    CHECK(row_value("bmod.typo") && !strcmp(s_val, "not read; kept"));
+
+    /* A change moves the setting now and stages its key, written with the
+     * kind's literal. */
+    CHECK(enhance_menu_select_row("Speed"));
+    tap(0x27);
+    CHECK(row_value("Speed") && !strcmp(s_val, "1.05"));
+    CHECK(xbox_mod_setting_value(1, 1) > 1.04 && xbox_mod_setting_value(1, 1) < 1.06);
+    CHECK(pending_has("bmod.speed", "1.05"));
+    CHECK(enhance_menu_unsaved() == 1);
+    tap(0x25);
+    CHECK(enhance_menu_unsaved() == 0);
+
+    /* Back returns to the list, on the mod's row. */
+    tap(0x08);
+    CHECK(enhance_menu_is_open() && !strcmp(selected_label(), "B mod"));
+
+    /* The refused mod: its reason, every row unavailable, no Reset. */
+    open_detail("Failing mod");
+    CHECK(row_value("State") && !strncmp(s_val, "Failed: ", 8));
+    CHECK(row_value("Go") && !strcmp(s_val, "unavailable"));
+    CHECK(row_value("Aim") && !strcmp(s_val, "unavailable"));
+    CHECK(row_value("Speed") && !strcmp(s_val, "unavailable"));
+    CHECK(row_index("Reset this mod") < 0);
+    tap(0x08);
+
+    /* A mod with no descriptor keeps its name, State, Enabled and items. */
+    open_detail("testmod");
+    CHECK(row_value("testmod") != NULL);
+    CHECK(row_value("State") && !strcmp(s_val, "On"));
+    CHECK(row_value("Level") && !strcmp(s_val, "low"));
+    CHECK(row_index("Controls") < 0);
+    open_menu();
+}
+
+/* About wraps at the word that no longer fits, at any panel width: the
+ * lines put back together are the summary, and a narrower panel takes
+ * more of them. */
+static int wrap_lines(int w, char *joined, size_t n)
+{
+    int i, lines = 0;
+    size_t at = 0;
+    char l[96];
+    nv2a_overlay_set_placement(0, 0, w, 1080);
+    open_menu();
+    open_detail("B mod");
+    i = row_index("About");
+    joined[0] = 0;
+    for (; i >= 0 && enhance_menu_row(i, l, sizeof l, s_val, sizeof s_val, NULL); i++) {
+        if (lines && l[0])
+            break;
+        at += (size_t)snprintf(joined + at, n - at, "%s%s", lines ? " " : "", s_val);
+        lines++;
+    }
+    open_menu();
+    return lines;
+}
+
+static void test_detail_wrap(void)
+{
+    char a[512], b[512], c[512];
+    int la, lb, lc;
+    start_with(ARMED, k_bmods);
+    la = wrap_lines(1920, a, sizeof a);
+    lb = wrap_lines(1400, b, sizeof b);
+    lc = wrap_lines(1100, c, sizeof c);
+    CHECK(la >= 2 && lb > la && lc > lb);
+    CHECK(!strcmp(a, BM_SUMMARY) && !strcmp(b, BM_SUMMARY) && !strcmp(c, BM_SUMMARY));
+    nv2a_overlay_set_placement(0, 0, 1920, 1080);
+}
+
+/* Reset this mod stages the mod's own settings and bindings back to the
+ * stock; its switch, other mods and the unknown key are left alone. */
+static void test_detail_reset(void)
+{
+    const char *keys[16], *vals[16], *f;
+    int n;
+    start_with(ARMED "[bmod]\nspeed = 2.0\nhud = \"hide\"\ntypo = 1\n[testmod]\nlevel = \"high\"\n"
+                     "[input.actions]\n\"bmod.toggle\" = [\"F8\"]\n",
+               k_bmods);
+    open_menu();
+    open_detail("B mod");
+    CHECK(row_value("Speed") && !strcmp(s_val, "2.00"));
+    CHECK(row_value("Toggle flight") && !strcmp(s_val, "F8"));
+    CHECK(enhance_menu_select_row("Reset this mod"));
+    tap(0x0D);
+    CHECK(strstr(enhance_menu_status(), "B mod: reset to defaults") != NULL);
+    CHECK(row_value("Speed") && !strcmp(s_val, "1.00"));
+    CHECK(row_value("Toggle flight") && !strcmp(s_val, "F7"));
+    n = enhance_menu_pending(keys, vals, 16);
+    /* The patch, by hand: the three keys removed, nothing else. */
+    CHECK(n == 3);
+    CHECK(pending_has("bmod.speed", NULL) && pending_has("bmod.hud", NULL));
+    CHECK(pending_has("input.actions.bmod.toggle", NULL));
+    tap(VK_F5);
+    f = read_file("config/config.toml");
+    CHECK(strstr(f, "speed") == NULL && strstr(f, "hud") == NULL && strstr(f, "F8") == NULL);
+    CHECK(strstr(f, "typo = 1") != NULL && strstr(f, "level = \"high\"") != NULL);
+    open_menu();
+}
+
+/* A user-file alias goes under its key at the first Save, edits or none;
+ * Enabled turned on drops a mods."<id>" = false. */
+static void test_detail_save(void)
+{
+    const char *f;
+    start_with("bmod_old_speed = 3.0\n" ARMED, k_bmods);
+    open_menu();
+    CHECK(enhance_menu_unsaved() == 0);
+    CHECK(pending_has("bmod.speed", "3.0") && pending_has("bmod_old_speed", NULL));
+    tap(VK_F5);
+    f = read_file("config/config.toml");
+    CHECK(strstr(f, "bmod_old_speed") == NULL && strstr(f, "speed = 3.0") != NULL);
+    CHECK(!pending_any("bmod.speed"));
+    open_menu();
+
+    start_with(ARMED "[mods]\nbmod = false\n", k_bmods);
+    open_menu();
+    open_detail("B mod");
+    CHECK(row_value("State") && !strcmp(s_val, "Off (mods.\"bmod\" = false)"));
+    CHECK(row_value("Toggle flight") && !strcmp(s_val, "F7 (mod off)"));
+    CHECK(enhance_menu_select_row("Enabled"));
+    tap(0x27);
+    xbox_mod_frame();
+    CHECK(pending_has("mods.bmod", NULL));
+    open_menu();
+
+    /* The player edits the new key while the old one is still in the
+     * file: the edit wins, the alias's value is not written over it, and
+     * the old key goes. */
+    start_with("bmod_old_speed = 3.0\n" ARMED, k_bmods);
+    open_menu();
+    open_detail("B mod");
+    CHECK(row_value("Speed") && !strcmp(s_val, "3.00"));
+    CHECK(enhance_menu_select_row("Speed"));
+    tap(0x27);
+    CHECK(pending_has("bmod.speed", "3.05") && pending_has("bmod_old_speed", NULL));
+    CHECK(!pending_has("bmod.speed", "3.0"));
+    tap(VK_F5);
+    CHECK(strstr(enhance_menu_status(), "Saved 1 change, 1 renamed key") != NULL);
+    f = read_file("config/config.toml");
+    CHECK(strstr(f, "bmod_old_speed") == NULL && strstr(f, "speed = 3.05") != NULL);
+    CHECK(strstr(f, "speed = 3.0\n") == NULL);
+    open_menu();
+
+    /* An alias holding the stock: the old key goes, nothing is written
+     * under the new one (no key the player never set). */
+    start_with("bmod_old_speed = 1.0\n" ARMED, k_bmods);
+    open_menu();
+    CHECK(!pending_any("bmod.speed") && pending_has("bmod_old_speed", NULL));
+    tap(VK_F5);
+    CHECK(strstr(enhance_menu_status(), "Saved 1 renamed key") != NULL);
+    f = read_file("config/config.toml");
+    CHECK(strstr(f, "speed") == NULL);
+    open_menu();
+}
+
+/* The capture refuses an input a dormant action holds, naming the mod and
+ * the label, and a key a mod's captured control names (D3 rule 2). */
+static void test_detail_conflicts(void)
+{
+    start_with(ARMED "[bmod]\nenabled = false\n", k_bmods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Controls"));
+    CHECK(enhance_menu_select_row("Stats strip"));
+    tap(0x0D);
+    CHECK(enhance_menu_capturing());
+    tap(0x76);  /* F7 */
+    CHECK(strstr(enhance_menu_status(),
+                 "F7 refused: B mod: Toggle flight has it (F7) (mod off); clear it there first")
+          != NULL);
+    CHECK(enhance_menu_select_row("Stats strip"));
+    tap(0x0D);
+    CHECK(enhance_menu_capturing());
+    tap('R');
+    CHECK(strstr(enhance_menu_status(), "R refused: B mod: Rise uses it") != NULL);
+    CHECK(enhance_menu_unsaved() == 0);
+    open_menu();
+}
+
+/* The Controls page: the toolkit's actions, then each mod's under its
+ * title, a dormant mod's group saying so; Mouse last. */
+static void test_controls_groups(void)
+{
+    char l[96];
+    int t, m, b, mo;
+    start_with(ARMED "[bmod]\nenabled = false\n", k_bmods);
+    open_menu();
+    CHECK(enhance_menu_set_page("Controls"));
+    t = row_index("Toolkit");
+    m = row_index("testmod");
+    b = row_index("B mod (mod off)");
+    mo = row_index("Mouse");
+    CHECK(t == 0 && m > t && b > m && mo > b);
+    CHECK(row_index("Game") < 0);
+    CHECK(enhance_menu_row(t + 1, l, sizeof l, NULL, 0, NULL) && !strcmp(l, "Open the menu"));
+    CHECK(enhance_menu_row(m + 1, l, sizeof l, NULL, 0, NULL) && !strcmp(l, "Poke"));
+    CHECK(enhance_menu_row(b + 1, l, sizeof l, NULL, 0, NULL) && !strcmp(l, "Toggle flight"));
+    /* Captured controls show on the mod's own page only; the group
+     * header says the mod is off, not each row. */
+    CHECK(row_index("Rise") < 0);
+    CHECK(row_after("B mod (mod off)", 1) && !strcmp(s_val, "F7"));
+    open_menu();
+
+    /* An action the title registers with no owner: its own group, between
+     * the toolkit's and the mods'. */
+    {
+        static const char *const k_jump[] = { "F12", NULL };
+        int g;
+        start_with(ARMED, k_bmods);
+        CHECK(enhance_action_register("game.jump", "Jump", k_jump) >= 0);
+        open_menu();
+        CHECK(enhance_menu_set_page("Controls"));
+        t = row_index("Toolkit");
+        g = row_index("Game");
+        m = row_index("testmod");
+        b = row_index("B mod");
+        CHECK(t == 0 && g > t && m > g && b > m);
+        CHECK(enhance_menu_row(g + 1, l, sizeof l, s_val, sizeof s_val, NULL) && !strcmp(l, "Jump")
+              && !strcmp(s_val, "F12"));
+        open_menu();
+    }
+}
+
 static uint32_t sum_of(const struct nv2a_ovl_list *l)
 {
     return nv2a_overlay_list_sum(l->vtx, l->nvtx, l->idx, l->nidx, l->cmd, l->ncmd);
@@ -877,8 +1245,8 @@ static void test_pages(void)
 {
     /* Render, Pack, Game, Mods, Stats, Controls, Debug, Save. */
     static const uint32_t k_sum[8] = {
-        0x5220FD06u, 0xC5E14D56u, 0xC918F275u, 0xE82DCF7Bu,
-        0x7B20659Eu, 0xA833B09Du, 0x2DA2FE24u, 0x4D09DFE6u };
+        0x5220FD06u, 0xC5E14D56u, 0xC918F275u, 0xEF138353u,
+        0x7B20659Eu, 0x13A93A10u, 0x2DA2FE24u, 0x4D09DFE6u };
     start_with(ARMED, k_mods);
     open_menu();
     CHECK(enhance_menu_is_open());
@@ -970,7 +1338,7 @@ static void test_save_tables(void)
     CHECK(enhance_menu_select_row("testmod"));
     tap(0x25);
     CHECK(enhance_menu_select_row("plainmod"));
-    tap(0x0D);
+    tap(0x27);
     CHECK(enhance_menu_set_page("Render"));
     CHECK(enhance_menu_select_row("Scaling filter"));
     tap(0x27);
@@ -991,6 +1359,31 @@ static void test_save_tables(void)
     rmdir(LONGROOT);
 }
 
+/* A title's STAGE item keeps its row as before the descriptor classes:
+ * its label, its value and its class. */
+static const char *const k_gm_lv[] = { "near", "far", NULL };
+static const struct enhance_item k_gm_stage = {
+    "fx.lod", "Draw distance", "Game", ENHANCE_ITEM_CHOICE, k_gm_lv, 0, 0, 0, NULL,
+    NULL, NULL, ENHANCE_LIVE_STAGE, 0, "near", NULL
+};
+static void test_stage_row(void)
+{
+    int i;
+    start_with(ARMED, NULL);
+    CHECK(enhance_menu_add(&k_gm_stage));
+    open_menu();
+    CHECK(enhance_menu_set_page("Game"));
+    i = row_index("Draw distance");
+    CHECK(i >= 0 && enhance_menu_row_live(i) == ENHANCE_LIVE_STAGE);
+    CHECK(row_value("Draw distance") && !strcmp(s_val, "near"));
+    CHECK(enhance_menu_select_row("Draw distance"));
+    tap(0x27);
+    CHECK(row_value("Draw distance") && !strcmp(s_val, "far"));
+    CHECK(pending_has("fx.lod", "\"far\""));
+    CHECK(enhance_menu_row_live(-1) == -1);
+    open_menu();
+}
+
 int main(int argc, char **argv)
 {
     s_pin = argc > 1 && !strcmp(argv[1], "--pin");
@@ -1006,11 +1399,18 @@ int main(int argc, char **argv)
     test_capture_and_save();
     test_capture_duplicate();
     test_capture_owned();
+    test_detail_rows();
+    test_detail_wrap();
+    test_detail_reset();
+    test_detail_save();
+    test_detail_conflicts();
+    test_controls_groups();
     test_mouse();
     test_snapshot();
     test_pages();
     test_save_deep();   /* after the pins: its Save moves the Debug page's options gen */
     test_save_tables();
+    test_stage_row();
     xbox_mod_shutdown();
     enhance_menu_reset_for_test();
     enhance_actions_reset();

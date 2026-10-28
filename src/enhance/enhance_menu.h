@@ -134,6 +134,11 @@ int  enhance_menu_selected(void);
  * range. *selectable may be NULL. */
 int  enhance_menu_row(int i, char *label, size_t ln, char *value, size_t vn,
                       int *selectable);
+/* Row i's help, as the footer shows it while the row is selected ("" for
+ * none); NULL when i is out of range. */
+const char *enhance_menu_row_help(int i);
+/* Row i's change class (an enhance_item_live) for a setting row, else -1. */
+int  enhance_menu_row_live(int i);
 int  enhance_menu_select_row(const char *label);  /* 1 when found */
 int  enhance_menu_capturing(void);
 const char *enhance_menu_status(void);           /* the last message */

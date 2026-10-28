@@ -161,6 +161,7 @@ struct action {
 
 static struct action s_act[ENHANCE_ACTIONS_MAX];
 static int s_nact;
+static int s_ntoolkit;      /* ids below it are enhance_actions_init's */
 static int s_started;
 
 /* ---- bindings ---------------------------------------------------------- */
@@ -1694,6 +1695,16 @@ int enhance_action_dormant(int id)
     return id >= 0 && id < n && s_act[id].live && s_act[id].dormant;
 }
 
+int enhance_action_mod(int id)
+{
+    int n = __atomic_load_n(&s_nact, __ATOMIC_ACQUIRE);
+    if (id < 0 || id >= n || !s_act[id].live)
+        return ENHANCE_ACT_TOOLKIT;
+    if (s_act[id].owner >= 0)
+        return s_act[id].owner;
+    return id < s_ntoolkit ? ENHANCE_ACT_TOOLKIT : ENHANCE_ACT_GAME;
+}
+
 int enhance_action_source(int id, char *key, size_t n)
 {
     const char *texts[ENHANCE_ACTION_BINDS];
@@ -1910,6 +1921,7 @@ void enhance_actions_init(void)
     s_menu_act = enhance_action_register("menu.open", "Open the menu", menu_open);
     s_stats_act = enhance_action_register("overlay.stats", "Stats strip", NULL);
     enhance_action_register("shot.window", "Window screenshot", NULL);
+    s_ntoolkit = s_nact;
 }
 
 void enhance_actions_start(void)
@@ -1946,6 +1958,7 @@ void enhance_actions_reset(void)
     enhance_actions_set_menu_hook(NULL);
     spin_lock(&s_reg_lock);
     s_nact = 0;
+    s_ntoolkit = 0;
     s_started = 0;
     spin_lock(&s_arm_lock);
     s_narm = 0;

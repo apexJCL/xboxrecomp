@@ -15,6 +15,7 @@
  */
 #include "enhance_menu.h"
 
+#include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -289,10 +290,14 @@ struct slot {
     int mod;                    /* -1, or the mod an item or toggle is for */
     int toggle;                 /* the mod's enable toggle */
     int env;                    /* forced by the environment: read only */
+    int dset;                   /* a descriptor setting's index, else -1 */
+    const char *envname;        /* the env row that forces it, or NULL */
+    const char *help;           /* the footer's text for its row, or NULL */
 };
 
 #define MODS_MAX 32
-#define SLOTS_MAX (ENHANCE_MENU_MAX_ITEMS + 2 * XBOX_MOD_MAX_ITEMS + MODS_MAX + 16)
+#define DSET_MAX 256            /* descriptor settings over every mod */
+#define SLOTS_MAX (ENHANCE_MENU_MAX_ITEMS + 2 * XBOX_MOD_MAX_ITEMS + MODS_MAX + DSET_MAX + 16)
 static struct slot s_slot[SLOTS_MAX];
 /* The Mods page's toggle per mod, synthesized at the first open: its key
  * is mods.<name>, or for a descriptor mod with an enable setting that
@@ -352,13 +357,14 @@ static void slot_read(struct slot *s)
         cfg_value(s->it, s->key, s->cur, sizeof s->cur);
 }
 
-static void slot_add(const struct enhance_item *it, int page, int mod)
+static struct slot *slot_add(const struct enhance_item *it, int page, int mod)
 {
     struct slot *s;
     if (s_nslot >= SLOTS_MAX)
-        return;
+        return NULL;
     s = &s_slot[s_nslot++];
     memset(s, 0, sizeof *s);
+    s->dset = -1;
     s->it = it;
     snprintf(s->key, sizeof s->key, "%s", it->key);
     s->page = page;
@@ -366,6 +372,7 @@ static void slot_add(const struct enhance_item *it, int page, int mod)
     s->env = enhance_cfg_source_of(s->key) == ENHANCE_SRC_ENV;
     slot_read(s);
     memcpy(s->base, s->cur, sizeof s->base);
+    return s;
 }
 
 static void mod_toggle_set(const struct enhance_item *it, const char *v)
@@ -379,9 +386,154 @@ static const char *mod_toggle_get(const struct enhance_item *it, char *b, size_t
     return b;
 }
 
+/* ---- descriptor settings (D2): one slot each, on the mod's page ---------- */
+
+/* The slot's text is the value as the row shows it, without the unit: a
+ * bool true/false, an enum its choice, a number at the step's decimals,
+ * so a value the toolkit snapped reads back as the text it came from. */
+static struct enhance_item s_set_item[DSET_MAX];
+static int s_nset;
+
+static const struct xbox_mod_setting *dset_of(const struct enhance_item *it, int *m,
+                                              uint32_t *k)
+{
+    int u = (int)(intptr_t)it->user;
+    *m = u >> 8;
+    *k = (uint32_t)(u & 0xff);
+    return &xbox_mod_desc_of(*m)->settings[*k];
+}
+
+/* A float with no step moves by a hundredth of its range. */
+static double dset_step(const struct xbox_mod_setting *st)
+{
+    if (st->step > 0)
+        return st->step;
+    if (st->kind == XBOX_SET_INT || !(st->hi > st->lo))
+        return 1;
+    return (st->hi - st->lo) / 100;
+}
+
+/* The decimals a step needs: 0.05 shows 1.00, 0.5 shows 1.5. With no step
+ * the computed one decides (0..0.01 moves by 0.0001: 4), so the text, which
+ * is also the saved literal, is the value in use rather than a rounding. */
+static int dset_decimals(const struct xbox_mod_setting *st)
+{
+    double x = dset_step(st);
+    int d = 0;
+    while (d < 6 && fabs(x - floor(x + 0.5)) > 1e-6) {
+        x *= 10;
+        d++;
+    }
+    return d;
+}
+
+static void dset_text(const struct xbox_mod_setting *st, double v, char *out, size_t n)
+{
+    int c = (int)v;
+    switch (st->kind) {
+    case XBOX_SET_BOOL:
+        snprintf(out, n, "%s", v ? "true" : "false");
+        return;
+    case XBOX_SET_ENUM:
+        snprintf(out, n, "%s", st->choices && c >= 0 ? st->choices[c] : "");
+        return;
+    case XBOX_SET_INT:
+        snprintf(out, n, "%lld", (long long)v);
+        return;
+    default:
+        snprintf(out, n, "%.*f", dset_decimals(st), v);
+        return;
+    }
+}
+
+static double dset_parse(const struct xbox_mod_setting *st, const char *v)
+{
+    int c;
+    switch (st->kind) {
+    case XBOX_SET_BOOL:
+        return on_text(v);
+    case XBOX_SET_ENUM:
+        c = index_of(st->choices, v);
+        return c < 0 ? 0 : c;
+    default:
+        return atof(v);
+    }
+}
+
+static void dset_set(const struct enhance_item *it, const char *v)
+{
+    int m;
+    uint32_t k;
+    const struct xbox_mod_setting *st = dset_of(it, &m, &k);
+    xbox_mod_setting_set(m, k, dset_parse(st, v));
+}
+
+static const char *dset_get(const struct enhance_item *it, char *b, size_t n)
+{
+    int m;
+    uint32_t k;
+    const struct xbox_mod_setting *st = dset_of(it, &m, &k);
+    dset_text(st, xbox_mod_setting_value(m, k), b, n);
+    return b;
+}
+
+/* Mod m's settings but its switch (the Enabled row is that), in the
+ * descriptor's order. A failed mod gets none: its page lists them as
+ * unavailable. */
+static void dset_slots(int m)
+{
+    const struct xbox_mod_desc *d = xbox_mod_desc_of(m);
+    if (!d || xbox_mod_state(m) == XBOX_MOD_FAILED)
+        return;
+    for (uint32_t k = 0; k < d->n_settings; k++) {
+        const struct xbox_mod_setting *st = &d->settings[k];
+        struct enhance_item *it;
+        struct slot *s;
+        if ((st->flags & XBOX_SET_ENABLE) || !xbox_mod_setting_key(m, k))
+            continue;
+        if (s_nset >= DSET_MAX) {
+            fprintf(stderr, LOGP "menu: more than %d mod settings; %s not listed\n", DSET_MAX,
+                    xbox_mod_setting_key(m, k));
+            continue;
+        }
+        it = &s_set_item[s_nset++];
+        memset(it, 0, sizeof *it);
+        it->key = xbox_mod_setting_key(m, k);
+        it->label = st->label ? st->label : st->name;
+        it->kind = st->kind == XBOX_SET_BOOL   ? ENHANCE_ITEM_TOGGLE
+                 : st->kind == XBOX_SET_ENUM ? ENHANCE_ITEM_CHOICE
+                                             : ENHANCE_ITEM_RANGE;
+        it->choices = st->choices;
+        it->lo = st->lo;
+        it->hi = st->hi;
+        it->step = dset_step(st);
+        it->set = dset_set;
+        it->get = dset_get;
+        it->live = (enum enhance_item_live)st->live;
+        it->user = (void *)(intptr_t)(m << 8 | (int)k);
+        s = slot_add(it, PAGE_MODS, m);
+        if (!s)
+            break;
+        s->dset = (int)k;
+        s->help = st->help;
+        s->env = xbox_mod_setting_forced(m, k);
+        s->envname = s->env ? xbox_mod_setting_env(m, k) : NULL;
+    }
+}
+
+/* Mod m's slot for setting k, -1 when it has none. */
+static int dset_slot(int m, uint32_t k)
+{
+    for (int i = 0; i < s_nslot; i++)
+        if (s_slot[i].mod == m && s_slot[i].dset == (int)k)
+            return i;
+    return -1;
+}
+
 static void build_slots(void)
 {
     s_nslot = 0;
+    s_nset = 0;
     s_pack_off = nv2a_host_opts()->pack_off;
     for (int i = 0; i < N_ITEMS; i++)
         slot_add(&k_items[i], page_by_name(k_items[i].page, PAGE_RENDER), -1);
@@ -408,8 +560,17 @@ static void build_slots(void)
         t->def = "true";
         t->user = (void *)(intptr_t)m;
         slot_add(t, PAGE_MODS, m);
-        if (s_nslot)
-            s_slot[s_nslot - 1].toggle = 1;
+        if (s_nslot) {
+            struct slot *ts = &s_slot[s_nslot - 1];
+            ts->toggle = 1;
+            /* The switch is the enable setting: name its variable when that
+             * forces it, as the setting rows do (D5). */
+            if (e >= 0 && xbox_mod_setting_forced(m, (uint32_t)e)) {
+                ts->env = 1;
+                ts->envname = xbox_mod_setting_env(m, (uint32_t)e);
+            }
+        }
+        dset_slots(m);
         for (int i = 0; i < n; i++)
             slot_add(items[i], PAGE_MODS, m);
     }
@@ -430,6 +591,12 @@ static int slot_stock(const struct slot *s, char *out, size_t n)
 {
     const recomp_cfg *d = enhance_cfg_defaults();
     const struct enhance_item *it = s->it;
+    if (s->dset >= 0) {
+        int m;
+        uint32_t k;
+        dset_text(dset_of(it, &m, &k), xbox_mod_setting_stock(m, k), out, n);
+        return 1;
+    }
     if (s->toggle && xbox_mod_enable_setting(s->mod) >= 0) {
         int e = xbox_mod_enable_setting(s->mod);
         snprintf(out, n, "%s", enable_stock(s->mod, e, s->key) ? "true" : "false");
@@ -466,6 +633,9 @@ static void slot_set(struct slot *s, const char *v)
      * mod's toggle); most have none and the value is only stored. */
     if (s->it->set)
         s->it->set(s->it, s->cur);
+    /* A setting comes back clamped and snapped: show what is in force. */
+    if (s->dset >= 0)
+        slot_read(s);
 }
 
 /* ---- actions the Controls page changed ---------------------------------- */
@@ -512,34 +682,72 @@ static void action_set(int id, bind_list l, int n)
         s_adirty[id] = 1;
 }
 
+static const char *mod_title(int m);
+
+/* Who an action belongs to, as the Controls page heads its group:
+ * "Free camera: Toggle flight" for a mod's, the label alone otherwise. */
+static void action_who(int id, char *out, size_t n)
+{
+    int g = enhance_action_mod(id);
+    const char *label = enhance_action_label(id);
+    if (g >= 0)
+        snprintf(out, n, "%s: %s", mod_title(g), label ? label : "?");
+    else
+        snprintf(out, n, "%s", label ? label : "another action");
+}
+
+/* The bindings in effect, and each one the table refuses marked with why:
+ * a player who sees "F6" must not think F6 does it when another action
+ * holds F6 (one input fires one action). */
 static void join_bindings(int id, char *out, size_t n)
 {
-    bind_list l;
+    bind_list l, bad;
     int k = enhance_action_bindings(id, l, ENHANCE_ACTION_BINDS);
+    int nb = enhance_action_refused(id, bad, ENHANCE_ACTION_BINDS);
     size_t at = 0;
     out[0] = 0;
     if (!k) {
         snprintf(out, n, "none");
         return;
     }
-    for (int i = 0; i < k && at < n; i++)
+    for (int i = 0; i < k && at < n; i++) {
+        int refused = 0;
+        for (int j = 0; j < nb && !refused; j++)
+            refused = !strcmp(l[i], bad[j]);
         at += (size_t)snprintf(out + at, n - at, "%s%s", i ? ", " : "", l[i]);
+        if (refused && at < n) {
+            char bound[ENHANCE_ACTION_TEXT], who[96];
+            int o = enhance_action_owner(l[i], id, bound, sizeof bound);
+            if (o >= 0) {
+                action_who(o, who, sizeof who);
+                at += (size_t)snprintf(out + at, n - at, " (refused: %s has it)", who);
+            } else {
+                at += (size_t)snprintf(out + at, n - at, " (refused)");
+            }
+        }
+    }
 }
 
 /* ---- state --------------------------------------------------------------- */
 
 enum { ST_CLOSED, ST_OPEN, ST_CLOSING };
 enum row_type {
-    R_SLOT, R_INFO, R_HEADER, R_BIND, R_MOD, R_SAVE, R_RESET
+    R_SLOT, R_INFO, R_HEADER, R_BIND, R_MOD, R_SAVE, R_RESET,
+    R_TEXT,             /* one wrapped line of a mod's Author, About or State */
+    R_CTL,              /* a mod's captured control: read only until phase D */
+    R_MODRESET          /* "Reset this mod" */
 };
+enum { TINT_NONE, TINT_BAD, TINT_WARN };
 
 struct row {
     int type;
-    int ref;            /* slot, action id or mod index */
+    int ref;            /* slot, action id, mod index; R_CTL mod << 8 | control */
     int sel;
     char label[64];
     char value[VAL_MAX];
-    mu_Color *tint;     /* an info value's colour, NULL for the default */
+    int tint;           /* an info or text value's colour: TINT_* */
+    const char *note;   /* dim words after the label ("while flying"), or NULL */
+    char help[160];     /* the footer's text while it is selected */
 };
 
 static int s_state = ST_CLOSED;     /* written under the lock, read relaxed */
@@ -641,13 +849,114 @@ static void slot_rows(int page, int mod)
     for (int i = 0; i < s_nslot; i++) {
         struct slot *s = &s_slot[i];
         struct row *r;
-        if (s->page != page || s->mod != mod || s->toggle)
+        if (s->page != page || s->mod != mod || s->toggle || s->dset >= 0)
             continue;
         r = row_add(R_SLOT, i, s->it->kind != ENHANCE_ITEM_INFO, s->it->label);
         if (r && s->it->kind == ENHANCE_ITEM_INFO)
             slot_read(s);
         if (r)
             snprintf(r->value, sizeof r->value, "%s", s->cur);
+    }
+}
+
+/* ---- the panel's geometry (the draw and the wrap share it) ---------------- */
+
+struct geom {
+    float s;
+    int pad, gap, rowh, rgap, pw;
+};
+
+/* R8: a panel on the left, 40% of the width up to 720 px at 1080; the
+ * whole width on a narrow or portrait output. */
+static void geom_of(struct geom *g, int *w_out, int *h_out)
+{
+    const struct nv2a_ovl_theme *t = &nv2a_ovl_theme_default;
+    int px, py, w, h;
+    nv2a_overlay_placement(&px, &py, &w, &h);
+    if (w <= 0 || h <= 0)
+        w = 1920, h = 1080;
+    g->s = nv2a_ovl_ui_scale((uint32_t)h);
+    g->pad = nv2a_ovl_px(g->s, t->pad);
+    g->gap = nv2a_ovl_px(g->s, t->gap);
+    g->rowh = nv2a_ovl_px(g->s, t->row_h);
+    g->rgap = nv2a_ovl_px(g->s, 4);
+    g->pw = (int)(w * 0.40f);
+    if (g->pw > nv2a_ovl_px(g->s, 720))
+        g->pw = nv2a_ovl_px(g->s, 720);
+    if (w < 640 || h > w)
+        g->pw = w - 2 * g->pad;
+    if (w_out)
+        *w_out = w;
+    if (h_out)
+        *h_out = h;
+}
+
+/* An R_TEXT row's text starts here, past its label. */
+static int text_col(float s)
+{
+    return nv2a_ovl_px(s, 150);
+}
+
+/* The bytes of p that fit in w on one line, up to max: broken after the
+ * last word that fits, and a word wider than the line cut at a character.
+ * Stops at a newline. */
+static size_t wrap_take(mu_Font f, const char *p, int w, size_t max)
+{
+    size_t best = 0, i = 0;
+    while (p[i] && p[i] != '\n') {
+        size_t k = i;
+        while (p[k] == ' ')
+            k++;
+        while (p[k] && p[k] != ' ' && p[k] != '\n')
+            k++;
+        if (k <= max && nv2a_ovl_text_width(f, p, (int)k) <= w) {
+            best = i = k;
+            continue;
+        }
+        if (best)
+            return best;
+        /* The first word alone is too wide: as many characters as fit. */
+        for (k = 0; p[k] && p[k] != '\n';) {
+            size_t nx = k + 1;
+            while (((unsigned char)p[nx] & 0xC0) == 0x80)
+                nx++;
+            if (k && (nx > max || nv2a_ovl_text_width(f, p, (int)nx) > w))
+                break;
+            k = nx;
+        }
+        return k;
+    }
+    return best;
+}
+
+/* One R_TEXT row per line of text, wrapped to the panel at the body
+ * font's glyph widths (the atlas's), with no cap on the lines: an About
+ * cut to one line was the complaint. The label goes on the first. */
+static void text_rows(const char *label, const char *text, int tint)
+{
+    const struct nv2a_ovl_theme *t = &nv2a_ovl_theme_default;
+    struct geom g;
+    mu_Font fb;
+    const char *p = text ? text : "";
+    int w;
+    geom_of(&g, NULL, NULL);
+    fb = OVL_FONT(OVL_FONT_BODY, nv2a_ovl_px(g.s, t->font_body), 0);
+    /* The row's room (draw_row: pad on each side, inside pw - pad). */
+    w = g.pw - 3 * g.pad - text_col(g.s);
+    for (int first = 1;; first = 0) {
+        size_t n = wrap_take(fb, p, w, VAL_MAX - 1);
+        struct row *r = row_add(R_TEXT, -1, 0, first ? label : "");
+        if (r) {
+            snprintf(r->value, sizeof r->value, "%.*s", (int)n, p);
+            r->tint = tint;
+        }
+        p += n;
+        while (*p == ' ')
+            p++;
+        if (*p == '\n')
+            p++;
+        if (!*p || !r)
+            break;
     }
 }
 
@@ -747,6 +1056,268 @@ static const char *trace_value(const char *v)
     return !v ? "off" : (!*v || !strcmp(v, "1")) ? "on" : v;
 }
 
+/* ---- the Mods page's detail view (D5) ------------------------------------- */
+
+static const char *mod_title(int m)
+{
+    const struct xbox_mod_desc *d = xbox_mod_desc_shown(m);
+    return d && d->title && *d->title ? d->title : xbox_mod_name(m);
+}
+
+static void state_text(int m, char *out, size_t n, int *tint)
+{
+    char sw[96];
+    const char *why;
+    *tint = TINT_NONE;
+    switch (xbox_mod_state(m)) {
+    case XBOX_MOD_ON:
+        snprintf(out, n, "On");
+        return;
+    case XBOX_MOD_OFF:
+        /* The switch that holds it off, so the player knows which key to
+         * change: a descriptor mod's own setting may say on. */
+        snprintf(sw, sizeof sw, "mods.%s", xbox_mod_name(m));
+        if (!enhance_cfg_bool(sw, 1))
+            snprintf(out, n, "Off (mods.\"%s\" = false)", xbox_mod_name(m));
+        else
+            snprintf(out, n, "Off");
+        return;
+    case XBOX_MOD_FAILED:
+        why = xbox_mod_fail_reason(m);
+        snprintf(out, n, "Failed%s%s", why && *why ? ": " : "", why ? why : "");
+        *tint = TINT_BAD;
+        return;
+    case XBOX_MOD_RESTART:
+        snprintf(out, n, "%s at restart", xbox_mod_enabled(m) ? "On" : "Off");
+        *tint = TINT_WARN;
+        return;
+    }
+    out[0] = 0;
+}
+
+/* The keys [input.bindings] gives a guest control a captured binding
+ * names ("left_stick": W A S D), appended to out at *at; nothing for a
+ * host key. */
+static void ctl_keys(const char *b, char *out, size_t n, size_t *at, int *nkeys)
+{
+    static const struct { const char *name; int ctl[4]; } k_alias[] = {
+        { "lt", { INPUT_LEFT_TRIGGER, -1, -1, -1 } },
+        { "rt", { INPUT_RIGHT_TRIGGER, -1, -1, -1 } },
+        { "left_stick", { INPUT_LSTICK_UP, INPUT_LSTICK_LEFT, INPUT_LSTICK_DOWN, INPUT_LSTICK_RIGHT } },
+        { "right_stick", { INPUT_RSTICK_UP, INPUT_RSTICK_LEFT, INPUT_RSTICK_DOWN, INPUT_RSTICK_RIGHT } },
+    };
+    int ctl[4] = { xbox_InputMap_ControlFromName(b), -1, -1, -1 };
+    for (unsigned a = 0; a < sizeof k_alias / sizeof k_alias[0]; a++)
+        if (!strcmp(b, k_alias[a].name))
+            memcpy(ctl, k_alias[a].ctl, sizeof ctl);
+    for (int c = 0; c < 4 && ctl[c] >= 0; c++) {
+        int codes[XBOX_BIND_MAX], mouse[XBOX_BIND_MAX];
+        int k = xbox_InputBindingsOf(ctl[c], codes, mouse, XBOX_BIND_MAX);
+        /* A stick's four directions read best one key each: W A S D. */
+        for (int j = 0; j < k && j < XBOX_BIND_MAX && *at < n; j++) {
+            const char *name = xbox_InputCodeName(codes[j], mouse[j]);
+            if (!name)
+                continue;
+            *at += (size_t)snprintf(out + *at, n - *at, "%s%s",
+                                    !*nkeys ? "" : c && !j ? " " : ", ", name);
+            ++*nkeys;
+            if (ctl[1] >= 0)
+                break;
+        }
+    }
+}
+
+/* A captured control's row value: its bindings, then the keys the guest
+ * controls among them come from ("RT, X (keys R, E)"). */
+static void ctl_value(int m, uint32_t k, char *out, size_t n)
+{
+    bind_list l;
+    char keys[VAL_MAX];
+    size_t at = 0, kat = 0;
+    int nb = xbox_mod_control_bindings(m, k, l, ENHANCE_ACTION_BINDS, NULL), nk = 0;
+    out[0] = keys[0] = 0;
+    for (int i = 0; i < nb && at < n; i++) {
+        at += (size_t)snprintf(out + at, n - at, "%s%s", i ? ", " : "", l[i]);
+        /* ctl_keys puts the separator before each key it adds, so a host
+         * key, which adds none, leaves no stray comma. */
+        if (kat < sizeof keys)
+            ctl_keys(l[i], keys, sizeof keys, &kat, &nk);
+    }
+    if (!nb)
+        snprintf(out, n, "none");
+    else if (nk && at < n)
+        snprintf(out + at, n - at, " (key%s %s)", nk == 1 ? "" : "s", keys);
+}
+
+static void unavailable(const char *label, const char *help)
+{
+    struct row *r = row_add(R_INFO, -1, 0, label ? label : "?");
+    if (!r)
+        return;
+    snprintf(r->value, sizeof r->value, "unavailable");
+    snprintf(r->help, sizeof r->help, "%s", help ? help : "");
+    r->tint = TINT_WARN;
+}
+
+static void ctl_row(int m, uint32_t k, int ok)
+{
+    const struct xbox_mod_control *c = &xbox_mod_desc_shown(m)->controls[k];
+    const char *label = c->label ? c->label : c->id;
+    struct row *r;
+    int id;
+    /* A failed mod's rows, INFO ones too: none of them is in effect. */
+    if (!ok) {
+        unavailable(label, c->help);
+        return;
+    }
+    if (c->kind == XBOX_CTL_INFO) {
+        r = row_add(R_INFO, -1, 0, label);
+        if (r) {
+            snprintf(r->value, sizeof r->value, "%s",
+                     c->defaults && c->defaults[0] ? c->defaults[0] : "");
+            r->note = c->when;
+        }
+        return;
+    }
+    id = c->kind == XBOX_CTL_ACTION ? xbox_mod_control_action(m, k) : -1;
+    if (c->kind == XBOX_CTL_ACTION && id < 0) {
+        unavailable(label, c->help);
+        return;
+    }
+    if (c->kind == XBOX_CTL_ACTION) {
+        r = row_add(R_BIND, id, 1, label);
+        if (!r)
+            return;
+        join_bindings(id, r->value, sizeof r->value);
+        if (enhance_action_dormant(id))
+            strncat(r->value, " (mod off)", sizeof r->value - strlen(r->value) - 1);
+        snprintf(r->help, sizeof r->help, "%s", c->help ? c->help : "");
+        r->note = c->when;
+        return;
+    }
+    r = row_add(R_CTL, m << 8 | (int)k, 1, label);
+    if (!r)
+        return;
+    ctl_value(m, k, r->value, sizeof r->value);
+    r->note = c->when;
+    /* Rebinding a captured control lands in phase D; until then the row
+     * says where its bindings come from. */
+    snprintf(r->help, sizeof r->help, "%s%s[input.controls] \"%s.%s\" and [input.bindings] set it",
+             c->help ? c->help : "", c->help && *c->help ? " \xC2\xB7 " : "", xbox_mod_name(m),
+             c->id);
+}
+
+/* The keys under the mod's names no lookup read: typos the player can
+ * see here as well as in the log. Kept as they are by Save and Reset. */
+static void unknown_rows(int m)
+{
+    const char *keys[16];
+    int n = enhance_cfg_unused_of(xbox_mod_name(m), keys, 16);
+    if (!n)
+        return;
+    header("Unknown keys");
+    for (int i = 0; i < n && i < 16; i++) {
+        struct row *r = row_add(R_INFO, -1, 0, keys[i]);
+        if (!r)
+            continue;
+        snprintf(r->value, sizeof r->value, "not read; kept");
+        r->tint = TINT_WARN;
+    }
+}
+
+static void detail_rows(int m)
+{
+    const struct xbox_mod_desc *d = xbox_mod_desc_shown(m);
+    int ok = xbox_mod_desc_of(m) && xbox_mod_state(m) != XBOX_MOD_FAILED;
+    int t = toggle_slot(m), tint, nset = 0;
+    char st[VAL_MAX * 2];
+    struct row *r = row_add(R_HEADER, -1, 0, mod_title(m));
+    if (r && d && d->version_text && *d->version_text)
+        snprintf(r->value, sizeof r->value, "v%s", d->version_text);
+    if (d && d->author && *d->author)
+        text_rows("Author", d->author, TINT_NONE);
+    if (d && d->summary && *d->summary)
+        text_rows("About", d->summary, TINT_NONE);
+    state_text(m, st, sizeof st, &tint);
+    text_rows("State", st, tint);
+    if (t >= 0) {
+        r = row_add(R_SLOT, t, 1, "Enabled");
+        if (r)
+            snprintf(r->value, sizeof r->value, "%s", s_slot[t].cur);
+    }
+    if (!d) {
+        slot_rows(PAGE_MODS, m);
+        unknown_rows(m);
+        return;
+    }
+    if (d->n_controls)
+        header("Controls");
+    for (uint32_t k = 0; k < d->n_controls; k++)
+        ctl_row(m, k, ok);
+    for (uint32_t k = 0; k < d->n_settings; k++)
+        nset += !(d->settings[k].flags & XBOX_SET_ENABLE);
+    for (int i = 0; i < s_nslot && !nset; i++)
+        nset = s_slot[i].mod == m && !s_slot[i].toggle;
+    if (nset)
+        header("Settings");
+    for (uint32_t k = 0; k < d->n_settings; k++) {
+        const struct xbox_mod_setting *ds = &d->settings[k];
+        int i = dset_slot(m, k);
+        if (ds->flags & XBOX_SET_ENABLE)
+            continue;
+        if (i < 0) {
+            unavailable(ds->label ? ds->label : ds->name, ds->help);
+            continue;
+        }
+        r = row_add(R_SLOT, i, 1, s_slot[i].it->label);
+        if (!r)
+            continue;
+        snprintf(r->value, sizeof r->value, "%s", s_slot[i].cur);
+        snprintf(r->help, sizeof r->help, "%s", s_slot[i].help ? s_slot[i].help : "");
+    }
+    slot_rows(PAGE_MODS, m);
+    if (ok)
+        row_add(R_MODRESET, m, 1, "Reset this mod");
+    unknown_rows(m);
+}
+
+/* The Controls page: the actions grouped by owner, the toolkit's first,
+ * then the game's, then each mod's under its title; a group of actions
+ * that never fire while the mod is off says so. */
+static void action_groups(void)
+{
+    int n = enhance_action_count();
+    for (int g = -1; g >= -2 || g < xbox_mod_count();) {
+        int any = 0, dormant = 0;
+        char head[96];
+        for (int id = 0; id < n; id++)
+            if (enhance_action_name(id) && enhance_action_mod(id) == g) {
+                any = 1;
+                dormant |= enhance_action_dormant(id);
+            }
+        if (any) {
+            if (g == ENHANCE_ACT_TOOLKIT)
+                snprintf(head, sizeof head, "Toolkit");
+            else if (g == ENHANCE_ACT_GAME)
+                snprintf(head, sizeof head, "Game");
+            else
+                snprintf(head, sizeof head, "%s%s", mod_title(g), dormant ? " (mod off)" : "");
+            header(head);
+            for (int id = 0; id < n; id++) {
+                struct row *r;
+                if (!enhance_action_name(id) || enhance_action_mod(id) != g)
+                    continue;
+                r = row_add(R_BIND, id, 1, enhance_action_label(id));
+                if (r)
+                    join_bindings(id, r->value, sizeof r->value);
+            }
+        }
+        g = g == ENHANCE_ACT_TOOLKIT ? ENHANCE_ACT_GAME : g == ENHANCE_ACT_GAME ? 0 : g + 1;
+        if (g >= xbox_mod_count())
+            break;
+    }
+}
+
 static void build_rows(void)
 {
     char buf[VAL_MAX];
@@ -789,18 +1360,13 @@ static void build_rows(void)
         break;
     case PAGE_MODS:
         if (s_mod_sub >= 0) {
-            int t = toggle_slot(s_mod_sub);
-            header(xbox_mod_name(s_mod_sub));
-            if (t >= 0) {
-                struct row *r = row_add(R_SLOT, t, 1, "Enabled");
-                if (r)
-                    snprintf(r->value, sizeof r->value, "%s", s_slot[t].cur);
-            }
-            slot_rows(PAGE_MODS, s_mod_sub);
+            detail_rows(s_mod_sub);
             break;
         }
+        /* The title, as the detail header and the Controls groups show it;
+         * the id is for config keys and logs (design: "The id stays"). */
         for (int m = 0; m < xbox_mod_count(); m++) {
-            struct row *r = row_add(R_MOD, m, 1, xbox_mod_name(m));
+            struct row *r = row_add(R_MOD, m, 1, mod_title(m));
             if (r)
                 snprintf(r->value, sizeof r->value, "%s", xbox_mod_state_name(xbox_mod_state(m)));
         }
@@ -826,14 +1392,7 @@ static void build_rows(void)
     case PAGE_CONTROLS: {
         xbox_mouse_opts mo;
         const char *rk;
-        for (int id = 0; id < enhance_action_count(); id++) {
-            struct row *r;
-            if (!enhance_action_name(id))
-                continue;
-            r = row_add(R_BIND, id, 1, enhance_action_label(id));
-            if (r)
-                join_bindings(id, r->value, sizeof r->value);
-        }
+        action_groups();
         header("Mouse");
         slot_row("input.mouse_capture");
         xbox_InputMouseGetOpts(&mo);
@@ -923,9 +1482,15 @@ static void build_rows(void)
 
 /* + MODS_MAX: a descriptor toggle saved on also drops a stale
  * mods."<id>" = false (enable_save). */
-static char s_pkey[SLOTS_MAX + ENHANCE_ACTIONS_MAX + MODS_MAX][96];
-static char s_pval[SLOTS_MAX + ENHANCE_ACTIONS_MAX + MODS_MAX][VAL_MAX * 4];
-static int s_pnull[SLOTS_MAX + ENHANCE_ACTIONS_MAX + MODS_MAX];
+/* + 2 * REWRITES_MAX: each user-file alias the mods read is written once
+ * under its current key, the alias removed (D4). */
+#define REWRITES_MAX 64
+#define PENDING_MAX (SLOTS_MAX + ENHANCE_ACTIONS_MAX + MODS_MAX + 2 * REWRITES_MAX)
+static char s_pkey[PENDING_MAX][96];
+static char s_pval[PENDING_MAX][VAL_MAX * 4];
+static int s_pnull[PENDING_MAX];
+static int s_rw_done;           /* the rewrites went out with a Save */
+static int s_rw_staged;         /* renamed keys the last collect staged */
 
 /* The stock of mod m's enable setting e: the defaults file's key, else
  * the descriptor's default. */
@@ -982,6 +1547,60 @@ static int enable_save(const struct slot *s, int n)
     return k;
 }
 
+static int pending_has(int n, const char *key)
+{
+    for (int i = 0; i < n; i++)
+        if (!strcmp(s_pkey[i], key))
+            return 1;
+    return 0;
+}
+
+/* 1 when value is the literal of the stock of the mod setting named key:
+ * writing it would leave a key the player never set ("no stray keys"). */
+static int rewrite_is_stock(const char *key, const char *value)
+{
+    for (int m = 0; m < xbox_mod_count(); m++) {
+        const struct xbox_mod_desc *d = xbox_mod_desc_of(m);
+        for (uint32_t k = 0; d && k < d->n_settings; k++) {
+            const char *full = xbox_mod_setting_key(m, k);
+            char lit[VAL_MAX * 4];
+            if (!full || strcmp(full, key))
+                continue;
+            return xbox_mod_setting_literal(m, k, xbox_mod_setting_stock(m, k), lit, sizeof lit)
+                   && !strcmp(lit, value);
+        }
+    }
+    return 0;
+}
+
+/* The aliases a mod read from the user file (D4): any Save, even one with
+ * nothing else, writes each value under its current key and removes the
+ * old one, unless the player's change of that key already went in. A
+ * value that is the stock is dropped rather than written. They are not
+ * counted as unsaved changes: the file reads the same either way. */
+static int rewrites(int n)
+{
+    const char *keys[REWRITES_MAX], *vals[REWRITES_MAX], *olds[REWRITES_MAX];
+    int k = xbox_mod_pending_rewrites(keys, vals, olds, REWRITES_MAX);
+    s_rw_staged = 0;
+    for (int i = 0; i < k && i < REWRITES_MAX && n + 2 <= PENDING_MAX; i++) {
+        int add = 0;
+        if (!pending_has(n, keys[i]) && !rewrite_is_stock(keys[i], vals[i])) {
+            snprintf(s_pkey[n], sizeof s_pkey[n], "%s", keys[i]);
+            snprintf(s_pval[n], sizeof s_pval[n], "%s", vals[i]);
+            s_pnull[n++] = 0;
+            add = 1;
+        }
+        if (!pending_has(n, olds[i])) {
+            snprintf(s_pkey[n], sizeof s_pkey[n], "%s", olds[i]);
+            s_pnull[n++] = 1;
+            add = 1;
+        }
+        s_rw_staged += add;
+    }
+    return n;
+}
+
 static int collect(void)
 {
     int n = 0;
@@ -996,7 +1615,13 @@ static int collect(void)
         }
         snprintf(s_pkey[n], sizeof s_pkey[n], "%s", s->key);
         s_pnull[n] = slot_stock(s, stock, sizeof stock) && !strcmp(stock, s->cur);
-        if (s->it->kind == ENHANCE_ITEM_CHOICE && !(s->it->flags & ENHANCE_ITEM_NUMERIC))
+        if (s->dset >= 0) {
+            /* The literal the toolkit writes for the setting's kind: a
+             * float keeps its point ("1.0"), an enum is quoted. */
+            const struct xbox_mod_setting *st = &xbox_mod_desc_of(s->mod)->settings[s->dset];
+            xbox_mod_setting_literal(s->mod, (uint32_t)s->dset, dset_parse(st, s->cur), s_pval[n],
+                                     sizeof s_pval[n]);
+        } else if (s->it->kind == ENHANCE_ITEM_CHOICE && !(s->it->flags & ENHANCE_ITEM_NUMERIC))
             recomp_cfg_quote(s->cur, s_pval[n], sizeof s_pval[n]);
         else
             snprintf(s_pval[n], sizeof s_pval[n], "%s", s->cur);
@@ -1022,6 +1647,9 @@ static int collect(void)
         snprintf(s_pval[n] + at, sizeof s_pval[n] - at, "]");
         n++;
     }
+    s_rw_staged = 0;
+    if (!s_rw_done)
+        n = rewrites(n);
     return n;
 }
 
@@ -1083,7 +1711,9 @@ static void save(void)
      * its table and advice (~120 bytes a key): room for a full macOS
      * path and several keys in the log line. */
     char err[2048];
-    int n, rc;
+    /* The status counts what the player changed; the renamed keys D4
+     * writes along are named apart, since the player made none of them. */
+    int edits = enhance_menu_unsaved(), n, rc, renamed;
     if (!path) {
         status("Save is off (RECOMP_CONFIG=none)");
         return;
@@ -1093,6 +1723,7 @@ static void save(void)
         status("Nothing to save");
         return;
     }
+    renamed = s_rw_staged;
     mkdir_parent(path);
     rc = recomp_cfg_patch(path, keys, vals, (size_t)n, err, sizeof err);
     if (rc < 0) {
@@ -1106,6 +1737,7 @@ static void save(void)
     for (int i = 0; i < s_nslot; i++)
         memcpy(s_slot[i].base, s_slot[i].cur, sizeof s_slot[i].base);
     memset(s_adirty, 0, sizeof s_adirty);
+    s_rw_done = 1;
     if (rc > 0) {
         fprintf(stderr, LOGP "menu: saved to %s, %d key%s left out: %s\n", path, rc,
                 rc == 1 ? "" : "s", err);
@@ -1115,14 +1747,25 @@ static void save(void)
         return;
     }
     fprintf(stderr, LOGP "menu: saved %d key%s to %s\n", n, n == 1 ? "" : "s", path);
-    status("Saved %d change%s", n, n == 1 ? "" : "s");
+    if (renamed && edits)
+        status("Saved %d change%s, %d renamed key%s", edits, edits == 1 ? "" : "s", renamed,
+               renamed == 1 ? "" : "s");
+    else if (renamed)
+        status("Saved %d renamed key%s", renamed, renamed == 1 ? "" : "s");
+    else
+        status("Saved %d change%s", edits, edits == 1 ? "" : "s");
 }
 
-static void reset_all(void)
+/* Stage the stock of every slot and action (m -1), or of mod m's own
+ * settings and actions but its Enabled row: Reset this mod keeps the mod
+ * as it is and puts its options back. */
+static void reset_scope(int m)
 {
     for (int i = 0; i < s_nslot; i++) {
         struct slot *s = &s_slot[i];
         char stock[VAL_MAX];
+        if (m >= 0 && (s->mod != m || s->toggle))
+            continue;
         if (s->env || s->it->kind == ENHANCE_ITEM_INFO || s->it->kind == ENHANCE_ITEM_ACTION
             || !slot_stock(s, stock, sizeof stock) || !strcmp(stock, s->cur))
             continue;
@@ -1131,13 +1774,18 @@ static void reset_all(void)
     for (int id = 0; id < enhance_action_count() && id < ENHANCE_ACTIONS_MAX; id++) {
         bind_list cur, stock;
         int nc, ns;
-        if (!enhance_action_name(id))
+        if (!enhance_action_name(id) || (m >= 0 && enhance_action_mod(id) != m))
             continue;
         nc = enhance_action_bindings(id, cur, ENHANCE_ACTION_BINDS);
         ns = action_stock(id, stock);
         if (!lists_equal(cur, nc, stock, ns))
             action_set(id, stock, ns);
     }
+}
+
+static void reset_all(void)
+{
+    reset_scope(-1);
     status("Reset to defaults; Save keeps it");
 }
 
@@ -1233,7 +1881,10 @@ static void change_slot(struct slot *s, int dir, int ok)
     const struct enhance_item *it = s->it;
     char v[VAL_MAX];
     if (s->env) {
-        status("Set by the environment");
+        if (s->envname)
+            status("Set by %s", s->envname);
+        else
+            status("Set by the environment");
         return;
     }
     switch (it->kind) {
@@ -1332,11 +1983,13 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
             change_slot(&s_slot[r->ref], dir, ok);
             break;
         case R_MOD: {
-            const struct enhance_item *items[1];
+            /* OK opens the mod's page (D5); left and right still switch it
+             * from the list. */
             int t;
-            if (ok && xbox_mod_items(r->ref, items, 1) > 0) {
+            if (ok) {
                 s_mod_sub = r->ref;
                 s_sel[PAGE_MODS] = 0;
+                s_scroll[PAGE_MODS] = 0;
                 break;
             }
             t = toggle_slot(r->ref);
@@ -1344,6 +1997,20 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
                 change_slot(&s_slot[t], dir, ok);
             break;
         }
+        case R_CTL:
+            if (ok) {
+                const struct xbox_mod_control *c =
+                    &xbox_mod_desc_shown(r->ref >> 8)->controls[r->ref & 0xff];
+                status("%s: read-only for now; set [input.controls] \"%s.%s\" in config.toml",
+                       r->label, xbox_mod_name(r->ref >> 8), c->id);
+            }
+            break;
+        case R_MODRESET:
+            if (ok) {
+                reset_scope(r->ref);
+                status("%s: reset to defaults; Save keeps it", mod_title(r->ref));
+            }
+            break;
         case R_BIND:
             if (ok) {
                 cap_phase(CAP_RELEASE);
@@ -1461,12 +2128,36 @@ static void capture_finish(const char *text)
      * it there first. */
     owner = enhance_action_owner(text, id, bound, sizeof bound);
     if (owner >= 0) {
-        const char *who = enhance_action_label(owner);
-        status("%s refused: %s has it (%s); clear it there first", text,
-               who ? who : "another action", bound);
-        nv2a_overlay_toast("%s refused: %s has it (%s); clear it there first", text,
-                           who ? who : "another action", bound);
+        /* A dormant action keeps its input: the player must see
+         * whose it is, a mod that is off says nothing on the Controls page
+         * of its own. */
+        char who[96];
+        const char *off = enhance_action_dormant(owner) ? " (mod off)" : "";
+        action_who(owner, who, sizeof who);
+        status("%s refused: %s has it (%s)%s; clear it there first", text, who, bound, off);
+        nv2a_overlay_toast("%s refused: %s has it (%s)%s; clear it there first", text, who,
+                           bound, off);
         return;
+    }
+    /* A key a mod's captured control names directly is the mod's while it
+     * captures (D3 conflict rule 2): an action there would fire mid-flight. */
+    for (int m = 0; m < xbox_mod_count(); m++) {
+        const struct xbox_mod_desc *d = xbox_mod_desc_of(m);
+        for (uint32_t k = 0; d && k < d->n_controls; k++) {
+            const struct xbox_mod_control *c = &d->controls[k];
+            bind_list cb;
+            int nb;
+            if (c->kind != XBOX_CTL_BUTTON && c->kind != XBOX_CTL_STICK)
+                continue;
+            nb = xbox_mod_control_bindings(m, k, cb, ENHANCE_ACTION_BINDS, NULL);
+            for (int i = 0; i < nb; i++)
+                if (chord_same(cb[i], text)) {
+                    const char *cl = c->label ? c->label : c->id;
+                    status("%s refused: %s: %s uses it", text, mod_title(m), cl);
+                    nv2a_overlay_toast("%s refused: %s: %s uses it", text, mod_title(m), cl);
+                    return;
+                }
+        }
     }
     if (n >= ENHANCE_ACTION_BINDS) {
         status("%s refused: %d bindings at most", text, ENHANCE_ACTION_BINDS);
@@ -1710,12 +2401,28 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
     const struct slot *sl = rw->type == R_SLOT ? &s_slot[rw->ref] : NULL;
     const struct enhance_item *it = sl ? sl->it : NULL;
     int ro = sl && sl->env;
-    char cut[VAL_MAX * 2];
-    const char *v;
+    mu_Color tint = rw->tint == TINT_BAD ? t->bad : rw->tint == TINT_WARN ? t->warn : t->text_dim;
+    char cut[VAL_MAX * 2], forced[96], uv[VAL_MAX + 32];
+    const char *v, *unit = NULL;
 
+    if (sl && sl->dset >= 0) {
+        int m;
+        uint32_t k;
+        unit = dset_of(it, &m, &k)->unit;
+    }
     if (rw->type == R_HEADER) {
-        int hs = nv2a_ovl_text_height(fs);
-        mu_draw_text(ctx, fs, rw->label, -1, mu_vec2(x, r.y + r.h - hs - nv2a_ovl_px(s, 4)), t->accent);
+        int hs = nv2a_ovl_text_height(fs), hy = r.y + r.h - hs - nv2a_ovl_px(s, 4);
+        mu_draw_text(ctx, fs, rw->label, -1, mu_vec2(x, hy), t->accent);
+        if (rw->value[0])
+            mu_draw_text(ctx, fs, rw->value, -1, mu_vec2(right - text_w(fs, rw->value), hy),
+                         t->text_dim);
+        return;
+    }
+    if (rw->type == R_TEXT) {
+        /* The label column, then the wrapped line text_rows cut to fit. */
+        mu_draw_text(ctx, fb, rw->label, -1, mu_vec2(x, ty), t->text);
+        mu_draw_text(ctx, fb, rw->value, -1, mu_vec2(x + text_col(s), ty),
+                     rw->tint ? tint : t->text);
         return;
     }
     if (selected) {
@@ -1730,8 +2437,12 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
     if (it && it->kind != ENHANCE_ITEM_INFO) {
         int fsh = nv2a_ovl_text_height(fs), fy = r.y + (r.h - fsh) / 2;
         if (ro) {
-            mu_draw_text(ctx, fs, "(environment)", -1, mu_vec2(x, fy), t->text_dim);
-            x += text_w(fs, "(environment)") + nv2a_ovl_px(s, 8);
+            if (sl->envname)
+                snprintf(forced, sizeof forced, "set by %s", sl->envname);
+            else
+                snprintf(forced, sizeof forced, "(environment)");
+            mu_draw_text(ctx, fs, forced, -1, mu_vec2(x, fy), t->text_dim);
+            x += text_w(fs, forced) + nv2a_ovl_px(s, 8);
         } else if (it->live == ENHANCE_LIVE || it->live == ENHANCE_LIVE_FLUSH) {
             int d = nv2a_ovl_px(s, 6);
             nv2a_ovl_ui_rrect(ctx, mu_rect(x, r.y + (r.h - d) / 2, d, d), d / 2, 1.0f,
@@ -1749,6 +2460,16 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
             mu_draw_text(ctx, fs, it->note, -1, mu_vec2(x, fy), t->text_dim);
             x += text_w(fs, it->note) + nv2a_ovl_px(s, 8);
         }
+    } else if (rw->note && *rw->note) {
+        /* A control's "while flying". */
+        int fsh = nv2a_ovl_text_height(fs), fy = r.y + (r.h - fsh) / 2;
+        mu_draw_text(ctx, fs, rw->note, -1, mu_vec2(x, fy), t->text_dim);
+        x += text_w(fs, rw->note) + nv2a_ovl_px(s, 8);
+    }
+    if (unit && *unit && it->kind != ENHANCE_ITEM_TOGGLE) {
+        snprintf(uv, sizeof uv, "%s%s", rw->value, unit);
+    } else {
+        snprintf(uv, sizeof uv, "%s", rw->value);
     }
 
     if (rw->type == R_MOD || (it && it->kind == ENHANCE_ITEM_TOGGLE)) {
@@ -1757,7 +2478,6 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
         draw_pill(ctx, mu_rect(right - pw, r.y + (r.h - ph) / 2, pw, ph), on, ro);
         if (rw->type == R_MOD) {
             enum xbox_mod_state st = xbox_mod_state(rw->ref);
-            const struct enhance_item *items[1];
             const char *w = st == XBOX_MOD_FAILED ? "failed"
                           : st == XBOX_MOD_RESTART || !xbox_mod_has_on_enable(rw->ref)
                               ? "applies at restart" : NULL;
@@ -1765,9 +2485,9 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
             if (w)
                 mu_draw_text(ctx, fs, w, -1, mu_vec2(x, fy),
                              st == XBOX_MOD_FAILED ? t->bad : t->warn);
-            if (xbox_mod_items(rw->ref, items, 1) > 0)
-                mu_draw_text(ctx, fb, ">", -1,
-                             mu_vec2(right - pw - nv2a_ovl_px(s, 20), ty), t->text_dim);
+            /* Every mod has a page (D5). */
+            mu_draw_text(ctx, fb, ">", -1, mu_vec2(right - pw - nv2a_ovl_px(s, 20), ty),
+                         t->text_dim);
         }
         return;
     }
@@ -1782,15 +2502,15 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
         nv2a_ovl_ui_rrect(ctx, mu_rect(tx, cy - tk / 2, fx - tx, tk), tk / 2, 1.0f,
                           ro ? t->text_dim : t->accent);
         nv2a_ovl_ui_rrect(ctx, mu_rect(fx - kn / 2, cy - kn / 2, kn, kn), kn / 2, 1.0f, t->text);
-        mu_draw_text(ctx, fv, rw->value, -1,
-                     mu_vec2(tx - nv2a_ovl_px(s, 12) - text_w(fv, rw->value), ty), t->text);
+        mu_draw_text(ctx, fv, uv, -1, mu_vec2(tx - nv2a_ovl_px(s, 12) - text_w(fv, uv), ty),
+                     ro ? t->text_dim : t->text);
         return;
     }
     if (it && it->kind == ENHANCE_ITEM_CHOICE) {
         int aw = text_w(fb, "<"), sp = nv2a_ovl_px(s, 10);
-        int vw = text_w(fb, rw->value);
+        int vw = text_w(fb, uv);
         mu_draw_text(ctx, fb, ">", -1, mu_vec2(right - aw, ty), t->text_dim);
-        mu_draw_text(ctx, fb, rw->value, -1, mu_vec2(right - aw - sp - vw, ty),
+        mu_draw_text(ctx, fb, uv, -1, mu_vec2(right - aw - sp - vw, ty),
                      ro ? t->text_dim : t->text);
         mu_draw_text(ctx, fb, "<", -1, mu_vec2(right - 2 * aw - 2 * sp - vw, ty), t->text_dim);
         return;
@@ -1805,8 +2525,7 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
     if (!rw->value[0])
         return;
     v = fit(fb, rw->value, right - x, cut, sizeof cut);
-    mu_draw_text(ctx, fb, v, -1, mu_vec2(right - text_w(fb, v), ty),
-                 rw->tint ? *rw->tint : t->text_dim);
+    mu_draw_text(ctx, fb, v, -1, mu_vec2(right - text_w(fb, v), ty), tint);
 }
 
 static void draw_graph(mu_Context *ctx, mu_Rect g, float s)
@@ -1835,7 +2554,8 @@ void enhance_menu_draw(uint64_t now_ms)
 {
     const struct nv2a_ovl_theme *t = &nv2a_ovl_theme_default;
     mu_Context *ctx;
-    int px, py, w, h, pad, gap, rowh, rgap, pw, ph, x0, y0, y, inner;
+    struct geom g;
+    int w, h, pad, gap, rowh, rgap, pw, ph, x0, y0, y, inner;
     int area_y, area_h, foot_h, vis, *scroll, sel;
     float s;
     mu_Font ft, fb, fs;
@@ -1843,9 +2563,9 @@ void enhance_menu_draw(uint64_t now_ms)
     s_now = now_ms;
     if (s_state != ST_OPEN)
         return;
-    nv2a_overlay_placement(&px, &py, &w, &h);
-    if (w <= 0 || h <= 0)
-        w = 1920, h = 1080;
+    /* One geometry for the draw and the wrap (text_rows): two copies could
+     * drift and clip or overlap a wrapped row. */
+    geom_of(&g, &w, &h);
     ctx = nv2a_overlay_ui_begin(NV2A_OVL_MENU);
     if (!ctx)
         return;
@@ -1853,22 +2573,15 @@ void enhance_menu_draw(uint64_t now_ms)
     build_rows();
     s_draw_w = w;
     s_draw_h = h;
-    s = nv2a_ovl_ui_scale((uint32_t)h);
+    s = g.s;
     ft = OVL_FONT(OVL_FONT_TITLE, nv2a_ovl_px(s, t->font_title), 0);
     fb = OVL_FONT(OVL_FONT_BODY, nv2a_ovl_px(s, t->font_body), 0);
     fs = OVL_FONT(OVL_FONT_SMALL, nv2a_ovl_px(s, t->font_small), 0);
-    pad = nv2a_ovl_px(s, t->pad);
-    gap = nv2a_ovl_px(s, t->gap);
-    rowh = nv2a_ovl_px(s, t->row_h);
-    rgap = nv2a_ovl_px(s, 4);
-
-    /* R8: a panel on the left, 40% of the width up to 720 px at 1080; the
-     * whole width on a narrow or portrait output. */
-    pw = (int)(w * 0.40f);
-    if (pw > nv2a_ovl_px(s, 720))
-        pw = nv2a_ovl_px(s, 720);
-    if (w < 640 || h > w)
-        pw = w - 2 * pad;
+    pad = g.pad;
+    gap = g.gap;
+    rowh = g.rowh;
+    rgap = g.rgap;
+    pw = g.pw;
     ph = h - 2 * pad;
     x0 = pad;
     y0 = pad;
@@ -1951,7 +2664,12 @@ void enhance_menu_draw(uint64_t now_ms)
                             ? live_tag(xbox_mod_has_on_enable(cur->ref) ? ENHANCE_LIVE
                                                                        : ENHANCE_LIVE_RESTART)
                         : cur && cur->type == R_BIND ? "live" : "";
-        if (s_status[0] && s_status_t && now_ms - s_status_t < STATUS_MS)
+        /* The selected row's help stands in for the controls while no
+         * status shows (D5): the status line still wins. */
+        int news = s_status[0] && s_status_t && now_ms - s_status_t < STATUS_MS;
+        if (cur && cur->sel && cur->help[0] && !news)
+            hint = cur->help;
+        if (news)
             snprintf(right, sizeof right, "%s", s_status);
         else if (un)
             snprintf(right, sizeof right, "%d unsaved%s%s", un, *tag ? " \xC2\xB7 " : "", tag);
@@ -2131,6 +2849,18 @@ int enhance_menu_row(int i, char *label, size_t ln, char *value, size_t vn, int 
     return 1;
 }
 
+int enhance_menu_row_live(int i)
+{
+    if (i < 0 || i >= s_nrow || s_row[i].type != R_SLOT)
+        return -1;
+    return (int)s_slot[s_row[i].ref].it->live;
+}
+
+const char *enhance_menu_row_help(int i)
+{
+    return i >= 0 && i < s_nrow ? s_row[i].help : NULL;
+}
+
 int enhance_menu_select_row(const char *label)
 {
     build_rows();
@@ -2177,6 +2907,8 @@ void enhance_menu_reset_for_test(void)
     memset(s_rate, 0, sizeof s_rate);
     memset(s_adirty, 0, sizeof s_adirty);
     s_nslot = 0;
+    s_nset = 0;
+    s_rw_done = 0;
     s_built = 0;
     s_ntitle = 0;
     s_pack_off = 0;
