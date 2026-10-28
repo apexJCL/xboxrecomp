@@ -739,6 +739,101 @@ static void test_extras_flag(void)
     xbox_InputSetBackend(NULL);
 }
 
+/* The host rumble gate (pad_map.h): changes at most once per
+ * XBOX_RUMBLE_MIN_MS with the latest winning, a stop at once, levels
+ * compared by their high byte, a held level renewed only on asks, nothing
+ * for a pad that stays still. */
+static void test_rumble_gate(void)
+{
+    xbox_rumble_gate g;
+    uint16_t l = 0, r = 0;
+    uint64_t t = 5000;
+    int sent = 0;
+
+    xbox_RumbleGateReset(&g);
+    xbox_RumbleGateSet(&g, 0, 0);
+    CHECK(!xbox_RumbleGatePoll(&g, t, 1, &l, &r), "still pad, still ask: sent");
+
+    /* The first change goes at once. */
+    xbox_RumbleGateSet(&g, 30000, 10000);
+    CHECK(xbox_RumbleGatePoll(&g, t, 1, &l, &r) && l == 30000 && r == 10000,
+          "first change held back or wrong: %u %u", l, r);
+
+    /* BLiNX's rate, a new level every 48 ms for a second: at most one
+     * change per XBOX_RUMBLE_MIN_MS reaches the host. */
+    for (int i = 0; i < 21; i++) {
+        t += 48;
+        xbox_RumbleGateSet(&g, (uint16_t)(30000 - i * 1000), 10000);
+        sent += xbox_RumbleGatePoll(&g, t, 1, &l, &r);
+    }
+    CHECK(sent >= 5 && sent <= 1000 / XBOX_RUMBLE_MIN_MS + 1,
+          "%d changes sent in ~1 s, want <= %u", sent, 1000 / XBOX_RUMBLE_MIN_MS + 1);
+
+    /* A change held back lands from the loop (asked 0), the latest one. */
+    t += 1;
+    xbox_RumbleGateSet(&g, 1234, 0);
+    xbox_RumbleGateSet(&g, 5000, 0);
+    CHECK(!xbox_RumbleGatePoll(&g, t, 1, &l, &r), "a change inside the window was sent");
+    t += XBOX_RUMBLE_MIN_MS;
+    CHECK(xbox_RumbleGatePoll(&g, t, 0, &l, &r) && l == 5000 && r == 0,
+          "the held change did not land: %u %u", l, r);
+
+    /* A stop goes at once, inside the window: xbox_InputShutdown sends one
+     * with no loop after it to land a held one. */
+    xbox_RumbleGateSet(&g, 0, 0);
+    CHECK(xbox_RumbleGatePoll(&g, t + 1, 1, &l, &r) && l == 0 && r == 0,
+          "a stop 1 ms after a send was held back: %u %u", l, r);
+    CHECK(!xbox_RumbleGatePoll(&g, t + 10000, 0, &l, &r), "a stop was repeated");
+    CHECK(!xbox_RumbleGatePoll(&g, t + 10000, 1, &l, &r), "a stop was repeated on an ask");
+
+    /* Levels compare as the pad gets them, the high byte: a change in the
+     * low byte alone is the same report, never sent; a level under 256 is
+     * still not a stop. */
+    t += 1000;
+    xbox_RumbleGateSet(&g, 0x1200, 0x3400);
+    CHECK(xbox_RumbleGatePoll(&g, t, 1, &l, &r), "a start after a still second held back");
+    t += XBOX_RUMBLE_MIN_MS;
+    xbox_RumbleGateSet(&g, 0x12ff, 0x3401);
+    CHECK(!xbox_RumbleGatePoll(&g, t, 1, &l, &r), "a low-byte change was sent");
+    CHECK(!xbox_RumbleGatePoll(&g, t + 1, 0, &l, &r), "a low-byte change landed from the loop");
+    xbox_RumbleGateSet(&g, 0x0050, 0);
+    CHECK(xbox_RumbleGatePoll(&g, t + 1, 1, &l, &r) && l == 0x0050 && r == 0,
+          "a level under 256 was taken for no change: %u %u", l, r);
+    xbox_RumbleGateSet(&g, 0, 0);
+    CHECK(xbox_RumbleGatePoll(&g, t + 2, 1, &l, &r) && l == 0 && r == 0,
+          "the stop from a level under 256 did not go: %u %u", l, r);
+
+    /* A held level: renewed on asks every XBOX_RUMBLE_REFRESH_MS, with the
+     * level SDL already has (so it writes nothing), never by the loop
+     * alone, so a title that stops asking stops rumbling. */
+    t += 1000;
+    xbox_RumbleGateSet(&g, 500, 500);
+    CHECK(xbox_RumbleGatePoll(&g, t, 1, &l, &r), "a start after a still second held back");
+    sent = 0;
+    for (int i = 0; i < 40; i++) {
+        t += 50;
+        xbox_RumbleGateSet(&g, (uint16_t)(500 + i % 7), 500);
+        if (xbox_RumbleGatePoll(&g, t, 1, &l, &r)) {
+            sent++;
+            CHECK(l == 500 && r == 500, "a renewal changed the level: %u %u", l, r);
+        }
+    }
+    CHECK(sent == 4, "%d renewals in 2 s of asks, want 4", sent);
+    CHECK(!xbox_RumbleGatePoll(&g, t + 5000, 0, &l, &r), "the loop renewed a level");
+
+    /* A renewal is no change: a real change right after one still goes. */
+    xbox_RumbleGateSet(&g, 9000, 9000);
+    CHECK(xbox_RumbleGatePoll(&g, t + 1, 1, &l, &r) && l == 9000 && r == 9000,
+          "a change 1 ms after a renewal was held back: %u %u", l, r);
+
+    /* A clock at 0 still counts as a send. */
+    xbox_RumbleGateReset(&g);
+    xbox_RumbleGateSet(&g, 1, 1);
+    CHECK(xbox_RumbleGatePoll(&g, 0, 1, &l, &r), "a change at t=0 held back");
+    xbox_RumbleGateSet(&g, 2, 2);
+    CHECK(!xbox_RumbleGatePoll(&g, 1, 1, &l, &r), "a change 1 ms after t=0 sent");
+}
+
 int main(int argc, char **argv)
 {
     xbox_InputSetDeadzone(0);
@@ -750,6 +845,7 @@ int main(int argc, char **argv)
     test_identity();
     test_setup();
     test_extras_flag();
+    test_rumble_gate();
     printf("pad_map: %d checks, %d failed\n", g_checks, g_fail);
     return g_fail ? 1 : 0;
 }

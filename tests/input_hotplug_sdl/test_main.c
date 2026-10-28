@@ -450,6 +450,134 @@ static void test_threads(void)
     EXPECT(0x0, 0, 0x1, "kept pad pulled");
 }
 
+/* ── 5. rumble at the title's rate ──────────────────────────────────── */
+
+/* What the virtual pad's motors were told, and how often. */
+static int      g_rumbles;
+static uint16_t g_rumble_l, g_rumble_r;
+
+static bool SDLCALL on_rumble(void *ud, Uint16 low, Uint16 high)
+{
+    (void)ud;
+    __atomic_add_fetch(&g_rumbles, 1, __ATOMIC_ACQ_REL);
+    __atomic_store_n(&g_rumble_l, low, __ATOMIC_RELEASE);
+    __atomic_store_n(&g_rumble_r, high, __ATOMIC_RELEASE);
+    return true;
+}
+
+static SDL_JoystickID g_rumble_pad;
+static int            g_saw_move;
+static volatile int   g_guest_done;
+
+/* The guest: BLiNX's XID output report every ~48 ms with a new level each
+ * time, its input report read between them, and the player pushing the
+ * stick halfway through. */
+static void *rumble_guest(void *arg)
+{
+    XBOX_INPUT_STATE st;
+    (void)arg;
+    for (int i = 0; i < 21; i++) {
+        XBOX_VIBRATION v = { (WORD)(30000 - i * 1000), (WORD)(i * 500) };
+        CHECK(xbox_InputSetState(0, &v) == ERROR_SUCCESS, "rumble %d refused", i);
+        if (i == 10)
+            SDL_SetJoystickVirtualAxis(SDL_GetJoystickFromID(g_rumble_pad),
+                                       SDL_GAMEPAD_AXIS_LEFTX, 32767);
+        if (xbox_InputGetState(0, &st) == ERROR_SUCCESS && i > 10
+            && st.Gamepad.sThumbLX > 16000)
+            g_saw_move = 1;
+        SDL_Delay(48);
+    }
+    {
+        XBOX_VIBRATION off = { 0, 0 };
+        xbox_InputSetState(0, &off);
+    }
+    __atomic_store_n(&g_guest_done, 1, __ATOMIC_RELEASE);
+    return NULL;
+}
+
+/* The gate through the real backend: changes reach the motors at most
+ * once per XBOX_RUMBLE_MIN_MS, the stop lands, and xbox_InputShutdown stops
+ * the motors right after a send. A virtual pad calls its Rumble callback
+ * directly, with no HIDAPI rumble thread or device lock, so this cannot
+ * reproduce the input starvation the gate is for; the stick check is only
+ * a smoke check that reads still work while the motors are driven. */
+static void test_rumble(void)
+{
+    SDL_VirtualJoystickDesc d;
+    uint32_t ins, rem;
+    uint64_t t0, elapsed;
+    pthread_t t;
+    int n;
+
+    SDL_INIT_INTERFACE(&d);
+    d.type       = SDL_JOYSTICK_TYPE_GAMEPAD;
+    d.naxes      = 6;
+    d.nbuttons   = 15;
+    d.vendor_id  = 0x1234;
+    d.product_id = 0x80;
+    d.name       = "rumble test pad";
+    d.Rumble     = on_rumble;
+    g_rumble_pad = SDL_AttachVirtualJoystick(&d);
+    CHECK(g_rumble_pad != 0, "rumble pad attach: %s", SDL_GetError());
+    if (!g_rumble_pad)
+        return;
+    step(&ins, &rem);
+    CHECK(xbox_InputIsConnected(0), "rumble pad not on port 0");
+    g_rumbles = 0;
+    g_saw_move = 0;
+    g_guest_done = 0;
+    t0 = SDL_GetTicks();
+    if (g_window) {
+        pthread_create(&t, NULL, rumble_guest, NULL);
+        while (!__atomic_load_n(&g_guest_done, __ATOMIC_ACQUIRE)) {
+            xbox_InputSdlPadSync();
+            SDL_UpdateGamepads();       /* the window's pump would */
+            SDL_Delay(5);
+        }
+        pthread_join(t, NULL);
+    } else {
+        rumble_guest(NULL);
+    }
+    elapsed = SDL_GetTicks() - t0;
+    /* The stop goes at once; the loop (or the reads) running on after it
+     * must not send anything more. */
+    for (int i = 0; i < 30; i++) {
+        XBOX_INPUT_STATE st;
+        SDL_Delay(10);
+        if (g_window)
+            xbox_InputSdlPadSync();
+        else
+            xbox_InputGetState(0, &st);
+    }
+    n = __atomic_load_n(&g_rumbles, __ATOMIC_ACQUIRE);
+    /* 22 asks over the guest's run (about 1 s, longer on a loaded host):
+     * one start, a change per window at most, then the stop. */
+    CHECK(n >= 3 && n <= (int)(elapsed / XBOX_RUMBLE_MIN_MS) + 2,
+          "%s: the motors were told %d times for 22 asks in %llu ms",
+          g_window ? "window" : "headless", n, (unsigned long long)elapsed);
+    CHECK(g_rumble_l == 0 && g_rumble_r == 0, "%s: the stop did not land (%u %u)",
+          g_window ? "window" : "headless", g_rumble_l, g_rumble_r);
+    CHECK(g_saw_move, "%s: the stick did not move through the rumble",
+          g_window ? "window" : "headless");
+
+    /* Shutdown right after a send, with a change held back by the gate and
+     * no loop after it: the motors still stop. */
+    {
+        XBOX_VIBRATION a = { 20000, 20000 }, b = { 40000, 40000 };
+        CHECK(xbox_InputSetState(0, &a) == ERROR_SUCCESS, "rumble before shutdown refused");
+        CHECK(xbox_InputSetState(0, &b) == ERROR_SUCCESS, "rumble before shutdown refused");
+        CHECK(__atomic_load_n(&g_rumble_l, __ATOMIC_ACQUIRE) == 20000,
+              "%s: the second change was not held back (%u)",
+              g_window ? "window" : "headless", g_rumble_l);
+        xbox_InputShutdown();
+        CHECK(g_rumble_l == 0 && g_rumble_r == 0, "%s: shutdown left the motors on (%u %u)",
+              g_window ? "window" : "headless", g_rumble_l, g_rumble_r);
+    }
+    SDL_SetJoystickVirtualAxis(SDL_GetJoystickFromID(g_rumble_pad), SDL_GAMEPAD_AXIS_LEFTX, 0);
+    detach(g_rumble_pad);
+    step(&ins, &rem);
+}
+
 int main(void)
 {
     int v = SDL_GetVersion(), n = 0;
@@ -479,6 +607,7 @@ int main(void)
     xbox_InputSetMainPump(0);
     test_basic();
     test_memory();
+    test_rumble();
     /* Under a window again, this thread standing in for its loop. */
     g_window = 1;
     xbox_InputSetMainPump(1);
@@ -486,6 +615,7 @@ int main(void)
     test_memory();
     test_families();
     test_threads();
+    test_rumble();
     printf("input_hotplug_sdl (SDL %d.%d.%d): %d checks, %d failed\n",
            SDL_VERSIONNUM_MAJOR(v), SDL_VERSIONNUM_MINOR(v), SDL_VERSIONNUM_MICRO(v),
            g_checks, g_fail);

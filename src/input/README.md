@@ -353,6 +353,28 @@ pad connected before launch is connected at the first read.
 `tests/input_hotplug_sdl` checks it with SDL's virtual joysticks.
 `xbox_InputSetState` reaches only connected ports; `xbox_InputShutdown`
 (also registered with `atexit` by `xbox_InputInit`) stops every motor.
+On SDL hosts a rumble gate (`xbox_RumbleGate*` in `pad_map.h`) passes a
+change of level to the pad at most every 100 ms, the latest one winning,
+and a stop at once, so the shutdown stop lands with no loop after it.
+Levels compare by their high byte, the part SDL's HIDAPI drivers send (the
+8BitDo one sends only that), so a change SDL would write as the same report
+is no change. A held level is renewed every 500 ms while the title keeps
+asking; a title that stops asking without a stop stops rumbling within
+SDL's 1 s duration. Titles ask far more often (BLiNX sends about 21 output
+reports a second), and each change is an output report that SDL's HIDAPI
+drivers write while holding the lock the pad's input update needs. An
+8BitDo pad over Bluetooth on macOS was seen to lose its input after a
+rumble; that this is the cause is not confirmed, and fewer writes lower the
+exposure without curing a write that blocks. A held-back change lands from
+the window's loop, or from the next poll when headless. `tests/pad_map`
+checks the gate. `tests/input_hotplug_sdl` checks its rate, the stop and
+the shutdown through a virtual pad, which has no HIDAPI rumble thread, so it
+does not reproduce the starvation. Native Linux SDL builds take the gate
+too, which costs a change at most 100 ms. The XInput backend (native Windows, and
+Proton, where Wine's XInput sits on winebus) is not gated: `XInputSetState`
+goes to the XInput driver and shares no lock with the input reads in the
+game's process, and the macOS synchronous write the gate guards against
+is not on that path.
 
 ## Ports
 

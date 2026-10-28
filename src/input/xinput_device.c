@@ -184,6 +184,7 @@ struct sdl_slot {
     int             had;    /* guid is set */
     int             family; /* atomic: the last sdl_family/steam_input read, */
     int             steam;  /* returned while another thread holds the lock */
+    xbox_rumble_gate rumble; /* what the guest asks vs what SDL was given */
 };
 static struct sdl_slot  g_slot[XBOX_MAX_CONTROLLERS];
 static pthread_mutex_t  g_slot_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -253,6 +254,7 @@ static void close_slot(int port)
 {
     SDL_CloseGamepad(g_slot[port].pad);
     g_slot[port].pad = NULL;
+    xbox_RumbleGateReset(&g_slot[port].rumble);
     __atomic_store_n(&g_slot[port].family, XBOX_PAD_FAMILY_XBOX, __ATOMIC_RELEASE);
     __atomic_store_n(&g_slot[port].steam, 0, __ATOMIC_RELEASE);
     fprintf(stderr, "[INPUT] host pad removed port=%d\n", port);
@@ -286,11 +288,29 @@ static void open_device(SDL_JoystickID id)
     g_slot[port].id   = id;
     g_slot[port].guid = g;
     g_slot[port].had  = 1;
+    xbox_RumbleGateReset(&g_slot[port].rumble);
     __atomic_store_n(&g_slot[port].family, pad_family(c), __ATOMIC_RELEASE);
     __atomic_store_n(&g_slot[port].steam, pad_steam(c), __ATOMIC_RELEASE);
     name = SDL_GetGamepadName(c);
     fprintf(stderr, "[INPUT] host pad added port=%d \"%s\"\n", port, name ? name : "?");
     fflush(stderr);
+}
+
+/* g_slot_lock held. Hand SDL the rumble level the gate lets through
+ * (pad_map.h: a title's stream of changes, passed straight on, can starve
+ * an HIDAPI pad's input reads). SDL rumble needs a duration: ~1 s, renewed
+ * by the gate while the title keeps asking; 0 stops it. */
+static void flush_rumble(int port, int asked)
+{
+    SDL_Gamepad *c = g_slot[port].pad;
+    uint16_t l, r;
+
+    /* The result is ignored and the gate counts the level sent. SDL keeps
+     * its old level when the driver refuses one, so the gate's next renewal
+     * is a change to SDL and tries again; a refused stop leaves the old
+     * level, which SDL's duration ends within 1 s. */
+    if (c && xbox_RumbleGatePoll(&g_slot[port].rumble, sdl_now_ms(), asked, &l, &r))
+        (void)SDL_RumbleGamepad(c, l, r, (l || r) ? 1000 : 0);
 }
 
 /* g_slot_lock held, on the pumping thread. Close what SDL lost, open what
@@ -358,6 +378,9 @@ void xbox_InputSdlPadSync(void)
         start_sdl();
     else
         maybe_rescan();
+    /* A change the gate held back lands here, within a loop of its time. */
+    for (int p = 0; p < XBOX_MAX_CONTROLLERS; p++)
+        flush_rumble(p, 0);
     pthread_mutex_unlock(&g_slot_lock);
 }
 
@@ -436,6 +459,8 @@ static DWORD sdl_get_raw(DWORD port, InputRaw *raw, DWORD *packet, int extras)
         pthread_mutex_unlock(&g_slot_lock);
         return ERROR_DEVICE_NOT_CONNECTED;
     }
+    if (!g_main_pump)
+        flush_rumble((int)port, 0);     /* headless, the reads are the loop */
     sdl_read_pad(c, &pad);
     /* The buttons past the Duke only when the host actions are armed or the
      * map names one, as the XInput backend does with Guide. */
@@ -452,11 +477,10 @@ static DWORD sdl_set_state(DWORD port, const XBOX_VIBRATION *v)
 
     pthread_mutex_lock(&g_slot_lock);
     c = g_slot[port].pad;
-    /* SDL rumble needs a duration; refresh for ~1s on each call (the game
-     * polls vibration continuously). 0 stops it. */
-    if (c)
-        SDL_RumbleGamepad(c, v->wLeftMotorSpeed, v->wRightMotorSpeed,
-                          (v->wLeftMotorSpeed || v->wRightMotorSpeed) ? 1000 : 0);
+    if (c) {
+        xbox_RumbleGateSet(&g_slot[port].rumble, v->wLeftMotorSpeed, v->wRightMotorSpeed);
+        flush_rumble((int)port, 1);
+    }
     pthread_mutex_unlock(&g_slot_lock);
     return c ? ERROR_SUCCESS : ERROR_DEVICE_NOT_CONNECTED;
 }

@@ -479,3 +479,63 @@ size_t xbox_PadMapReadmeRow(size_t i, char *buf, size_t size)
         return 0;
     return n < 0 ? 0 : (size_t)n;
 }
+
+void xbox_RumbleGateReset(xbox_rumble_gate *g)
+{
+    memset(g, 0, sizeof *g);
+}
+
+void xbox_RumbleGateSet(xbox_rumble_gate *g, uint16_t left, uint16_t right)
+{
+    g->want_l = left;
+    g->want_r = right;
+}
+
+/* The level as the pad receives it. The 8BitDo HIDAPI driver writes only
+ * the high byte of each motor, and the other HIDAPI drivers send 8 bits or
+ * fewer as far as known (PlayStation and Xbox 360 take the high byte, Xbox
+ * One scales to 0-100, GameCube and Wii are on or off), so two levels with
+ * the same high byte are the same report, and SDL, which compares all 16
+ * bits, would still write it. A driver with finer steps (GCController
+ * haptics) loses steps under 1/256 of full scale, which no pad motor
+ * renders. Any non-zero level stays non-zero, so a stop is never mistaken
+ * for a still-running level. */
+static unsigned rumble_wire(uint16_t v)
+{
+    return v ? ((v >> 8) ? (v >> 8) : 1u) : 0u;
+}
+
+int xbox_RumbleGatePoll(xbox_rumble_gate *g, uint64_t now_ms, int asked,
+                        uint16_t *left, uint16_t *right)
+{
+    int same = rumble_wire(g->want_l) == rumble_wire(g->sent_l)
+            && rumble_wire(g->want_r) == rumble_wire(g->sent_r);
+    int stop = !g->want_l && !g->want_r;
+    /* 0 means never, so a clock at 0 still counts as a send. */
+    uint64_t at = now_ms ? now_ms : 1;
+
+    if (same) {
+        /* Still is still, and only the title's asks keep a level alive. */
+        if (!asked || stop)
+            return 0;
+        if (now_ms - g->renew_ms < XBOX_RUMBLE_REFRESH_MS)
+            return 0;
+        /* Renew with the level SDL already has, so it only extends the
+         * duration and writes nothing. A renewal is no change: it leaves
+         * sent_ms alone, so it never delays a real change after it. */
+        g->renew_ms = at;
+        *left = g->sent_l;
+        *right = g->sent_r;
+        return 1;
+    }
+    /* A stop goes at once: it is one report, never the stream, and the one
+     * that must land (xbox_InputShutdown sends it with no loop after it). */
+    if (!stop && g->sent_ms && now_ms - g->sent_ms < XBOX_RUMBLE_MIN_MS)
+        return 0;
+    g->sent_l = g->want_l;
+    g->sent_r = g->want_r;
+    g->sent_ms = g->renew_ms = at;
+    *left = g->sent_l;
+    *right = g->sent_r;
+    return 1;
+}

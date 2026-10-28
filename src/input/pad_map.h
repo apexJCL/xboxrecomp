@@ -210,6 +210,49 @@ void xbox_PadSetupApply(const xbox_pad_setup *s, const InputRaw *raw, XBOX_GAMEP
 void xbox_InputSetPadSetup(const xbox_pad_setup *s);
 void xbox_InputPadSetup(xbox_pad_setup *out);
 
+/* Host rumble gate, for the SDL backend. A title asks for vibration at its
+ * own rate (BLiNX, for example, sends an XID SET_REPORT about 21 times a
+ * second, rumble or not), so a level that varies can change on every one.
+ * Each change SDL's HIDAPI drivers turn into an output report, and their
+ * rumble thread holds the device lock across the write, while the input
+ * update only tries that lock and skips the pad when it is held. On macOS the write is a
+ * synchronous IOHIDDeviceSetReport, which can be slow over Bluetooth. A
+ * pad that loses its input (it keeps its last stick and buttons, still
+ * connected, and the character runs on by itself) was seen with an 8BitDo
+ * pad over Bluetooth after a rumble. The cause is not confirmed: a write
+ * that blocks for long, or a pad that stops reporting while it is flooded
+ * with output reports. Fewer writes lower the exposure to both, though
+ * they cannot cure a write that blocks. The gate passes a change at most
+ * once per XBOX_RUMBLE_MIN_MS, the latest one winning, and a stop at once,
+ * so at most a change and a stop reach the pad per window. Levels are
+ * compared as the pad receives them (the high byte), so a change SDL would
+ * write as the same report is no change. A held non-zero level is renewed,
+ * on an ask, every XBOX_RUMBLE_REFRESH_MS so the duration SDL needs does
+ * not run out while the title keeps asking (SDL writes nothing for an
+ * unchanged level); a title that stops asking without a stop stops
+ * rumbling within SDL's 1 s duration. Pure: the caller owns the clock and
+ * the lock. */
+#define XBOX_RUMBLE_MIN_MS      100u
+#define XBOX_RUMBLE_REFRESH_MS  500u
+
+typedef struct xbox_rumble_gate {
+    uint16_t want_l, want_r;    /* the latest level asked for */
+    uint16_t sent_l, sent_r;    /* the last level handed to the host */
+    uint64_t sent_ms;           /* when that level changed; 0 = never */
+    uint64_t renew_ms;          /* when it was last changed or renewed */
+} xbox_rumble_gate;
+
+/* Forget everything: a new pad starts still. */
+void xbox_RumbleGateReset(xbox_rumble_gate *g);
+/* Record what the guest asks for; nothing reaches the host here. */
+void xbox_RumbleGateSet(xbox_rumble_gate *g, uint16_t left, uint16_t right);
+/* 1 with *left/*right set when the host should be given that level now
+ * (and the gate counts it sent), else 0. Call it with asked = 1 right after
+ * each Set, and with asked = 0 from a loop that keeps running, so a
+ * held-back change still lands; only an ask repeats a held level. */
+int  xbox_RumbleGatePoll(xbox_rumble_gate *g, uint64_t now_ms, int asked,
+                         uint16_t *left, uint16_t *right);
+
 #ifdef __cplusplus
 }
 #endif
