@@ -308,6 +308,7 @@ extern "C" {
     X(PROF,              TRACE, "prof",            NULL,                       "=hz (1: 250): sample every thread's pc in-process (Windows, Wine, macOS); report at exit, module offsets for the bench to symbolise (host_prof.h)") \
     X(PROF_DELAY,        TRACE, "prof_delay",      NULL,                       "=s: prof starts sampling after this many seconds (default 0)") \
     X(PROF_OUT,          TRACE, "prof_out",        NULL,                       "=path: prof's report (default recomp-prof.txt in the working directory)") \
+    X(MEM_TRACE,         TRACE, "mem",             NULL,                       "=s (bare: 1): a [MEM] sample line (process RAM and GPU memory) every s seconds; the [MEM] exit line prints always (mem_stats.h)") \
     X(GUEST_CPU_TRACE,   TRACE, "guest_cpu",       "RECOMP_GUEST_CPU_TRACE",   "=ms: [GUEST] each hold of the guest CPU (RECOMP_GUEST_LOCK) longer than ms and where it ended (first 50, then one a second)") \
     X(VBLANK_CLOCK,      DEBUG, "vblank_clock",    NULL,                       "=ms: the old millisecond vblank schedule and timer loop (A/B)") \
     X(MISSING,           TRACE, "missing",         "RECOMP_MISSING_FILES",     "missing game files, one line each and an exit summary; default on, =0 off, =all also absent directories, other trees, probes, every FAILED repeat and NtOpenFile/IoCreateFile successes") \

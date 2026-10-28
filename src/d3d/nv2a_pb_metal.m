@@ -69,6 +69,7 @@
 #include <math.h>
 #include <stddef.h>
 #include "recomp_env.h"
+#include "mem_stats.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -3492,6 +3493,11 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
         }
     }
     s_presents++;
+    /* The [MEM] exit line's GPU figure: every allocation this device made
+     * for the process (the presenter's too, on the shared device). Unified
+     * memory has no separate non-local pool. */
+    if (s_dev && (s_presents == 1 || s_presents % 60 == 0))
+        mem_stats_gpu_note("metal", (uint64_t)[s_dev currentAllocatedSize], MEM_STATS_NA);
     flip_log(surface_offset, rt);
     if (s_presents == 1 || (s_presents % 300) == 0)
         fprintf(stderr, LOGP "present #%llu: surface 0x%08X (%s), %llu clears,"

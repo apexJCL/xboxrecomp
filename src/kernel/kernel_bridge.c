@@ -32,6 +32,7 @@
 #include "recomp_env.h"
 #include "platform/host_time.h"
 #include "platform/host_prof.h"
+#include "platform/mem_stats.h"
 #include "recomp_exit_hook.h"
 #include "guest_vmem.h"
 #include "xbe_sections.h"
@@ -566,6 +567,8 @@ void xbox_log_thread_role(const char *role, uint32_t routine)
         main_tid = GetCurrentThreadId();
         /* RECOMP_TRACE=prof: the earliest point every host passes once. */
         host_prof_start_from_env();
+        /* The [MEM] exit line, from here so a bench's SIGINT finds it. */
+        mem_stats_start_from_env();
     }
     /* Not the initial thread: on Linux (Wine included) its name is the
      * process comm, so renaming it to guest-main breaks pgrep and ps. */

@@ -32,9 +32,11 @@
 #include <windows.h>
 #include "recomp_env.h"
 #include "recomp_exit_hook.h"
+#include "mem_stats.h"
 #include <d3d11.h>
 #include <d3d11_1.h>   /* ID3D11DeviceContext1::ClearView, for a partial clear */
 #include <dxgi.h>
+#include <dxgi1_4.h>  /* IDXGIAdapter3::QueryVideoMemoryInfo, the [MEM] line */
 #include <d3dcompiler.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -4529,6 +4531,50 @@ static void ovl_present(void)
 static int s_probe_x = -1, s_probe_y;
 static uint32_t s_probe_px = 0xDEADBEEFu;
 
+/* The [MEM] exit line's GPU figures: this process's video memory in the
+ * adapter's local and non-local segments (DXGI 1.4; Windows 10 and DXVK).
+ * An adapter without IDXGIAdapter3 leaves them n/a. Called every 60
+ * presents on the render thread. The adapter is held per device: a new
+ * s_dev drops it and asks again, so it never outlives the device. */
+static void gpu_mem_note(void)
+{
+    static IDXGIAdapter3 *a3;
+    static ID3D11Device *a3_dev;
+    static int said;
+    DXGI_QUERY_VIDEO_MEMORY_INFO loc, nl;
+
+    if (a3_dev != s_dev) {
+        IDXGIDevice *dd = NULL;
+        IDXGIAdapter *ad = NULL;
+        if (a3)
+            IDXGIAdapter3_Release(a3);
+        a3 = NULL;
+        a3_dev = s_dev;
+        if (s_dev && SUCCEEDED(ID3D11Device_QueryInterface(s_dev, &IID_IDXGIDevice,
+                                                           (void **)&dd)) && dd) {
+            if (SUCCEEDED(IDXGIDevice_GetAdapter(dd, &ad)) && ad) {
+                if (FAILED(IDXGIAdapter_QueryInterface(ad, &IID_IDXGIAdapter3,
+                                                       (void **)&a3)))
+                    a3 = NULL;
+                IDXGIAdapter_Release(ad);
+            }
+            IDXGIDevice_Release(dd);
+        }
+        if (!a3 && s_dev && !said) {
+            said = 1;
+            fprintf(stderr, LOGP "no IDXGIAdapter3: the [MEM] line has no GPU figures\n");
+        }
+    }
+    if (!a3)
+        return;
+    if (FAILED(IDXGIAdapter3_QueryVideoMemoryInfo(a3, 0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &loc)))
+        loc.CurrentUsage = MEM_STATS_NA;
+    if (FAILED(IDXGIAdapter3_QueryVideoMemoryInfo(a3, 0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL,
+                                                  &nl)))
+        nl.CurrentUsage = MEM_STATS_NA;
+    mem_stats_gpu_note("d3d11", loc.CurrentUsage, nl.CurrentUsage);
+}
+
 static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
 {
     HRESULT hr;
@@ -4646,6 +4692,8 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
     if (s_occ.ops)
         nv2a_occ_flip(&s_occ);
     flip_log(surface_offset);
+    if (s_presents == 1 || s_presents % 60 == 0)
+        gpu_mem_note();
     if (s_presents == 1 || (s_presents % 300) == 0)
         fprintf(stderr, LOGP "present #%llu: surface 0x%08X (walker said 0x%08X),"
                 " %llu clears, %llu draws, %llu skipped, %llu culled, %llu texture uploads,"

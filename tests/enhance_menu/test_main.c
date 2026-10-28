@@ -1249,7 +1249,7 @@ static void test_pages(void)
     /* Render, Pack, Game, Mods, Stats, Controls, Debug, Save. */
     static const uint32_t k_sum[8] = {
         0x5220FD06u, 0xC5E14D56u, 0xC918F275u, 0xEF138353u,
-        0x7B20659Eu, 0x13A93A10u, 0x2DA2FE24u, 0x4D09DFE6u };
+        0x7B20659Eu, 0x13A93A10u, 0x42BC3478u, 0x4D09DFE6u };
     start_with(ARMED, k_mods);
     open_menu();
     CHECK(enhance_menu_is_open());

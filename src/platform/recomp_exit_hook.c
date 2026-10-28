@@ -16,10 +16,10 @@ void recomp_exit_hook_set(recomp_exit_hook_fn fn)
     s_hook = fn;
 }
 
-/* The kernel's summary, the present trace, the mouse's clip and the mods
- * take one each; 8 leaves room. A full table says so on stderr: the hook
- * left out is often the mouse's, added last, whose clip then outlives a
- * Wine exit. */
+/* The kernel's summary, the present trace, the mouse's clip, the mods and
+ * the [MEM] exit line take one each; 8 leaves room. A full table says so
+ * on stderr: the hook left out is often the mouse's, added last, whose
+ * clip then outlives a Wine exit. */
 #define MORE 8
 static recomp_exit_hook_fn s_more[MORE];
 

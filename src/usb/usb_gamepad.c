@@ -609,10 +609,16 @@ static void pad_record_exit_hook(const char *why)
  * that last step. The handler writes the held steps with write(2), not
  * stdio: every fputs to the record is flushed at once, so its buffer is
  * empty unless the signal lands mid-fputs, and write cannot deadlock on the
- * FILE's lock. Then the signal's default runs, so the stop means what it
- * did. Only installed while recording. */
+ * FILE's lock. Then the handler that was there before runs (the [MEM]
+ * exit line's, or the default), so the stop still means what it did and
+ * the bench keeps its memory line. Only installed while recording. */
+typedef void (*pad_sig_fn)(int);
+static pad_sig_fn s_rec_old_int = SIG_DFL, s_rec_old_term = SIG_DFL;
+
 static void pad_record_signal(int sig)
 {
+    pad_sig_fn old = sig == SIGINT ? s_rec_old_int : s_rec_old_term;
+
     char lines[512];
     int i, fd;
 
@@ -623,7 +629,7 @@ static void pad_record_signal(int sig)
                 (void)!pad_write(fd, lines, (unsigned)strlen(lines));
         s_rec_file = NULL;
     }
-    signal(sig, SIG_DFL);
+    signal(sig, old == SIG_ERR ? SIG_DFL : old);
     raise(sig);
 }
 
@@ -646,8 +652,8 @@ static void pad_record(int pad, const uint8_t *out, uint32_t flip)
                 s_rec_file = f;
                 atexit(pad_record_end);
                 recomp_exit_hook_add(pad_record_exit_hook);
-                signal(SIGINT, pad_record_signal);
-                signal(SIGTERM, pad_record_signal);
+                s_rec_old_int = signal(SIGINT, pad_record_signal);
+                s_rec_old_term = signal(SIGTERM, pad_record_signal);
                 fprintf(f, "# pad_record: pad_script steps timed by flip"
                         " (f<flip>:<buttons>:<hold flips>, sticks lx=<v>)\n");
                 fflush(f);
