@@ -9,6 +9,43 @@ blinx2-v0.3.2; earlier tags are described by their commits.
 
 ## [Unreleased]
 
+## [blinx2-v0.8.0] - 2026-10-29
+
+### Added
+- `present.shader` (`RECOMP_PRESENT_SHADER`, default `none`, behind
+  `XBOXRECOMP_ENHANCE`): the present pass hands the render-scale frame to
+  a RetroArch slang preset run by librashader v0.12.0 on Metal and
+  D3D11, with a Shader row on the menu's Render page. Bundled presets:
+  `crt-lottes`, `crt-lottes-fast`, `crt-hyllian` and `fsr`, or a path to
+  your own `.slangp`. The prebuilt library is fetched by cmake, pinned by
+  sha256 and loaded at run time, never linked; a missing library logs one
+  line and presents as before. The CPU backend ignores it.
+- `render.snap_2d` (`RECOMP_RENDER_SNAP_2D`, default off, live from the
+  menu): above render scale 1, swizzled and magnified 2D stages sample on
+  the guest texel grid, so loading screens and HUD tiles have no seams.
+  With it off the shader texts are byte-identical to before.
+- `XboxSpinSiteStats` exposes each spin site's pass and yield counts.
+
+### Changed
+- Back-to-back triangle batches with the same draw state go to the
+  backend as one draw; batches that sample their own colour target are
+  never merged. BLiNX 1's snow stages, thousands of tiny batches a frame,
+  no longer cost most of the frame. Debug keys `pb_merge` and `pb_mlog`.
+
+### Fixed
+- The BUMPENVMAP du/dv decode divides by 128, as the NV2A does, not 127
+  (checked against the nxdk_pgraph_tests Bump_map hardware goldens), on
+  Metal and D3D11.
+- `NtQueryVolumeInformationFile` class 1 and `NtQueryInformationFile`
+  class 6 answer on every file backend, so Kingdom Under Fire: Heroes
+  passes its fatal screen after character select.
+- Under `RECOMP_HEAP_RECLAIM`, free blocks that end at the bump cursor fold
+  back into it when an allocation would pass the heap top (KUF's battle
+  load).
+- The stub boot ROM copies DSP scratch into P memory when a core leaves
+  reset, as the MCPX ROM does; KUF's DirectSound check passes and its
+  audio is no longer choppy.
+
 ## [blinx2-v0.7.0] - 2026-10-28
 
 ### Added
