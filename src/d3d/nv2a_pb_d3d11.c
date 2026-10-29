@@ -52,6 +52,9 @@
 #include "nv2a_tex_pack.h"
 #ifdef XBOXRECOMP_ENHANCE
 #include "nv2a_overlay.h"
+#include "nv2a_present_chain.h"
+#define LIBRA_RUNTIME_D3D11
+#include "librashader.h"
 #endif
 #include "nv2a_vsh_cpu.h"      /* the batch trace runs the CPU interpreter */
 #include "shader_cache.h"
@@ -3857,16 +3860,14 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
  * (the stock path, as always), or the present RT itself when the flip went
  * through the scaling blit, so a window size or a filter never reaches the
  * dump (under render.scale the RT is host-sized: dumps are hw x hh). */
-static void dump_back_buffer(const char *path)
+static void dump_texture(ID3D11Texture2D *src, const char *path)
 {
     D3D11_TEXTURE2D_DESC td;
-    ID3D11Texture2D *st = NULL, *src = s_back;
+    ID3D11Texture2D *st = NULL;
     D3D11_MAPPED_SUBRESOURCE m;
     FILE *f;
     UINT y;
 
-    if (s_dump_rt && s_drawn && s_drawn->tex)
-        src = s_drawn->tex;
     if (!src) {
         /* No back buffer after a failed resize (d3d11_on_flip said so). */
         return;
@@ -3909,6 +3910,15 @@ static void dump_back_buffer(const char *path)
     ID3D11Texture2D_Release(st);
 }
 
+static void dump_back_buffer(const char *path)
+{
+    dump_texture(s_dump_rt && s_drawn && s_drawn->tex ? s_drawn->tex : s_back, path);
+}
+
+#ifdef XBOXRECOMP_ENHANCE
+static int s_chained;                   /* this flip went through present.shader */
+#endif
+
 static void dump_frame(void)
 {
     static const char *prefix;
@@ -3944,6 +3954,13 @@ static void dump_frame(void)
         snprintf(path, sizeof path, "%sflip_%05u.bmp", prefix,
                  (unsigned)s_presents);
         dump_back_buffer(path);
+#ifdef XBOXRECOMP_ENHANCE
+        /* What present.shader put on screen, the overlay not yet drawn. */
+        if (s_chained) {
+            snprintf(path, sizeof path, "%spresent_%05u.bmp", prefix, (unsigned)s_presents);
+            dump_texture(s_back, path);
+        }
+#endif
     }
 }
 
@@ -4289,6 +4306,216 @@ static void present_blit(RenderTarget *rt, int filter, unsigned overscan, int in
 #endif
 }
 
+#ifdef XBOXRECOMP_ENHANCE
+/* ── present.shader (nv2a_present_chain.h) ──────────────────────────────
+ *
+ * librashader's D3D11 filter chain draws the frame into the scaling blit's
+ * rectangle of the cleared back buffer, in place of the blit's triangle. Its
+ * input is the frame at render.scale's host size, pads included: the whole
+ * target when the frame fills it, else a copy of the frame's part (a grown
+ * target holds more). Built on this thread when the request's generation
+ * moves; "none" never loads the library. */
+static libra_d3d11_filter_chain_t s_lrs_chain;
+static unsigned s_lrs_gen;
+static size_t s_lrs_frames;
+static ID3D11Texture2D *s_lrs_src;
+static ID3D11ShaderResourceView *s_lrs_srv;
+static PFN_libra_d3d11_filter_chain_frame s_lrs_ff;   /* with the chain */
+static int s_lrs_ov_said;
+
+/* The chain and its input copy: after a switch to none or a failure the
+ * copy (host size, tens of MB at scale 4) is not kept for the session. */
+static void lrs_free(void)
+{
+    const struct nv2a_lrs *l;
+    PFN_libra_d3d11_filter_chain_free fr;
+    if (s_lrs_srv)
+        ID3D11ShaderResourceView_Release(s_lrs_srv);
+    if (s_lrs_src)
+        ID3D11Texture2D_Release(s_lrs_src);
+    s_lrs_srv = NULL;
+    s_lrs_src = NULL;
+    s_lrs_ff = NULL;
+    if (!s_lrs_chain)
+        return;
+    l = nv2a_present_chain_lib();
+    fr = l ? (PFN_libra_d3d11_filter_chain_free)l->sym("libra_d3d11_filter_chain_free") : NULL;
+    if (fr)
+        fr(&s_lrs_chain);
+    s_lrs_chain = NULL;
+}
+
+/* The chain for the current request, or NULL (none, a missing library, a
+ * preset that failed: said once, then not retried until the next request). */
+static libra_d3d11_filter_chain_t lrs_chain(void)
+{
+    unsigned gen = nv2a_present_chain_gen();
+    const struct nv2a_lrs *l;
+    PFN_libra_preset_create pc;
+    PFN_libra_preset_free pf;
+    PFN_libra_d3d11_filter_chain_create cc;
+    libra_shader_preset_t preset = NULL;
+    libra_error_t e;
+    filter_chain_d3d11_opt_t co;
+    char path[1024], msg[512];
+    int found;
+
+    if (gen == s_lrs_gen)
+        return s_lrs_chain;
+    lrs_free();
+    s_lrs_gen = gen;
+    s_lrs_frames = 0;
+    if (!nv2a_present_chain_wanted())
+        return NULL;
+    found = nv2a_present_chain_preset(path, sizeof path, NULL);
+    l = found > 0 ? nv2a_present_chain_lib() : NULL;
+    if (!l) {
+        nv2a_present_chain_failed(gen);
+        return NULL;
+    }
+    pc = (PFN_libra_preset_create)l->sym("libra_preset_create");
+    pf = (PFN_libra_preset_free)l->sym("libra_preset_free");
+    cc = (PFN_libra_d3d11_filter_chain_create)l->sym("libra_d3d11_filter_chain_create");
+    s_lrs_ff = (PFN_libra_d3d11_filter_chain_frame)l->sym("libra_d3d11_filter_chain_frame");
+    if (!pc || !pf || !cc || !s_lrs_ff) {
+        fprintf(stderr, "[SHADER] present.shader off: the library has no D3D11 runtime\n");
+        nv2a_present_chain_failed(gen);
+        return NULL;
+    }
+    memset(&co, 0, sizeof co);
+    co.version = LIBRASHADER_CURRENT_VERSION;
+    e = pc(path, &preset);
+    if (!e)
+        e = cc(&preset, s_dev, &co, &s_lrs_chain);
+    if (preset)
+        pf(&preset);
+    s_sc_init = 0;
+    if (e) {
+        nv2a_present_chain_error(e, msg, sizeof msg);
+        fprintf(stderr, "[SHADER] present.shader off: %s: %s\n", path, msg);
+        s_lrs_chain = NULL;
+        nv2a_present_chain_failed(gen);
+        return NULL;
+    }
+    fprintf(stderr, "[SHADER] present.shader: %s (D3D11)\n", path);
+    return s_lrs_chain;
+}
+
+/* The chain's input: rt's w x h corner at host size. */
+static ID3D11ShaderResourceView *lrs_source(RenderTarget *rt, UINT w, UINT h)
+{
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_BOX b;
+
+    ID3D11Texture2D_GetDesc(rt->tex, &td);
+    if (td.Width == w && td.Height == h)
+        return rt->srv;
+    if (s_lrs_src) {
+        D3D11_TEXTURE2D_DESC sd;
+        ID3D11Texture2D_GetDesc(s_lrs_src, &sd);
+        if (sd.Width != w || sd.Height != h || sd.Format != td.Format) {
+            ID3D11ShaderResourceView_Release(s_lrs_srv);
+            ID3D11Texture2D_Release(s_lrs_src);
+            s_lrs_srv = NULL;
+            s_lrs_src = NULL;
+        }
+    }
+    if (!s_lrs_src) {
+        td.Width = w;
+        td.Height = h;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.SampleDesc.Count = 1;
+        td.SampleDesc.Quality = 0;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        td.CPUAccessFlags = 0;
+        td.MiscFlags = 0;
+        if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &s_lrs_src)))
+            return NULL;
+        if (FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)s_lrs_src,
+                                                         NULL, &s_lrs_srv))) {
+            ID3D11Texture2D_Release(s_lrs_src);
+            s_lrs_src = NULL;
+            return NULL;
+        }
+    }
+    b.left = b.top = b.front = 0;
+    b.right = w;
+    b.bottom = h;
+    b.back = 1;
+    ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)s_lrs_src, 0, 0, 0, 0,
+                                              (ID3D11Resource *)rt->tex, 0, &b);
+    return s_lrs_srv;
+}
+
+/* rt through the chain into the back buffer at nv2a_present_rect's place
+ * (the filter only sizes the rectangle: the chain samples). 0 when it did
+ * not draw, and the caller presents as without a shader. */
+static int present_chain(RenderTarget *rt, int filter, int internal)
+{
+    static const float black[4] = {0, 0, 0, 1};
+    libra_d3d11_filter_chain_t chain;
+    ID3D11ShaderResourceView *src;
+    frame_d3d11_opt_t fo;
+    libra_viewport_t lv;
+    libra_error_t e;
+    struct nv2a_rect r;
+    UINT cw, ch, hcw, hch;
+    char msg[512];
+
+    chain = lrs_chain();
+    if (!chain || !s_back)
+        return 0;
+    if (!s_back_rtv && FAILED(ID3D11Device_CreateRenderTargetView(
+                s_dev, (ID3D11Resource *)s_back, NULL, &s_back_rtv)))
+        return 0;
+    if (!rt->srv && FAILED(ID3D11Device_CreateShaderResourceView(
+                s_dev, (ID3D11Resource *)rt->tex, NULL, &rt->srv)))
+        return 0;
+    present_extent(rt, &cw, &ch);
+    hcw = (cw + 2u * rt->pad) * rt->n;
+    hch = ch * rt->n;
+    if (hcw > rt->hw)
+        hcw = rt->hw;
+    if (hch > rt->hh)
+        hch = rt->hh;
+    src = lrs_source(rt, hcw, hch);
+    if (!src)
+        return 0;
+    nv2a_present_rect(hcw, hch, s_back_w, s_back_h, filter, &r);
+    if (internal) {
+        r.x = r.y = 0;
+        r.w = (int32_t)s_back_w;
+        r.h = (int32_t)s_back_h;
+    }
+    if (r.w <= 0 || r.h <= 0)
+        return 0;
+    ID3D11DeviceContext_ClearRenderTargetView(s_ctx, s_back_rtv, black);
+    lv.x = (float)r.x;
+    lv.y = (float)r.y;
+    lv.width = (uint32_t)r.w;
+    lv.height = (uint32_t)r.h;
+    memset(&fo, 0, sizeof fo);
+    fo.version = LIBRASHADER_CURRENT_VERSION;
+    fo.total_subframes = 1;
+    fo.current_subframe = 1;
+    fo.frames_per_second = nv2a_present_chain_rate((uint64_t)(sh_now_ms() * 1e6));
+    e = s_lrs_ff(&s_lrs_chain, s_ctx, s_lrs_frames++, src, s_back_rtv, &lv, NULL, &fo);
+    /* Every binding the chain made went behind the draw path's state shadow. */
+    s_sc_init = 0;
+    if (e) {
+        nv2a_present_chain_error(e, msg, sizeof msg);
+        fprintf(stderr, "[SHADER] present.shader off: frame: %s\n", msg);
+        nv2a_present_chain_failed(s_lrs_gen);
+        lrs_free();
+        return 0;
+    }
+    s_ovl_place = r;
+    return 1;
+}
+#endif /* XBOXRECOMP_ENHANCE */
+
 static UINT s_shown_w, s_shown_h;   /* the last flip's present extent */
 #ifdef XBOXRECOMP_ENHANCE
 /* ── The overlay (nv2a_overlay.h) ─────────────────────────────────────────
@@ -4622,6 +4849,22 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
         /* A display.overscan crop always blits: a copy shows the edges. */
         int blit = !stock && (eo->overscan
                 || !(same && (eo->present_filter != NV2A_PRESENT_LINEAR || internal)));
+#ifdef XBOXRECOMP_ENHANCE
+        /* present.shader: the chain reads the whole frame, so a display.overscan
+         * crop has no place in it. */
+        s_chained = 0;
+        if (s_back && (nv2a_present_chain_wanted() || s_lrs_chain)) {
+            s_chained = present_chain(s_drawn, eo->present_filter, internal);
+            if (s_chained && eo->overscan && !s_lrs_ov_said++)
+                fprintf(stderr, "[SHADER] display.overscan=%u ignored while"
+                        " present.shader runs\n", eo->overscan);
+        }
+        if (s_chained) {
+            /* d3d11_dump keeps reading the frame (the goldens'); the back
+             * buffer goes to present_NNNNN.bmp beside it. */
+            s_dump_rt = 1;
+        } else
+#endif
         if (!s_back) {
             /* A failed ResizeBuffers/GetBuffer left no back buffer. */
             static int said_nb;
@@ -4668,6 +4911,9 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
             fprintf(stderr, LOGP "first present: back buffer %ux%u, frame %ux%u"
                     " (%ux%u host), %s%s\n", s_back_w, s_back_h, s_drawn->w, s_drawn->h,
                     s_drawn->hw, s_drawn->hh,
+#ifdef XBOXRECOMP_ENHANCE
+                    s_chained ? "present.shader" :
+#endif
                     blit ? "scaling blit" : same ? "copy" : "overlap copy",
                     internal ? " (surface internal)" : "");
     }

@@ -57,6 +57,8 @@ static void bind_builtins(void)
     enhance_cfg_bind_env("present.fullscreen", RENV_PRESENT_FULLSCREEN);
     enhance_cfg_bind_env("present.pacing", RENV_PRESENT_PACING);
     enhance_cfg_bind_env("present.surface", RENV_PRESENT_SURFACE);
+    enhance_cfg_bind_env("present.shader", RENV_PRESENT_SHADER);
+    enhance_cfg_bind_env("present.shader_lib", RENV_PRESENT_SHADER_LIB);
     enhance_cfg_bind_env("textures.pack", RENV_TEXTURES_PACK);
     enhance_cfg_bind_env("textures.font", RENV_TEXTURES_FONT);
     enhance_cfg_bind_env("textures.text", RENV_TEXTURES_TEXT);

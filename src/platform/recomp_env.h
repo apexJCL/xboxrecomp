@@ -82,6 +82,8 @@ extern "C" {
     X(PRESENT_FULLSCREEN, CONFIG, "RECOMP_PRESENT_FULLSCREEN", NULL, "enhancements: present.fullscreen, borderless desktop fullscreen at start (1/0)") \
     X(PRESENT_PACING,    CONFIG, "RECOMP_PRESENT_PACING",    NULL, "enhancements: present.pacing, sleep (default: lowered spin waits sleep) or spin (stock busy-wait, the console-original timing)") \
     X(PRESENT_SURFACE,   CONFIG, "RECOMP_PRESENT_SURFACE",   NULL, "enhancements: present.surface, auto (default), window, internal") \
+    X(PRESENT_SHADER,    CONFIG, "RECOMP_PRESENT_SHADER",    NULL, "enhancements: present.shader, none (stock), crt-lottes, crt-lottes-fast, crt-hyllian, fsr, or a .slangp path") \
+    X(PRESENT_SHADER_LIB, CONFIG, "RECOMP_PRESENT_SHADER_LIB", NULL, "enhancements: present.shader_lib, the librashader library path (default: beside the executable)") \
     X(HOST_GAMESCOPE,    CONFIG, "RECOMP_HOST_GAMESCOPE",    NULL, "host: 1 when the launcher runs the game under gamescope (Steam Game Mode); present.surface=auto then means internal") \
     X(TEXTURES_PACK,     CONFIG, "RECOMP_TEXTURES_PACK",     NULL, "enhancements: textures.pack, a texture pack file (host-side texture replacements; unset = stock)") \
     X(TEXTURES_FONT,     CONFIG, "RECOMP_TEXTURES_FONT",     NULL, "enhancements: textures.font, the pack's font-atlas entries, on (default) or off") \

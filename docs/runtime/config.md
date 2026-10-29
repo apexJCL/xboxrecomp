@@ -162,6 +162,8 @@ the stock settings, `present.pacing = "spin"` included.
 | `present.filter` | string | `"nearest"`, `"linear"`, `"integer"` | `"nearest"` | `RECOMP_PRESENT_FILTER` |
 | `present.fullscreen` | bool | borderless fullscreen at start | `false` | `RECOMP_PRESENT_FULLSCREEN` |
 | `present.pacing` | string | `"sleep"`, `"spin"` (stock, the console-original timing): how a lowered guest busy-wait waits | `"sleep"` | `RECOMP_PRESENT_PACING` |
+| `present.shader` | string | `"none"`, `"crt-lottes"`, `"crt-lottes-fast"`, `"crt-hyllian"`, `"fsr"`, or a `.slangp` path: a RetroArch slang preset run by librashader in place of the final present, on Metal and D3D11 ([present.shader](#presentshader)) | `"none"` | `RECOMP_PRESENT_SHADER` |
+| `present.shader_lib` | string | the librashader library; relative to the executable's directory. Loaded as given, with no hash check (the sha256 pin covers only the build's own copy) | `librashader.dll` beside the executable; macOS `librashader.dylib` beside it, then `../Frameworks/librashader.dylib` | `RECOMP_PRESENT_SHADER_LIB` |
 | `present.surface` | string | `"auto"`, `"window"`, `"internal"`: who scales the frame to the screen, the game or the compositor | `"auto"` | `RECOMP_PRESENT_SURFACE` |
 | `textures.pack` | string | a texture pack file ([texture-pack.md](../formats/texture-pack.md)); relative to the executable's directory | none | `RECOMP_TEXTURES_PACK` |
 | `textures.font` | string | `"on"`, `"off"`: the pack's font-atlas entries | `"on"` | `RECOMP_TEXTURES_FONT` |
@@ -422,6 +424,36 @@ same requests at given flips, to check a switch without the menu.
   `nearest` and linear otherwise; the macOS launcher sets no hint, so
   `auto` gives `window` there unless `RECOMP_HOST_GAMESCOPE` is set by hand. The
   SDL renderer window (the CPU backend) ignores the key with one line.
+- **`present.shader`.** <a id="presentshader"></a>A RetroArch slang
+  preset, run by [librashader](https://github.com/SnowflakePowered/librashader)
+  0.12, replaces the draw that puts the frame on the screen. Its input is
+  the frame at `render.scale` (the whole frame, its guard band included),
+  and its output fills the same letterboxed rectangle the stock present
+  would, so the aspect, `present.surface` and the window size behave as
+  before; `present.filter` and `display.overscan` do not apply while a
+  shader runs (overscan says so once). The bundled presets sit in
+  `shaders/` beside the executable (`assets/shaders`, public domain, MIT
+  and Unlicense only, listed in its README): `crt-lottes` and
+  `crt-lottes-fast` (shadow mask, scanlines, curvature), `crt-hyllian`
+  (the one-pass fast variant) and `fsr` (AMD FidelityFX Super Resolution
+  1, an upscaler, not a CRT). Any other value with a `/` or ending in
+  `.slangp` is a preset path, relative to the executable's directory; a
+  bundled name or path that is not there says so once and the present
+  stays stock. The library is loaded on first use, never linked:
+  `cmake/librashader.cmake` stages the upstream release (pinned by
+  sha256) beside the executable when a game calls
+  `xboxrecomp_present_shaders(<target>)`; a configure that cannot
+  download it warns and builds without it. `present.shader_lib` points at
+  another copy, loaded as given with no hash check: it runs code from the
+  path the player names, as any library they put there would. A missing
+  library, one with another ABI, or (Windows) a missing Visual C++
+  Redistributable gives one `[SHADER]` line and the stock present. The menu's *Shader* row
+  (Render page) switches it live: the next present builds the new chain,
+  and a preset that fails to build is not retried until the next change.
+  `none` costs one atomic load per present and loads nothing. D3D11 frame
+  dumps add `present_NNNNN.bmp`, the back buffer after the shader, beside
+  the usual render-target dumps, which stay the game's own frame. The
+  CPU rasteriser ignores the key.
 - **`present.pacing`.** Only for a title generated with
   `tools.recomp --spin-waits` ([lifting](../pipeline/04-lifting.md#spin-waits)),
   whose busy-wait loops call `RECOMP_SPIN_WAIT` on their back edge. `sleep`
@@ -1054,7 +1086,7 @@ points, its live class; the footer names the selected row's:
 
 | Class | Takes effect | Items |
 |---|---|---|
-| live | at the next flip | `render.aniso`, `present.filter`, `present.pacing`, `display.overscan`, `display.movie`, `overlay.stats`, `input.mouse_capture`, every action binding, a mod with `on_enable` |
+| live | at the next flip | `render.aniso`, `present.filter`, `present.shader`, `present.pacing`, `display.overscan`, `display.movie`, `overlay.stats`, `input.mouse_capture`, every action binding, a mod with `on_enable` |
 | at the flip | at the next flip, rebuilding the targets or the texture cache | `render.scale`, `present.fullscreen`, `textures.pack`, `textures.font`, `textures.text` |
 | next stage | at a later game point (a title's item) | none of the toolkit's |
 | next activation | when the mod next turns its feature on | a mod setting the descriptor marks so (the free camera's HUD choice) |

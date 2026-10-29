@@ -37,6 +37,7 @@
 #include "nv2a_backend_common.h"
 #include "nv2a_overlay.h"
 #include "nv2a_overlay_int.h"
+#include "nv2a_present_chain.h"
 #include "nv2a_stats.h"
 #include "nv2a_tex_pack.h"
 #include "recomp_cfg.h"
@@ -72,6 +73,9 @@ static const char *const k_aspect[] = { "4:3", "16:9", "16:10", "21:9", NULL };
 static const char *const k_movie[] = { "black", "fit", "fill", NULL };
 static const char *const k_surface[] = { "auto", "window", "internal", NULL };
 static const char *const k_onoff[] = { "off", "on", NULL };
+/* present.shader: "none" then nv2a_present_chain_names; a .slangp path from
+ * the config shows as itself and the first press moves it to a bundled one. */
+static const char *const k_shader[] = { "none", NV2A_PRESENT_CHAIN_NAMES, NULL };
 /* input.mouse_capture in the menu's order; the enum's is focus, click, never. */
 static const char *const k_capture[] = { "click", "focus", "never", NULL };
 
@@ -125,6 +129,13 @@ static void set_filter(const struct enhance_item *it, const char *v) { (void)it;
 static void set_full(const struct enhance_item *it, const char *v) { (void)it; req(e_full, v, NV2A_OPT_FULLSCREEN); }
 static void set_overscan(const struct enhance_item *it, const char *v) { (void)it; req(e_overscan, v, NV2A_OPT_OVERSCAN); }
 static void set_movie(const struct enhance_item *it, const char *v) { (void)it; req(e_movie, v, NV2A_OPT_MOVIE); }
+
+static void set_shader(const struct enhance_item *it, const char *v)
+{
+    (void)it;
+    /* The backend rebuilds its chain at the next present. */
+    nv2a_present_chain_request(v);
+}
 
 static void set_pacing(const struct enhance_item *it, const char *v)
 {
@@ -180,6 +191,13 @@ static const char *get_filter(const struct enhance_item *it, char *b, size_t n)
     int f = nv2a_host_opts()->present_filter;
     (void)it;
     snprintf(b, n, "%s", k_filter[f >= 0 && f <= 2 ? f : 0]);
+    return b;
+}
+
+static const char *get_shader(const struct enhance_item *it, char *b, size_t n)
+{
+    (void)it;
+    nv2a_present_chain_requested(b, n);
     return b;
 }
 
@@ -248,6 +266,8 @@ static const struct enhance_item k_items[] = {
       .def = "0" },
     { ITEM("present.filter", "Scaling filter", "Render", ENHANCE_ITEM_CHOICE),
       .choices = k_filter, .set = set_filter, .get = get_filter, .def = "nearest" },
+    { ITEM("present.shader", "Shader", "Render", ENHANCE_ITEM_CHOICE),
+      .choices = k_shader, .set = set_shader, .get = get_shader, .def = "none" },
     { ITEM("present.fullscreen", "Fullscreen", "Render", ENHANCE_ITEM_TOGGLE), .set = set_full,
       .get = get_full, .live = ENHANCE_LIVE_FLUSH, .def = "false" },
     { ITEM("present.pacing", "Frame pacing", "Render", ENHANCE_ITEM_CHOICE),

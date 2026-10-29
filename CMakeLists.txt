@@ -54,6 +54,10 @@ if(XBOXRECOMP_ENHANCE)
     target_compile_definitions(recomp_env PUBLIC RECOMP_ENV_HAVE_ENHANCE_KEYS XBOXRECOMP_ENHANCE)
     add_subdirectory(src/enhance)
 endif()
+# present.shader's presets and librashader, staged beside a game's exe by
+# xboxrecomp_present_shaders(<target>). Always defined, so a game can call it
+# unconditionally; it does nothing without XBOXRECOMP_ENHANCE.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/librashader.cmake)
 
 # MCPX APU DSP emulation: the GP and EP run the title's DSP56300 programs on
 # the MIT dsp56300 JIT (cmake/dsp56300.cmake, a pinned prebuilt archive per

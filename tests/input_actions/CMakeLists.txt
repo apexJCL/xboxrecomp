@@ -33,6 +33,7 @@ add_executable(input_actions_test
     ${XR_SRC}/enhance/recomp_cfg.c
     ${XR_SRC}/enhance/enhance_cfg.c
     ${XR_SRC}/enhance/enhance.c
+    ${XR_SRC}/kernel/nv2a_present_chain.c
     ${XR_SRC}/enhance/enhance_input.c
     ${XR_SRC}/enhance/enhance_actions.c
     ${XR_SRC}/enhance/mod.c
@@ -50,7 +51,7 @@ add_executable(input_actions_test
     ${XR_SRC}/platform/recomp_exe_dir.c
     ${XR_SRC}/platform/recomp_exit_hook.c)
 target_include_directories(input_actions_test PRIVATE ${XR_SRC}/enhance ${XR_SRC}/platform
-    ${XR_SRC}/input ${XR_SRC}/kernel ${XR_SRC}/d3d ${XR_SRC})
+    ${XR_SRC}/input ${XR_SRC}/kernel ${XR_SRC}/d3d ${XR_SRC} ${XR_SRC}/../third_party/librashader)
 target_compile_definitions(input_actions_test PRIVATE RECOMP_ENV_HAVE_ENHANCE_KEYS
     XBOXRECOMP_ENHANCE)
 if(NOT MSVC)
@@ -64,6 +65,8 @@ if(NOT WIN32)
     find_package(Threads REQUIRED)
     target_link_libraries(input_actions_test PRIVATE m Threads::Threads)
 endif()
+# enhance.c sets present.shader; the chain module dlopens librashader.
+target_link_libraries(input_actions_test PRIVATE ${CMAKE_DL_LIBS})
 enable_testing()
 add_test(NAME input_actions COMMAND input_actions_test
          WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})

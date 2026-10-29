@@ -17,6 +17,7 @@
 #include "mod.h"
 #include "nv2a_backend_common.h"
 #include "nv2a_overlay.h"
+#include "nv2a_present_chain.h"
 #include "nv2a_tex_pack.h"
 #include "recomp_exe_dir.h"
 
@@ -77,7 +78,7 @@ static const char *const s_movie[] = { "black", "fit", "fill", NULL };
 int xbox_enhance_init(const char *root, const char *title)
 {
     struct nv2a_host_opts o;
-    const char *aspect;
+    const char *aspect, *shader, *shader_lib;
     long long scale, aniso, overscan;
     int rc, pacing, surface;
     char surface_txt[48], overscan_txt[32] = "";
@@ -191,6 +192,17 @@ int xbox_enhance_init(const char *root, const char *title)
     if (o.aspect_w)
         fprintf(stderr, LOGP "display.aspect=%s display.movie=%s\n", aspect,
                 s_movie[o.movie_mode]);
+    /* A slang preset in place of the present draw (nv2a_present_chain.h).
+     * Only the request is stored here: the library loads at the first
+     * present that wants it, so "none" never touches it. */
+    shader = enhance_cfg_string("present.shader", "none");
+    shader_lib = enhance_cfg_string("present.shader_lib", "");
+    nv2a_present_chain_set_lib(shader_lib);
+    nv2a_present_chain_request(shader);
+    if (shader && *shader && strcmp(shader, "none"))
+        fprintf(stderr, LOGP "present.shader=%s%s%s\n", shader,
+                shader_lib && *shader_lib ? " present.shader_lib=" : "",
+                shader_lib && *shader_lib ? shader_lib : "");
     load_tex_pack(&o);
     enhance_input_init();
     /* The toolkit's host actions before the mods register theirs. */

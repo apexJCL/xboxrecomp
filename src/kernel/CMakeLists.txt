@@ -85,13 +85,17 @@ if(XBOXRECOMP_ENHANCE)
         nv2a_overlay_ui.c
         nv2a_overlay_font.c
         nv2a_stats.c
+        nv2a_present_chain.c
         ${_ovl_vendored}
         "${_ovl_fonts_c}")
 endif()
 
 add_library(xbox_kernel STATIC ${KERNEL_SOURCES})
 if(XBOXRECOMP_ENHANCE)
-    target_include_directories(xbox_kernel PUBLIC "${_xr_tp}/microui" "${_xr_tp}/stb")
+    target_include_directories(xbox_kernel PUBLIC "${_xr_tp}/microui" "${_xr_tp}/stb"
+                                                  "${_xr_tp}/librashader")
+    # present.shader loads librashader at run time (nv2a_present_chain.c).
+    target_link_libraries(xbox_kernel PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
 # See src/platform/CMakeLists.txt: resolve src/ relative to this file, not via

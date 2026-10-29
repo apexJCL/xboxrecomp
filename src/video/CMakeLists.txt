@@ -23,6 +23,11 @@ else()
         target_link_libraries(xbox_video PUBLIC
             "-framework Metal" "-framework QuartzCore" "-framework CoreGraphics"
             "-framework Foundation" "-framework AppKit")
+        if(XBOXRECOMP_ENHANCE)
+            # present.shader's Metal chain (librashader.h, loaded at run time).
+            target_include_directories(xbox_video PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/librashader)
+        endif()
     endif()
 endif()
 target_include_directories(xbox_video PUBLIC

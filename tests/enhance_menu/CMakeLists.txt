@@ -34,6 +34,7 @@ add_executable(enhance_menu_test
     ${XR_SRC}/enhance/recomp_cfg.c
     ${XR_SRC}/enhance/enhance_cfg.c
     ${XR_SRC}/enhance/enhance.c
+    ${XR_SRC}/kernel/nv2a_present_chain.c
     ${XR_SRC}/enhance/enhance_input.c
     ${XR_SRC}/enhance/enhance_actions.c
     ${XR_SRC}/enhance/enhance_menu.c
@@ -57,7 +58,7 @@ add_executable(enhance_menu_test
     ${XR_SRC}/platform/recomp_exit_hook.c
     ${_vendored} "${_fonts_c}")
 target_include_directories(enhance_menu_test PRIVATE ${XR_SRC}/enhance ${XR_SRC}/platform
-    ${XR_SRC}/input ${XR_SRC}/kernel ${XR_SRC}/d3d ${XR_SRC} ${XR_TP}/microui ${XR_TP}/stb)
+    ${XR_SRC}/input ${XR_SRC}/kernel ${XR_SRC}/d3d ${XR_SRC} ${XR_TP}/microui ${XR_TP}/stb ${XR_SRC}/../third_party/librashader)
 target_compile_definitions(enhance_menu_test PRIVATE RECOMP_ENV_HAVE_ENHANCE_KEYS
     XBOXRECOMP_ENHANCE)
 if(NOT MSVC)
@@ -69,6 +70,8 @@ if(NOT WIN32)
     find_package(Threads REQUIRED)
     target_link_libraries(enhance_menu_test PRIVATE m Threads::Threads)
 endif()
+# enhance.c sets present.shader; the chain module dlopens librashader.
+target_link_libraries(enhance_menu_test PRIVATE ${CMAKE_DL_LIBS})
 enable_testing()
 add_test(NAME enhance_menu COMMAND enhance_menu_test
          WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})

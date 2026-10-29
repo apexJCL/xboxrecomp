@@ -31,6 +31,11 @@ if(WIN32)
     # guest memory (xbox_memory_layout.h) live with the kernel.
     target_include_directories(xbox_d3d8 PRIVATE
         ${CMAKE_CURRENT_SOURCE_DIR}/../kernel ${CMAKE_CURRENT_SOURCE_DIR}/..)
+    if(XBOXRECOMP_ENHANCE)
+        # present.shader's D3D11 chain (librashader.h, loaded at run time).
+        target_include_directories(xbox_d3d8 PRIVATE
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../third_party/librashader)
+    endif()
 
     # Offline smoke test for the pure format layer (no D3D11 device needed).
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_smoke

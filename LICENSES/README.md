@@ -30,3 +30,11 @@ components under `third_party/`:
 - `MIT-stb.txt`: the stb licence file, verbatim (MIT or public domain).
 - `OFL-1.1-atkinson-hyperlegible.txt`: the Atkinson Hyperlegible font
   licence, verbatim from google/fonts (also beside the font as `OFL.txt`).
+
+`present.shader` (also `-DXBOXRECOMP_ENHANCE=ON`; see "MPL-2.0 —
+librashader" in the top-level NOTICE) loads the prebuilt librashader at run
+time:
+
+- `MPL-2.0-librashader.txt`: librashader's `LICENSE.md`, verbatim from the
+  `librashader-v0.12.0` tag. It ships as `shaders/LICENSE-librashader.txt`
+  beside the library; the source is at https://github.com/SnowflakePowered/librashader/tree/librashader-v0.12.0.

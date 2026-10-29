@@ -33,6 +33,11 @@
  *                  drawn in the same pass after the frame, premultiplied, so
  *                  the drawable shot has them and the Metal frame dump (the
  *                  backend's render target) never does.
+ *   shader         present.shader (enhancements builds): librashader's Metal
+ *                  filter chain on this queue draws the slot into the same
+ *                  rectangle in place of the triangle; the overlay follows
+ *                  in a second pass. Built on the main thread when the
+ *                  request's generation moves; "none" never loads it.
  *
  * Manual retain/release, like nv2a_pb_metal.m. Every entry point is wrapped in
  * an autorelease pool: the main loop and the ack thread have none of their own.
@@ -50,10 +55,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "kernel/nv2a_backend_common.h"
 #ifdef XBOXRECOMP_ENHANCE
 #include "kernel/nv2a_overlay.h"
+#include "kernel/nv2a_present_chain.h"
+#define LIBRA_RUNTIME_METAL
+#include "librashader.h"
 #endif
 #include "fb_present_metal.h"
 #include "metal_compile.h"
@@ -249,6 +258,10 @@ static void layer_filter(int filter)
     s_layer.minificationFilter = f;
 }
 
+#ifdef XBOXRECOMP_ENHANCE
+static void chain_free(void);
+#endif
+
 void fbm_destroy(void)
 {
     int k;
@@ -271,6 +284,7 @@ void fbm_destroy(void)
         [s_pso_crop release];
         s_pso_crop = nil;
 #ifdef XBOXRECOMP_ENHANCE
+        chain_free();
         [s_pso_ovl release];
         s_pso_ovl = nil;
         for (k = 0; k <= NV2A_OVL_IMAGES; k++) {
@@ -525,6 +539,84 @@ static void ovl_draw(id<MTLRenderCommandEncoder> enc, id<MTLCommandBuffer> cb,
 }
 #endif /* XBOXRECOMP_ENHANCE */
 
+#ifdef XBOXRECOMP_ENHANCE
+/* present.shader's chain: the one built for s_chain_gen, or NULL (off, or
+ * failed for that generation). Main thread only, like the rest. */
+static libra_mtl_filter_chain_t s_chain;
+static unsigned s_chain_gen;
+static size_t s_chain_frames;
+static PFN_libra_mtl_filter_chain_frame s_chain_ff;   /* with the chain */
+static int s_chain_ov_said;
+
+static void chain_free(void)
+{
+    const struct nv2a_lrs *l;
+    PFN_libra_mtl_filter_chain_free fr;
+    if (!s_chain)
+        return;
+    l = nv2a_present_chain_lib();
+    fr = l ? (PFN_libra_mtl_filter_chain_free)l->sym("libra_mtl_filter_chain_free") : NULL;
+    if (fr)
+        fr(&s_chain);
+    s_chain = NULL;
+    s_chain_ff = NULL;
+}
+
+/* The chain for the current request, (re)built when its generation moved:
+ * NULL for "none", a missing library or a preset that failed (said once,
+ * then not retried until the next request). */
+static libra_mtl_filter_chain_t chain_get(void)
+{
+    unsigned gen = nv2a_present_chain_gen();
+    const struct nv2a_lrs *l;
+    PFN_libra_preset_create pc;
+    PFN_libra_preset_free pf;
+    PFN_libra_mtl_filter_chain_create cc;
+    libra_shader_preset_t preset = NULL;
+    libra_error_t e;
+    filter_chain_mtl_opt_t co = { LIBRASHADER_CURRENT_VERSION, false };
+    char path[1024], msg[512];
+    int found;
+
+    if (gen == s_chain_gen)
+        return s_chain;
+    chain_free();
+    s_chain_gen = gen;
+    s_chain_frames = 0;
+    if (!nv2a_present_chain_wanted())
+        return NULL;
+    found = nv2a_present_chain_preset(path, sizeof path, NULL);
+    l = found > 0 ? nv2a_present_chain_lib() : NULL;
+    if (!l) {
+        nv2a_present_chain_failed(gen);
+        return NULL;
+    }
+    pc = (PFN_libra_preset_create)l->sym("libra_preset_create");
+    pf = (PFN_libra_preset_free)l->sym("libra_preset_free");
+    cc = (PFN_libra_mtl_filter_chain_create)l->sym("libra_mtl_filter_chain_create");
+    s_chain_ff = (PFN_libra_mtl_filter_chain_frame)l->sym("libra_mtl_filter_chain_frame");
+    if (!pc || !pf || !cc || !s_chain_ff) {
+        fprintf(stderr, "[SHADER] present.shader off: the library has no Metal runtime\n");
+        nv2a_present_chain_failed(gen);
+        return NULL;
+    }
+    e = pc(path, &preset);
+    if (!e)
+        e = cc(&preset, s_queue, &co, &s_chain);
+    if (preset)
+        pf(&preset);
+    if (e) {
+        nv2a_present_chain_error(e, msg, sizeof msg);
+        fprintf(stderr, "[SHADER] present.shader off: %s: %s\n", path, msg);
+        s_chain = NULL;
+        nv2a_present_chain_failed(gen);
+        return NULL;
+    }
+    fprintf(stderr, "[SHADER] present.shader: %s (Metal)\n", path);
+    return s_chain;
+}
+#endif /* XBOXRECOMP_ENHANCE */
+
 int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
                 uint32_t pad, int filter, const char *shot_path, uint32_t flip,
                 const struct nv2a_ovl_list *const *layers, int nlayers)
@@ -541,6 +633,21 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
         int whole, dw = 0, dh = 0;
         unsigned ov = nv2a_host_opts()->overscan;
         CGSize cur = s_layer.drawableSize;
+#ifdef XBOXRECOMP_ENHANCE
+        libra_mtl_filter_chain_t chain = NULL;
+        int chained = 0;
+
+        if (nv2a_present_chain_wanted() || s_chain)
+            chain = chain_get();
+        /* The chain reads the whole slot: a crop has no place in it. */
+        if (chain && ov) {
+            if (!s_chain_ov_said)
+                fprintf(stderr, "[SHADER] display.overscan=%u ignored while"
+                        " present.shader runs\n", ov);
+            s_chain_ov_said = 1;
+            ov = 0;
+        }
+#endif
 
         /* Checked every present, not only on resize events: a move between
          * displays of another scale need not arrive as SIZE_CHANGED. Under
@@ -590,7 +697,39 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
                 if (!ov || filter == NV2A_PRESENT_INTEGER)
                     filter = NV2A_PRESENT_NEAREST;
             }
+#ifdef XBOXRECOMP_ENHANCE
+            if (chain && r.w > 0 && r.h > 0) {
+                /* This pass only clears; the chain draws after it, into
+                 * the same rectangle, then the overlay's pass loads. */
+                libra_viewport_t lv = { (float)r.x, (float)r.y, (uint32_t)r.w, (uint32_t)r.h };
+                frame_mtl_opt_t fo;
+                libra_error_t e;
+                char msg[512];
+
+                memset(&fo, 0, sizeof fo);
+                fo.version = LIBRASHADER_CURRENT_VERSION;
+                fo.total_subframes = 1;
+                fo.current_subframe = 1;
+                fo.frames_per_second =
+                    nv2a_present_chain_rate(clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
+                [enc endEncoding];
+                enc = nil;
+                e = s_chain_ff(&chain, cb, s_chain_frames++, s_slot[k], d.texture, &lv, NULL,
+                               &fo);
+                if (e) {
+                    nv2a_present_chain_error(e, msg, sizeof msg);
+                    fprintf(stderr, "[SHADER] present.shader off: frame: %s\n", msg);
+                    nv2a_present_chain_failed(s_chain_gen);
+                    chain_free();   /* the command buffer keeps what it uses */
+                }
+                rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
+                enc = [cb renderCommandEncoderWithDescriptor:rp];
+                chained = 1;
+            }
+            if (!chained && r.w > 0 && r.h > 0) {
+#else
             if (r.w > 0 && r.h > 0) {
+#endif
                 MTLViewport vp = { r.x, r.y, r.w, r.h, 0.0, 1.0 };
                 int lin = filter == NV2A_PRESENT_LINEAR
                           || (filter == NV2A_PRESENT_INTEGER && !whole);
