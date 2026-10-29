@@ -50,8 +50,7 @@
 #define P_WORDS 0x1000u
 #define MIXBUF_X_ALIAS 0xC00u
 
-/* What the boot ROM copies from the start of scratch into P. */
-#define BOOT_WORDS 0x800u
+#define BOOT_WORDS APU_DSP_BOOT_WORDS
 
 #define WORD_MASK 0xFFFFFFu
 

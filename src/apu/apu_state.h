@@ -596,6 +596,9 @@ void mcpx_apu_update_dsp_preference(MCPXAPUState *d);
 void mcpx_apu_dsp_frame(MCPXAPUState *d, float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME]);
 void mcpx_apu_dsp_ack_poll(MCPXAPUState *d);
 void mcpx_apu_dsp_gprst_write(uint32_t val);
+/* The boot ROM's scratch-to-P copy when GPRST/EPRST go to 3, polled in the
+ * MCPX window at mcpx (xbox_McpxHost()); the stub's, apu_dsp.c. */
+void mcpx_apu_dsp_boot_poll(MCPXAPUState *d, uint8_t *mcpx);
 
 #ifdef XBOXRECOMP_APU_DSP_DEVICE
 /* The GP and EP on the dsp56300 JIT (apu_dsp_run.c), with RECOMP_APU_DSP=1:

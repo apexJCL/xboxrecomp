@@ -25,6 +25,8 @@
 #include "apu_state.h"
 #include "recomp_env.h"
 #include "fpconv.h"
+#include "apu_dsp_emu.h"
+#include "../kernel/xbox_memory_layout.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -213,6 +215,78 @@ static uint32_t *dsp_ack_auto_slot(MCPXAPUState *d)
     return (uint32_t *)(mcpx_apu_phys(page) + GP_DOORBELL_OFFSET);
 }
 
+/* THE BOOT ROM, WITHOUT A DSP. When GPRST/EPRST go to 3 the core's boot
+ * ROM copies the first 0x800 words of its scratch into P:0 and starts there
+ * (xemu's dsp_bootstrap; apu_dsp_emu.c bootstrap() with the DSP on). The
+ * stub runs no program, but a title may read the loaded program back: KUF:
+ * Heroes' DirectSound checks EP P:6 against 0xCCCCCC, word 6 of the DOLBY
+ * program it copied to EP scratch, on every DoWork (sub_002F5CCD), and on a
+ * mismatch resets both cores, rewinds XGSCNT and stalls 10 ms
+ * (sub_002F5A8D). With nothing loaded that ran about 30 times a second,
+ * XACT's sample clock lost the time on each, and voices played in 10.7 ms
+ * chunks with gaps between. GPRST/EPRST and P live in the
+ * untrapped MCPX window, so the frame poll looks at them there. Only the
+ * copy is modelled: P holds what the title loaded, and nothing runs it.
+ * The copy fires when the APU frame thread's poll sees RST at 3, not on the
+ * register write: a 0->3 toggle between two polls, or made while the frame
+ * thread is paused (pause_requested), gets no copy. apu_dsp_emu_poll_rst
+ * has the same limit. KUF's 10 ms stall after the reset is what keeps RST
+ * at 3 long enough for the poll to see the edge. */
+static uint32_t s_boot_rst[2];            /* GP, EP: last RST bits seen */
+static unsigned long s_boots[2];
+
+static void dsp_boot_copy(uint8_t *p, uint32_t sge_base, uint32_t max_sge)
+{
+    const uint8_t *src = NULL;
+    uint32_t i;
+
+    if (!sge_base)
+        return;
+    for (i = 0; i < APU_DSP_BOOT_WORDS; i++) {
+        uint32_t off = i * 4, w;
+        if ((off & 0xFFF) == 0) {
+            uint32_t pe = off >> 12, page;
+            if (pe > max_sge)
+                return;                    /* past the table: P keeps the rest */
+            page = *(const uint32_t *)mcpx_apu_phys(sge_base + pe * 8);
+            if (!page || (page & 0xFFF))
+                return;                    /* entry not filled in */
+            src = mcpx_apu_phys(page);
+        }
+        memcpy(&w, src + (off & 0xFFF), 4);
+        w &= 0xFFFFFFu;
+        memcpy(p + off, &w, 4);
+    }
+}
+
+void mcpx_apu_dsp_boot_poll(MCPXAPUState *d, uint8_t *mcpx)
+{
+    static const uint32_t win[2] = { 0x30000u, 0x50000u };
+    static const char *const name[2] = { "GP", "EP" };
+    int k;
+
+    if (!mcpx || !d->ram_ptr)
+        return;
+    for (k = 0; k < 2; k++) {
+        uint8_t *w = mcpx + win[k];
+        uint32_t rst = *(volatile uint32_t *)(w + APU_DSP_WIN_RST) & 3;
+        if (rst == s_boot_rst[k])
+            continue;
+        s_boot_rst[k] = rst;
+        if (rst != 3)
+            continue;
+        dsp_boot_copy(w + APU_DSP_WIN_P,
+                      qatomic_read(&d->regs[k ? NV_PAPU_EPSADDR
+                                              : NV_PAPU_GPSADDR]),
+                      qatomic_read(&d->regs[k ? NV_PAPU_EPSMAXSGE
+                                              : NV_PAPU_GPSMAXSGE]));
+        if (s_boots[k]++ < 3)
+            fprintf(stderr, "[APU] %s out of reset: boot ROM copy, scratch"
+                            " to P:0 (stub; P:6 = 0x%06X)\n", name[k],
+                    *(const uint32_t *)(w + APU_DSP_WIN_P + 6 * 4));
+    }
+}
+
 void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
 {
     int i;
@@ -226,6 +300,7 @@ void mcpx_apu_dsp_ack_poll(MCPXAPUState *d)
         dsp_ack_init();
     if (!d->ram_ptr)
         return;
+    mcpx_apu_dsp_boot_poll(d, (uint8_t *)xbox_McpxHost());
     if (s_dsp_ack_auto) {
         uint32_t *slot = dsp_ack_auto_slot(d);
         if (slot && *slot) {
@@ -258,6 +333,8 @@ void mcpx_apu_dsp_init(MCPXAPUState *d)
     s_dsp_ack_auto = 0;
     s_dsp_ack_auto_page = 0;
     s_gp_in_reset = 0;
+    memset(s_boot_rst, 0, sizeof s_boot_rst);
+    memset(s_boots, 0, sizeof s_boots);
 
     /* Allocate minimal DSP state for GP and EP.
      * We need these to exist so reset doesn't crash,

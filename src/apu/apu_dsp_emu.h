@@ -47,6 +47,9 @@ extern "C" {
 #define APU_DSP_WIN_P        0xA000u   /* P:0x000-0xFFF */
 #define APU_DSP_WIN_RST      0xFFFCu   /* GPRST / EPRST */
 
+/* What the boot ROM copies from the start of scratch into P. */
+#define APU_DSP_BOOT_WORDS   0x800u
+
 /* X:0x1400, where the VP writes the 32 mixbins and the GP leaves its
  * output (GP_DSP_MIXBUF_BASE in apu_regs.h). */
 #define APU_DSP_MIXBUF_BASE  0x1400u
