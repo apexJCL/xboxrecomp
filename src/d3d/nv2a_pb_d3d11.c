@@ -3839,9 +3839,9 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
     }
     rt->last_draw = ++s_seq;
     s_cur = NULL;
-    s_draws++;
+    s_draws += d->batches;
     if (d->program)
-        s_draws_prog++;
+        s_draws_prog += d->batches;
 }
 
 /* ---- flip ------------------------------------------------------------------ */
@@ -5029,6 +5029,9 @@ static const struct nv2a_pb_backend s_d3d11_backend = {
     d3d11_on_zpass_clear,
     d3d11_on_report,
     d3d11_on_poll,
+    0,                  /* writes_back: presents and dumps from its swap chain */
+    NULL,               /* sync_guest */
+    1,                  /* merge_draws */
 };
 
 /* For tests/d3d11_backend_smoke: the size of the target at a colour offset

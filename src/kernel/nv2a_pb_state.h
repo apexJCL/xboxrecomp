@@ -308,6 +308,10 @@ struct nv2a_pb_draw {
     const uint32_t   *inline_buf;
     uint32_t          inline_bytes;
     int               program;
+    uint32_t          batches;       /* guest batches drawn: 1, or a merged
+                                      * chain's length (nv2a_merge); the flip
+                                      * log's "batches" adds these, as golden
+                                      * anchors count guest batches */
 };
 
 /* The backend's events. A NULL member ignores that event.
@@ -354,6 +358,11 @@ struct nv2a_pb_backend {
      * Called on the ack thread only, like on_flip. NULL: guest memory is
      * already current (CPU) or never read (D3D11 dumps itself). */
     void (*sync_guest)(uint32_t offset, uint32_t pitch, uint32_t w, uint32_t h);
+    /* merge_draws: on_draw may get back-to-back batches as one triangle
+     * list (nv2a_merge); the backend keeps no per-batch rule that the
+     * merged list would change. The walker merges only with display.aspect
+     * stock, since Hor+ places each batch from its own vertices. */
+    int  merge_draws;
 };
 
 /* Route the executor's events to `backend`. NULL restores the CPU rasteriser.

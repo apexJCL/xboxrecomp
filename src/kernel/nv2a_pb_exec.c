@@ -385,6 +385,8 @@ static int      s_idx_cut;              /* the open batch has lost some */
 static uint32_t s_idx_max;              /* largest idx_count drawn */
 static uint32_t s_idx_over_ffff;        /* indices past 0xFFFF, truncated to 16 bits */
 static uint32_t s_xv_fail;              /* program batches dropped: no scratch */
+static void merge_flush(void);
+static uint32_t s_draw_batches = 1;     /* guest batches the next draw stands for */
 
 /* Indices past NV_MAX_INDICES are dropped, which cuts the far end off a big
  * mesh with no other sign: say so once, and count the batch at its END. */
@@ -3446,6 +3448,7 @@ static struct {
 static struct {
     uint64_t scan, draw, flip, scan_t0, flip_t0;
     uint32_t methods, batches;
+    uint32_t draws;     /* backend draws: batches less those merged (nv2a_merge) */
 } s_perf;
 
 uint64_t nv2a_pb_now_ns(void) { return rt_now(); }
@@ -6107,6 +6110,7 @@ static void reports_settle(void)
 /* nv2a_pb_scan, at the end of each walk, before GET is stored. */
 void nv2a_pb_exec_walk_end(void)
 {
+    merge_flush();
     reports_settle();
 }
 
@@ -6115,6 +6119,7 @@ void nv2a_pb_exec_walk_end(void)
  * early acks. */
 void nv2a_pb_exec_checkpoint(void)
 {
+    merge_flush();
     reports_settle();
 }
 
@@ -6508,7 +6513,9 @@ static void draw_primitive(void)
 
     if (!s_gpu.prim || !s_gpu.idx_count)
         return;
-    s_gpu.draws++;
+    /* Every count here is per guest batch: a merged chain (merge_flush)
+     * counts as the s_draw_batches it stands for, drawn or skipped. */
+    s_gpu.draws += s_draw_batches;
     if (s_gpu.idx_count > s_idx_max)
         s_idx_max = s_gpu.idx_count;
     /* ~14 lines a second at 2.8k batches a frame, each a locked write to
@@ -6536,7 +6543,7 @@ static void draw_primitive(void)
     if (s_gpu.color_keep != 0xFFFFFFFFu)   /* a depth/stencil-only pass draws no colour */
         present_note(0);
     if (ff_begin() < 0) {
-        s_perf.batches++;
+        s_perf.batches += s_draw_batches;
         return;
     }
     vsh_const_dump_draw();
@@ -6554,6 +6561,7 @@ static void draw_primitive(void)
         d.inline_buf   = s_gpu.inline_buf;
         d.inline_bytes = s_gpu.inline_count * 4;
         d.program      = vsh_batch_active();
+        d.batches      = s_draw_batches;
         if (cpu_px_on()) {
             uint32_t before[4] = {0};
             float zb[4] = {0};
@@ -6568,15 +6576,16 @@ static void draw_primitive(void)
             s_backend->on_draw(&d);
         if (timed)
             s_perf.draw += rt_now() - t0;
+        s_perf.draws++;
         /* The CPU rasteriser already counts its batches into s_gpu.batches_*,
          * so counting it here too would double the [PACING] figure. */
         if (s_backend != &s_cpu_backend)
-            s_pacing_backend_batches++;
+            s_pacing_backend_batches += s_draw_batches;
         if (s_backend->writes_back)
-            s_gpu_backend_batches++;
+            s_gpu_backend_batches += s_draw_batches;
     }
     ff_end();
-    s_perf.batches++;
+    s_perf.batches += s_draw_batches;
 
     if (recomp_env(RENV_PB_EXEC_VERBOSE)) {
         static int shown;
@@ -6776,6 +6785,136 @@ static void draw_immediate(void)
     s_gpu.inline_count = 0;
 }
 
+/* Draw merging (nv2a_merge): a batch made of DRAW_ARRAYS or ARRAY_ELEMENT
+ * alone is held at its END instead of drawn, and the batches that follow
+ * it with the same primitive and no other method in between join it; the
+ * first other method, or the walk's end, draws the chain as one triangle
+ * list. Nothing but BEGIN, the indices and END came since the held
+ * batches ended, so the state they draw with is still theirs. BLiNX 1's
+ * stage 2 snow is 18.6k batches a flip, most of them 3 to 6 vertex
+ * strips back to back: 7.8k draws merged, and on the Deck each backend
+ * draw is ~1.3 us of the walk. */
+static struct nv2a_merge s_mrg;
+static int s_batch_pure;        /* the open batch has had only indices */
+static uint32_t s_mrg_save_n;
+/* merge_continues flushes before an open batch passes the batch cap, so
+ * what merge_flush keeps aside fits here. */
+static uint16_t s_mrg_save[NV2A_MERGE_BATCH_MAX];
+
+/* Whether this batch's END may hold it: on a backend that takes merged
+ * lists, with display.aspect stock (Hor+ places each batch from its own
+ * vertices, nv2a_aspect_place) and pb_merge not 0. */
+static int merge_on(void)
+{
+    static int env = -1;
+    if (env < 0) {
+        const char *e = recomp_env(RENV_PB_MERGE);
+        env = !(e && !strcmp(e, "0"));
+    }
+    return env && s_backend->merge_draws && s_backend->on_draw
+        && !nv2a_host_opts()->aspect_w;
+}
+
+/* Draw the held batches. Runs before the method that ended the chain is
+ * applied, which may be inside a batch that has started (and has only
+ * indices so far): that batch's indices are kept aside meanwhile. */
+static void merge_flush(void)
+{
+    uint32_t prim = s_gpu.prim, n = s_gpu.idx_count;
+    int cut = s_idx_cut;
+
+    if (!s_mrg.batches)
+        return;
+    if (prim && n) {
+        memcpy(s_mrg_save, s_gpu.idx, n * sizeof *s_gpu.idx);
+        s_mrg_save_n = n;
+    }
+    s_idx_cut = 0;
+    if (s_mrg.batches == 1) {
+        s_gpu.prim = s_mrg.prim;
+        memcpy(s_gpu.idx, s_mrg.raw, s_mrg.raw_n * sizeof *s_gpu.idx);
+        s_gpu.idx_count = s_mrg.raw_n;
+        draw_primitive();
+    } else {
+        s_gpu.prim = NV_PRIM_TRIANGLES;
+        memcpy(s_gpu.idx, s_mrg.list, s_mrg.n * sizeof *s_gpu.idx);
+        s_gpu.idx_count = s_mrg.n;
+        s_draw_batches = s_mrg.batches;
+        draw_primitive();
+        s_draw_batches = 1;
+        /* draw_primitive counted the list's indices; the batches carried
+         * their own. */
+        s_gpu.verts += s_mrg.verts - s_mrg.n;
+    }
+    s_mrg.batches = 0;
+    s_gpu.prim = prim;
+    s_gpu.idx_count = 0;
+    if (prim && n) {
+        memcpy(s_gpu.idx, s_mrg_save, n * sizeof *s_gpu.idx);
+        s_gpu.idx_count = n;
+    }
+    s_idx_cut = cut;
+}
+
+/* Whether an enabled texture stage reads the colour surface the batch draws
+ * into. Both GPU backends then sample a copy of the target taken per draw
+ * (Metal rt_texture, D3D11 rt_self_copy), so each batch sees the pixels the
+ * one before it wrote: distortion, haze or blur quads drawn back to back
+ * would see none of them in one merged draw. The test is rt_texture's. */
+static int merge_samples_target(void)
+{
+    uint32_t color;
+    int n;
+
+    if (!s_gpu.color_offset)
+        return 0;
+    color = dma_resolve(s_gpu.color_offset);
+    for (n = 0; n < 4; n++) {
+        const uint32_t *r = &s_tex_reg[(0x40u * n) / 4];
+        if ((r[0x0C / 4] & (1u << 30)) && r[0]
+                && !((dma_resolve(r[0]) ^ color) & 0x07FFFFFFu))
+            return 1;
+    }
+    return 0;
+}
+
+/* At a batch's END: hold it (1) or leave it to be drawn now (0), drawing
+ * any chain it cannot join first. */
+static int merge_take(void)
+{
+    if (!s_batch_pure || s_gpu.imm_count || s_gpu.inline_count || s_idx_cut
+            || !nv2a_merge_joinable(s_gpu.prim, s_gpu.idx_count) || !merge_on()
+            || merge_samples_target()) {
+        merge_flush();
+        return 0;
+    }
+    if (nv2a_merge_add(&s_mrg, s_gpu.prim, s_gpu.idx, s_gpu.idx_count))
+        return 1;
+    merge_flush();
+    return nv2a_merge_add(&s_mrg, s_gpu.prim, s_gpu.idx, s_gpu.idx_count);
+}
+
+/* Whether a method keeps the held chain open: the next batch's BEGIN with
+ * the chain's primitive, and inside it its indices and END. */
+static int merge_continues(uint32_t method, uint32_t param)
+{
+    switch (method) {
+    case NV097_SET_BEGIN_END:
+        return param ? !s_gpu.prim && param == s_mrg.prim : s_gpu.prim && s_batch_pure;
+    /* Only while the open batch stays joinable: past the cap it would
+     * draw on its own anyway, and merge_flush keeps at most the cap aside. */
+    case NV097_DRAW_ARRAYS:
+        return s_gpu.prim && s_batch_pure
+            && s_gpu.idx_count + ((param >> 24) & 0xFFu) + 1u <= NV2A_MERGE_BATCH_MAX;
+    case NV097_ARRAY_ELEMENT16:
+        return s_gpu.prim && s_batch_pure && s_gpu.idx_count + 2u <= NV2A_MERGE_BATCH_MAX;
+    case NV097_ARRAY_ELEMENT32:
+        return s_gpu.prim && s_batch_pure && s_gpu.idx_count + 1u <= NV2A_MERGE_BATCH_MAX;
+    default:
+        return 0;
+    }
+}
+
 /* A vertex is complete: append every attribute's current inline value
  * (s_vsh.inl, kept by vsh_inline_attr for every SET_VERTEX_DATA* form) in
  * the layout draw_immediate describes. An attribute the batch never set
@@ -6915,6 +7054,22 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                     " samples guest memory\n");
     }
     s_perf.methods++;
+    /* One flip's method stream, to see what a heavy flip spends its batches
+     * on (which state changes sit between draws, how big each draw is). */
+    {
+        static long mlog_flip = -2;
+        if (mlog_flip == -2) {
+            const char *e = recomp_env(RENV_PB_MLOG);
+            mlog_flip = e ? strtol(e, NULL, 0) : -1;
+        }
+        if (mlog_flip >= 0 && s_gpu.flips == (uint32_t)mlog_flip)
+            fprintf(stderr, "[MLOG] %u %04X %08X\n", subch, method, param);
+    }
+    if (s_gpu.prim && method != NV097_SET_BEGIN_END && method != NV097_DRAW_ARRAYS
+            && method != NV097_ARRAY_ELEMENT16 && method != NV097_ARRAY_ELEMENT32)
+        s_batch_pure = 0;
+    if (s_mrg.batches && !merge_continues(method, param))
+        merge_flush();
     fence_paired = s_fence_ref_next;
     s_fence_ref_next = 0;
     /* Bring-up: the first parameters each surface method carries. A wrong
@@ -7054,6 +7209,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             s_gpu.prim = param;
             s_gpu.idx_count = 0;
             s_idx_cut = 0;
+            s_batch_pure = 1;
             s_gpu.inline_count = 0;
             s_gpu.imm_count = 0;
         } else {
@@ -7064,7 +7220,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                 draw_immediate();
             else if (s_gpu.inline_count)
                 draw_inline_array();
-            else
+            else if (!merge_take())
                 draw_primitive();
             if (s_idx_cut)
                 s_idx_overflow++;
@@ -7403,17 +7559,17 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
                      * (the lifetime total is in the [PB] report). */
                     fprintf(stderr, "[PB-PERF] flip %u wall %.2f ms walk %.2f ms"
                             " (draw %.2f, decode %.2f) methods %u batches %u"
-                            " present %.2f kicks %u kickwait %.2f stops %u\n",
+                            " present %.2f kicks %u kickwait %.2f stops %u draws %u\n",
                             s_gpu.flips,
                             s_perf.flip_t0 ? (now - s_perf.flip_t0) / 1e6 : 0.0,
                             scan / 1e6, s_perf.draw / 1e6,
                             (double)(int64_t)(scan - s_perf.draw - s_perf.flip) / 1e6,
                             s_perf.methods, s_perf.batches,
                             s_perf.flip / 1e6, kicks, kwait / 1e6,
-                            stops - prev_stops);
+                            stops - prev_stops, s_perf.draws);
                     prev_stops = stops;
                     s_perf.scan = s_perf.draw = s_perf.flip = 0;
-                    s_perf.methods = s_perf.batches = 0;
+                    s_perf.methods = s_perf.batches = s_perf.draws = 0;
                     s_perf.scan_t0 = s_perf.flip_t0 = now;
                 }
             }

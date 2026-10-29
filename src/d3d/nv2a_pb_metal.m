@@ -2198,7 +2198,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         /* Vertex function and the float4 inputs it reads, in order. */
         if (d->program) {
             VsEntry *e = vs_cache();
-            s_draws_prog++;
+            s_draws_prog += d->batches;
             if (!e) {
                 s_draws_skipped++;
                 return;
@@ -2525,7 +2525,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         }
         [s_enc drawIndexedPrimitives:ptype indexCount:nidx indexType:MTLIndexTypeUInt32
                          indexBuffer:s_ib indexBufferOffset:ib_off];
-        s_draws++;
+        s_draws += d->batches;
     }
 }
 
@@ -3657,6 +3657,7 @@ static const struct nv2a_pb_backend s_metal_backend = {
     metal_on_poll,
     1,                  /* writes_back: dumps read guest memory, after sync_guest */
     metal_sync_guest,
+    1,                  /* merge_draws */
 };
 
 const struct nv2a_pb_backend *nv2a_pb_metal_backend(void)

@@ -93,6 +93,9 @@ if(NOT WIN32)
     # And a stride-0 vertex array: every vertex reads its one element.
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pb_stride0
                      ${CMAKE_CURRENT_BINARY_DIR}/pb_stride0)
+    # And draw merging: back-to-back strips reach a GPU backend as one list.
+    add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pb_draw_merge
+                     ${CMAKE_CURRENT_BINARY_DIR}/pb_draw_merge)
     # And the vertex-constant write generation the D3D11 backend's c[]
     # upload skip trusts.
     add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/pb_vsh_cgen

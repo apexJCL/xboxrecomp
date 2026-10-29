@@ -788,6 +788,38 @@ uint32_t nv2a_prim_to_list(uint32_t prim, const uint16_t *v, uint32_t n,
                            uint32_t base, uint32_t *out,
                            enum nv2a_topology *topo);
 
+/* Draw merging (nv2a_pb_exec.c): back-to-back batches of one triangle
+ * primitive with no method between them are drawn as one triangle list.
+ * Titles that draw every particle or sprite as its own 3- or 4-vertex
+ * strip (BLiNX 1's snow: 18k batches a flip, most of them with nothing in
+ * between) pay a backend draw call per strip otherwise. The list is
+ * nv2a_prim_to_list of each batch in turn, so the triangles, their order,
+ * winding and last vertex are the ones the batches would have drawn.
+ *
+ * A batch joins with up to NV2A_MERGE_BATCH_MAX indices; the list holds
+ * NV2A_MERGE_LIST_MAX, and the chain's indices span at most
+ * NV2A_MERGE_SPAN_MAX vertices, since a backend fetches the whole range
+ * lo..hi of a draw. */
+#define NV2A_MERGE_BATCH_MAX 256u
+#define NV2A_MERGE_LIST_MAX  0x6000u
+#define NV2A_MERGE_SPAN_MAX  0x1000u
+struct nv2a_merge {
+    uint32_t prim;        /* the chain's primitive (NV_PRIM_*) */
+    uint32_t batches;     /* guest batches held, 0: none */
+    uint32_t verts;       /* indices they carried */
+    uint32_t raw_n;       /* the first batch, drawn as it came if it stays alone */
+    uint16_t raw[NV2A_MERGE_BATCH_MAX];
+    uint32_t n;           /* list indices, once batches >= 2 */
+    uint16_t list[NV2A_MERGE_LIST_MAX];
+    uint16_t lo, hi;      /* vertex range of the chain */
+};
+/* Whether a batch of n indices of prim may join a chain at all. */
+int nv2a_merge_joinable(uint32_t prim, uint32_t n);
+/* Add a joinable batch to m (batches 0 starts a chain). Returns 0, with m
+ * unchanged, when it does not fit: another primitive, the list full or the
+ * span too wide; the caller draws m and starts again. */
+int nv2a_merge_add(struct nv2a_merge *m, uint32_t prim, const uint16_t *v, uint32_t n);
+
 /* FNV-1a over the vertex program's slots, from v->start through the slot
  * with the FINAL bit (or the end). *len, if given, gets the slot count. */
 uint32_t nv2a_vsh_program_hash(const struct nv2a_pb_vsh *v, uint32_t *len);
@@ -1827,8 +1859,8 @@ void nv2a_downscale_box32(const uint8_t *src, uint32_t src_pitch, uint32_t w, ui
 struct nv2a_batch_info {
     uint32_t program_hash;  /* nv2a_vsh_program_hash; 0 for a fixed-function batch */
     int      program;       /* the batch runs the vertex program */
-    uint32_t prim;          /* NV_PRIM_* */
-    uint32_t idx_count;
+    uint32_t prim;          /* NV_PRIM_*; NV_PRIM_TRIANGLES for a merged chain */
+    uint32_t idx_count;     /* a merged chain's list (nv2a_merge), not one batch's */
     uint32_t color_offset;  /* SET_SURFACE_COLOR_OFFSET, as the title set it */
     uint32_t surface_w, surface_h;   /* the clip's extent: clip_x + clip_w, clip_y + clip_h */
     uint32_t surface_format;         /* SET_SURFACE_FORMAT */

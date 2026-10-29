@@ -299,6 +299,68 @@ uint32_t nv2a_prim_to_list(uint32_t prim, const uint16_t *v, uint32_t n,
     return k;
 }
 
+int nv2a_merge_joinable(uint32_t prim, uint32_t n)
+{
+    return prim >= NV_PRIM_TRIANGLES && prim <= NV_PRIM_POLYGON
+        && n >= 3 && n <= NV2A_MERGE_BATCH_MAX;
+}
+
+/* Append batch v's triangles to out at *at, room permitting. */
+static int merge_put(uint16_t *out, uint32_t *at, uint32_t prim, const uint16_t *v, uint32_t n)
+{
+    uint32_t tmp[NV2A_MERGE_BATCH_MAX * 3u], k, i;
+    enum nv2a_topology topo;
+
+    k = nv2a_prim_to_list(prim, v, n, 0, tmp, &topo);
+    if (*at + k > NV2A_MERGE_LIST_MAX)
+        return 0;
+    for (i = 0; i < k; i++)
+        out[*at + i] = (uint16_t)tmp[i];
+    *at += k;
+    return 1;
+}
+
+int nv2a_merge_add(struct nv2a_merge *m, uint32_t prim, const uint16_t *v, uint32_t n)
+{
+    uint16_t lo = v[0], hi = v[0];
+    uint32_t i, at;
+
+    for (i = 1; i < n; i++) {
+        if (v[i] < lo) lo = v[i];
+        if (v[i] > hi) hi = v[i];
+    }
+    if (!m->batches) {
+        m->prim = prim;
+        m->batches = 1;
+        m->verts = n;
+        m->raw_n = n;
+        memcpy(m->raw, v, n * sizeof *v);
+        m->n = 0;
+        m->lo = lo;
+        m->hi = hi;
+        return 1;
+    }
+    if (prim != m->prim)
+        return 0;
+    if (lo > m->lo) lo = m->lo;
+    if (hi < m->hi) hi = m->hi;
+    if ((uint32_t)(hi - lo) >= NV2A_MERGE_SPAN_MAX)
+        return 0;
+    at = 0;
+    if (m->batches == 1 && !merge_put(m->list, &at, prim, m->raw, m->raw_n))
+        return 0;
+    if (m->batches > 1)
+        at = m->n;
+    if (!merge_put(m->list, &at, prim, v, n))
+        return 0;
+    m->n = at;
+    m->batches++;
+    m->verts += n;
+    m->lo = lo;
+    m->hi = hi;
+    return 1;
+}
+
 uint32_t nv2a_vsh_program_hash(const struct nv2a_pb_vsh *v, uint32_t *len)
 {
     uint32_t h = 2166136261u, n = 0, pc, k;
