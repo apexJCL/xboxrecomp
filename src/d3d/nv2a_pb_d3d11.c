@@ -733,6 +733,9 @@ static int init(void)
     create_black_texture();
     fprintf(stderr, LOGP "device up: feature level 0x%X, swap chain %ux%u\n",
             (unsigned)fl, s_back_w, s_back_h);
+#ifdef XBOXRECOMP_ENHANCE
+    nv2a_present_chain_host("D3D11");
+#endif
     s_failed = 0;
     return 1;
 }
@@ -4311,6 +4314,8 @@ static size_t s_lrs_frames;
 static ID3D11Texture2D *s_lrs_src;
 static ID3D11ShaderResourceView *s_lrs_srv;
 static PFN_libra_d3d11_filter_chain_frame s_lrs_ff;   /* with the chain */
+static PFN_libra_d3d11_filter_chain_set_param s_lrs_sp;
+static unsigned s_lrs_pgen;         /* the parameter generation applied */
 static int s_lrs_ov_said;
 
 /* The chain and its input copy: after a switch to none or a failure the
@@ -4326,8 +4331,10 @@ static void lrs_free(void)
     s_lrs_srv = NULL;
     s_lrs_src = NULL;
     s_lrs_ff = NULL;
+    s_lrs_sp = NULL;
     if (!s_lrs_chain)
         return;
+    nv2a_present_chain_params_clear();
     l = nv2a_present_chain_lib();
     fr = l ? (PFN_libra_d3d11_filter_chain_free)l->sym("libra_d3d11_filter_chain_free") : NULL;
     if (fr)
@@ -4367,6 +4374,7 @@ static libra_d3d11_filter_chain_t lrs_chain(void)
     pf = (PFN_libra_preset_free)l->sym("libra_preset_free");
     cc = (PFN_libra_d3d11_filter_chain_create)l->sym("libra_d3d11_filter_chain_create");
     s_lrs_ff = (PFN_libra_d3d11_filter_chain_frame)l->sym("libra_d3d11_filter_chain_frame");
+    s_lrs_sp = (PFN_libra_d3d11_filter_chain_set_param)l->sym("libra_d3d11_filter_chain_set_param");
     if (!pc || !pf || !cc || !s_lrs_ff) {
         fprintf(stderr, "[SHADER] present.shader off: the library has no D3D11 runtime\n");
         nv2a_present_chain_failed(gen);
@@ -4375,6 +4383,9 @@ static libra_d3d11_filter_chain_t lrs_chain(void)
     memset(&co, 0, sizeof co);
     co.version = LIBRASHADER_CURRENT_VERSION;
     e = pc(path, &preset);
+    /* The parameters before the chain: creating it consumes the preset. */
+    if (!e)
+        nv2a_present_chain_params_publish(&preset, gen);
     if (!e)
         e = cc(&preset, s_dev, &co, &s_lrs_chain);
     if (preset)
@@ -4384,11 +4395,84 @@ static libra_d3d11_filter_chain_t lrs_chain(void)
         nv2a_present_chain_error(e, msg, sizeof msg);
         fprintf(stderr, "[SHADER] present.shader off: %s: %s\n", path, msg);
         s_lrs_chain = NULL;
+        nv2a_present_chain_params_clear();
         nv2a_present_chain_failed(gen);
         return NULL;
     }
+    /* A new chain starts at the preset's values: apply every override. */
+    s_lrs_pgen = nv2a_present_chain_params_gen() - 1;
     fprintf(stderr, "[SHADER] present.shader: %s (D3D11)\n", path);
     return s_lrs_chain;
+}
+
+/* nv2a_present_chain_params_apply's setter. librashader refuses a name the
+ * chain lacks (UnknownShaderParameter), but the names come from the table
+ * read off this chain's own preset, so none is unknown; an error here would
+ * repeat on every change, so it is dropped unlogged. */
+static void lrs_set_param(void *ctx, const char *name, float v)
+{
+    libra_error_t e;
+    char msg[256];
+    if (!s_lrs_sp)
+        return;
+    e = s_lrs_sp((libra_d3d11_filter_chain_t *)ctx, name, v);
+    if (e)
+        nv2a_present_chain_error(e, msg, sizeof msg);
+}
+
+/* While a chain is wanted under present.surface=internal the surface is
+ * the output, not the frame. The chain draws its mask and scanlines per
+ * output pixel; drawn into a frame-sized surface and scaled after by the
+ * compositor (gamescope on the Deck: 640x480 to 1280x800, bilinear), they
+ * are resampled into colour fringes and moire. Under gamescope or
+ * present.fullscreen a borderless window covers the monitor and the swap
+ * chain takes its size; otherwise the swap chain follows the client area as
+ * under window. With the chain off the window style comes back and
+ * internal_resize returns the frame's size. present.surface=window already
+ * draws at the client size (present_resize). Returns 1 while the surface is
+ * the output. */
+static int chain_surface(int on, int internal)
+{
+    static int s_popup;
+    const struct nv2a_host_opts *eo = nv2a_host_opts();
+    int over = recomp_env_on(RENV_HOST_GAMESCOPE) || eo->fullscreen;
+    UINT w = s_client_w, h = s_client_h;
+
+    if (!on || !internal) {
+        if (s_popup && !eo->fullscreen) {
+            SetWindowLongPtrW(s_hwnd, GWL_STYLE, (LONG_PTR)(WS_OVERLAPPEDWINDOW | WS_VISIBLE));
+            SetWindowPos(s_hwnd, HWND_TOP, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+        }
+        s_popup = 0;
+        return 0;
+    }
+    if (over) {
+        MONITORINFO mi;
+        RECT r;
+        mi.cbSize = sizeof mi;
+        if (GetMonitorInfoW(MonitorFromWindow(s_hwnd, MONITOR_DEFAULTTONEAREST), &mi)) {
+            r = mi.rcMonitor;
+        } else {
+            r.left = r.top = 0;
+            r.right = GetSystemMetrics(SM_CXSCREEN);
+            r.bottom = GetSystemMetrics(SM_CYSCREEN);
+        }
+        w = (UINT)(r.right - r.left);
+        h = (UINT)(r.bottom - r.top);
+        if (!s_popup && w && h) {
+            SetWindowLongPtrW(s_hwnd, GWL_STYLE, (LONG_PTR)(WS_POPUP | WS_VISIBLE));
+            SetWindowPos(s_hwnd, HWND_TOP, r.left, r.top, (int)w, (int)h,
+                         SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+            s_popup = 1;
+        }
+    }
+    if (w && h && (w != s_back_w || h != s_back_h)) {
+        swap_resize(w, h);
+        fprintf(stderr, "[SHADER] present.shader: back buffer %ux%u (the output's size)\n",
+                s_back_w, s_back_h);
+    }
+    return 1;
 }
 
 /* The chain's input: rt's w x h corner at host size. */
@@ -4457,6 +4541,7 @@ static int present_chain(RenderTarget *rt, int filter, int internal)
     chain = lrs_chain();
     if (!chain || !s_back)
         return 0;
+    nv2a_present_chain_params_apply(&s_lrs_pgen, lrs_set_param, &s_lrs_chain);
     if (!s_back_rtv && FAILED(ID3D11Device_CreateRenderTargetView(
                 s_dev, (ID3D11Resource *)s_back, NULL, &s_back_rtv)))
         return 0;
@@ -4825,14 +4910,22 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
                  && s_back_w == s_made_w && s_back_h == s_made_h;
         UINT cw, ch;
         int same;
+        int internal = eo->present_surface == NV2A_PRESENT_SURFACE_INTERNAL;
         present_extent(s_drawn, &cw, &ch);
         s_shown_w = cw;
         s_shown_h = ch;
-        if (eo->present_surface == NV2A_PRESENT_SURFACE_INTERNAL)
+#ifdef XBOXRECOMP_ENHANCE
+        /* A shader draws at the output: everything below is as under
+         * present.surface=window. Gated on a built chain, as Metal: a
+         * missing library or preset must not flash a monitor-sized popup
+         * for the one flip its build takes to fail. */
+        if (chain_surface(nv2a_present_chain_wanted() && lrs_chain(), internal))
+            internal = 0;
+#endif
+        if (internal)
             internal_resize(s_drawn, cw, ch);
         same = cw == s_drawn->w && ch == s_drawn->h
             && s_drawn->hw == s_back_w && s_drawn->hh == s_back_h;
-        int internal = eo->present_surface == NV2A_PRESENT_SURFACE_INTERNAL;
         /* Under present.surface=internal nothing is scaled here, so no
          * filter has anything to do: the frame is copied as it is, at
          * scale > 1 too (the compositor gets the scaled frame whole). */
@@ -5024,6 +5117,13 @@ static void fullscreen_switch(int full)
 
     if (!s_hwnd)
         return;
+#ifdef XBOXRECOMP_ENHANCE
+    /* With a chain the back buffer is the output's size (chain_surface),
+     * not the frame's: the switch goes as under present.surface=window, or
+     * leaving fullscreen would keep a monitor-sized window. */
+    if (s_lrs_chain)
+        internal = 0;
+#endif
     if (full) {
         MONITORINFO mi;
 

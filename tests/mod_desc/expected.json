@@ -21,4 +21,4 @@
       {"id": "go", "kind": "action", "action": "dorm.go", "label": "Go", "when": null, "defaults": ["F7"], "bindings": ["F7", "NoSuchKey"], "refused": ["NoSuchKey"], "source": "user"}]},
   {"id": "bad", "descriptor": true, "init": "failed", "reason": "setting 'x': lo 9 > hi 1"},
   {"id": "legacy", "descriptor": false}
-]}
+], "shaders": {"active": "none", "presets": []}}

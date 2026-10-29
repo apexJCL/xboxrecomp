@@ -127,7 +127,9 @@ void enhance_menu_draw(uint64_t now_ms);
 int  enhance_menu_page_count(void);
 const char *enhance_menu_page_name(int page);
 int  enhance_menu_page(void);
-int  enhance_menu_set_page(const char *name);   /* 1 when found */
+int  enhance_menu_set_page(const char *name);   /* 1 when found and shown */
+/* 0 for a page left out of the tab strip (Shaders, where none can run). */
+int  enhance_menu_page_shown(int page);
 int  enhance_menu_rows(void);
 int  enhance_menu_selected(void);
 /* Row i's label and value text (value "" for none); 0 when i is out of

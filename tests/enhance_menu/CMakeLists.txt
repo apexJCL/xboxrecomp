@@ -4,7 +4,8 @@
 # the neutral pad, a Mods toggle through on_enable at xbox_mod_frame, the
 # Controls capture and its refusals, Save of an action binding and of an
 # item (config.toml holds only the changed keys), the Mouse group, the
-# pack's miss snapshot, and each page's draw list at 1080 lines against a
+# pack's miss snapshot, the Shaders page's parameter rows and their Save,
+# and each page's draw list at 1080 lines against a
 # pinned checksum. Pure C, no device:
 #   cmake -S tests/enhance_menu -B build/enhance_menu
 #   cmake --build build/enhance_menu && ctest --test-dir build/enhance_menu
@@ -72,6 +73,14 @@ if(NOT WIN32)
 endif()
 # enhance.c sets present.shader; the chain module dlopens librashader.
 target_link_libraries(enhance_menu_test PRIVATE ${CMAKE_DL_LIBS})
+# A librashader stand-in with a fixed parameter table (the present_chain
+# test's), for the Shaders page.
+add_library(fake_lrs_params MODULE ${CMAKE_CURRENT_LIST_DIR}/../present_chain/fake_lrs.c)
+target_compile_definitions(fake_lrs_params PRIVATE FAKE_ABI=2 FAKE_API=5 FAKE_PARAMS)
+set_target_properties(fake_lrs_params PROPERTIES PREFIX "")
+add_dependencies(enhance_menu_test fake_lrs_params)
+target_compile_definitions(enhance_menu_test PRIVATE
+    FAKE_LRS_PARAMS="$<TARGET_FILE:fake_lrs_params>")
 enable_testing()
 add_test(NAME enhance_menu COMMAND enhance_menu_test
          WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})

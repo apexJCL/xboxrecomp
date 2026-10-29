@@ -57,11 +57,11 @@
 #define STATUS_MS    3000u  /* a message stays in the footer this long */
 
 enum page {
-    PAGE_RENDER, PAGE_PACK, PAGE_GAME, PAGE_MODS, PAGE_STATS, PAGE_CONTROLS,
+    PAGE_RENDER, PAGE_SHADERS, PAGE_PACK, PAGE_GAME, PAGE_MODS, PAGE_STATS, PAGE_CONTROLS,
     PAGE_DEBUG, PAGE_SAVE, PAGE_COUNT
 };
 static const char *const s_page_name[PAGE_COUNT] = {
-    "Render", "Pack", "Game", "Mods", "Stats", "Controls", "Debug", "Save"
+    "Render", "Shaders", "Pack", "Game", "Mods", "Stats", "Controls", "Debug", "Save"
 };
 
 /* ---- the toolkit's items ------------------------------------------------ */
@@ -277,7 +277,7 @@ static const struct enhance_item k_items[] = {
       .def = "0" },
     { ITEM("present.filter", "Scaling filter", "Render", ENHANCE_ITEM_CHOICE),
       .choices = k_filter, .set = set_filter, .get = get_filter, .def = "nearest" },
-    { ITEM("present.shader", "Shader", "Render", ENHANCE_ITEM_CHOICE),
+    { ITEM("present.shader", "Shader", "Shaders", ENHANCE_ITEM_CHOICE),
       .choices = k_shader, .set = set_shader, .get = get_shader, .def = "none" },
     { ITEM("present.fullscreen", "Fullscreen", "Render", ENHANCE_ITEM_TOGGLE), .set = set_full,
       .get = get_full, .live = ENHANCE_LIVE_FLUSH, .def = "false" },
@@ -766,7 +766,9 @@ enum row_type {
     R_SLOT, R_INFO, R_HEADER, R_BIND, R_MOD, R_SAVE, R_RESET,
     R_TEXT,             /* one wrapped line of a mod's Author, About or State */
     R_CTL,              /* a mod's captured control: read only until phase D */
-    R_MODRESET          /* "Reset this mod" */
+    R_MODRESET,         /* "Reset this mod" */
+    R_PARAM,            /* a shader parameter: ref indexes s_ptab */
+    R_PRESET            /* "Reset to preset" */
 };
 enum { TINT_NONE, TINT_BAD, TINT_WARN };
 
@@ -784,6 +786,30 @@ struct row {
 static int s_state = ST_CLOSED;     /* written under the lock, read relaxed */
 static int s_page;
 static int s_sel[PAGE_COUNT];
+/* The Shaders page is left out where no shader can run (the user,
+ * 2026-10-29): no chain presenter, or librashader missing or failing to
+ * load (a stock Windows lacks the D3DX9 runtime it imports). Decided at
+ * each open; the reason is said once. A supported build shows it with
+ * present.shader none, since the picker lives there. */
+static int s_shaders_off;
+static int s_shaders_said;
+
+static int page_shown(int p)
+{
+    return p != PAGE_SHADERS || !s_shaders_off;
+}
+
+static void shaders_check(void)
+{
+    char why[700];
+    s_shaders_off = !nv2a_present_chain_supported(why, sizeof why);
+    if (s_shaders_off && !s_shaders_said) {
+        fprintf(stderr, "[SHADER] the menu's Shaders page is hidden: %s\n", why);
+        s_shaders_said = 1;
+    }
+    if (!page_shown(s_page))
+        s_page = PAGE_RENDER;
+}
 static int s_scroll[PAGE_COUNT];
 static int s_mod_sub = -1;          /* the mod whose items the Mods page lists */
 static int s_confirm;               /* the Reset row asks again */
@@ -1349,6 +1375,125 @@ static void action_groups(void)
     }
 }
 
+/* ---- the Shaders page: the active preset's parameters ------------------- */
+
+/* The table as build_rows last read it, and a range item per row for the
+ * draw (the slider) and the footer's tag. The store keeps the values and
+ * the overrides (nv2a_present_chain.h): the rows are no slots, and Save
+ * writes the store's overrides as present.shader_params.<preset>.<name>. */
+static struct nv2a_present_param s_ptab[NV2A_PRESENT_PARAMS_MAX];
+static struct enhance_item s_pitem[NV2A_PRESENT_PARAMS_MAX];
+static int s_nptab;
+static char s_pkey_active[64];
+
+#define SHADER_PARAMS "present.shader_params."
+
+/* A step's decimals, as for a mod setting: 0.05 shows 0.05, 1 shows 1. A
+ * preset with no step moves by a hundredth of its range. */
+static double param_step(const struct nv2a_present_param *p)
+{
+    return p->step > 0 ? p->step : p->max > p->min ? (p->max - p->min) / 100 : 1;
+}
+
+static int param_decimals(const struct nv2a_present_param *p)
+{
+    double x = param_step(p);
+    int d = 0;
+    while (d < 6 && fabs(x - floor(x + 0.5)) > 1e-6) {
+        x *= 10;
+        d++;
+    }
+    return d;
+}
+
+/* The label: the preset's description, the name when it has none. */
+static void param_rows(void)
+{
+    char req[VAL_MAX];
+    int failed;
+
+    nv2a_present_chain_requested(req, sizeof req);
+    failed = strcmp(req, "none") && !nv2a_present_chain_wanted();
+    s_nptab = nv2a_present_chain_params(s_ptab, NV2A_PRESENT_PARAMS_MAX, s_pkey_active,
+                                        sizeof s_pkey_active);
+    if (!strcmp(req, "none")) {
+        info("Parameters", "no shader");
+        return;
+    }
+    if (failed) {
+        struct row *r = row_add(R_INFO, -1, 0, "Parameters");
+        if (r) {
+            snprintf(r->value, sizeof r->value, "the shader failed to load (see the log)");
+            r->tint = TINT_BAD;
+        }
+        return;
+    }
+    if (!s_pkey_active[0]) {
+        info("Parameters", "loading");
+        return;
+    }
+    if (!s_nptab) {
+        info("Parameters", "none in this preset");
+        return;
+    }
+    header("Parameters");
+    for (int i = 0; i < s_nptab; i++) {
+        const struct nv2a_present_param *p = &s_ptab[i];
+        struct enhance_item *it = &s_pitem[i];
+        struct row *r;
+        float v = p->initial;
+        memset(it, 0, sizeof *it);
+        it->key = p->name;
+        it->label = p->desc[0] ? p->desc : p->name;
+        it->kind = ENHANCE_ITEM_RANGE;
+        it->lo = p->min;
+        it->hi = p->max;
+        it->step = param_step(p);
+        it->live = ENHANCE_LIVE;
+        r = row_add(R_PARAM, i, 1, it->label);
+        if (!r)
+            break;
+        nv2a_present_chain_param_get(p->name, &v);
+        snprintf(r->value, sizeof r->value, "%.*f", param_decimals(p), v);
+        /* The bounds and the preset's value as the preset wrote them: they
+         * need not sit on the step grid (warpX ends at 0.125, step 0.01). */
+        snprintf(r->help, sizeof r->help, "%s \xC2\xB7 %g..%g \xC2\xB7 preset %g", p->name,
+                 p->min, p->max, p->initial);
+    }
+    row_add(R_PRESET, -1, 1, "Reset to preset");
+}
+
+/* Left and right by a step, snapped to the step's grid from the minimum so
+ * float steps do not drift; OK past the top wraps to the bottom, as a range
+ * slot does. */
+static void change_param(int i, int dir, int ok)
+{
+    const struct nv2a_present_param *p;
+    double step, x;
+    float v;
+    if (i < 0 || i >= s_nptab)
+        return;
+    p = &s_ptab[i];
+    step = param_step(p);
+    v = p->initial;
+    nv2a_present_chain_param_get(p->name, &v);
+    x = v + (dir < 0 ? -step : step);
+    x = p->min + floor((x - p->min) / step + 0.5) * step;
+    if (x > p->max + step * 1e-3)
+        x = ok ? p->min : p->max;
+    if (x < p->min - step * 1e-3)
+        x = p->min;
+    nv2a_present_chain_param_set(p->name, (float)x);
+}
+
+/* A float literal TOML reads back as a float: always a point. */
+static void float_literal(float v, char *out, size_t n)
+{
+    snprintf(out, n, "%.6g", (double)v);
+    if (!strpbrk(out, ".eEn"))
+        strncat(out, ".0", n - strlen(out) - 1);
+}
+
 static void build_rows(void)
 {
     char buf[VAL_MAX];
@@ -1384,6 +1529,10 @@ static void build_rows(void)
         miss_rows(4);
         break;
     }
+    case PAGE_SHADERS:
+        slot_rows(PAGE_SHADERS, -1);
+        param_rows();
+        break;
     case PAGE_GAME:
         slot_rows(PAGE_GAME, -1);
         if (!s_nrow)
@@ -1516,7 +1665,8 @@ static void build_rows(void)
 /* + 2 * REWRITES_MAX: each user-file alias the mods read is written once
  * under its current key, the alias removed (D4). */
 #define REWRITES_MAX 64
-#define PENDING_MAX (SLOTS_MAX + ENHANCE_ACTIONS_MAX + MODS_MAX + 2 * REWRITES_MAX)
+#define PENDING_MAX (SLOTS_MAX + ENHANCE_ACTIONS_MAX + MODS_MAX + 2 * REWRITES_MAX \
+                     + NV2A_PRESENT_OVERRIDES_MAX)
 static char s_pkey[PENDING_MAX][96];
 static char s_pval[PENDING_MAX][VAL_MAX * 4];
 static int s_pnull[PENDING_MAX];
@@ -1678,6 +1828,26 @@ static int collect(void)
         snprintf(s_pval[n] + at, sizeof s_pval[n] - at, "]");
         n++;
     }
+    /* The shader parameters that moved: a removed override deletes its
+     * key, so the file holds differences from the preset only. */
+    for (int i = 0;; i++) {
+        char key[64], name[64];
+        float v;
+        int has, dirty, w;
+        if (!nv2a_present_chain_override_at(i, key, sizeof key, name, sizeof name, &v, &has,
+                                            &dirty))
+            break;
+        if (!dirty || n >= PENDING_MAX)
+            continue;
+        w = snprintf(s_pkey[n], sizeof s_pkey[n], SHADER_PARAMS "%s.%s", key, name);
+        if (w < 0 || (size_t)w >= sizeof s_pkey[n]) {
+            fprintf(stderr, LOGP "menu: " SHADER_PARAMS "%s.%s is too long to save\n", key,
+                    name);
+            continue;
+        }
+        float_literal(v, s_pval[n], sizeof s_pval[n]);
+        s_pnull[n++] = !has;
+    }
     s_rw_staged = 0;
     if (!s_rw_done)
         n = rewrites(n);
@@ -1702,7 +1872,7 @@ int enhance_menu_unsaved(void)
             n++;
     for (int id = 0; id < ENHANCE_ACTIONS_MAX; id++)
         n += s_adirty[id] != 0;
-    return n;
+    return n + nv2a_present_chain_overrides_dirty();
 }
 
 /* Every missing directory above `path`, outermost first: a user config
@@ -1768,6 +1938,7 @@ static void save(void)
     for (int i = 0; i < s_nslot; i++)
         memcpy(s_slot[i].base, s_slot[i].cur, sizeof s_slot[i].base);
     memset(s_adirty, 0, sizeof s_adirty);
+    nv2a_present_chain_overrides_saved();
     s_rw_done = 1;
     if (rc > 0) {
         fprintf(stderr, LOGP "menu: saved to %s, %d key%s left out: %s\n", path, rc,
@@ -1817,6 +1988,7 @@ static void reset_scope(int m)
 static void reset_all(void)
 {
     reset_scope(-1);
+    nv2a_present_chain_params_reset(NULL);
     status("Reset to defaults; Save keeps it");
 }
 
@@ -1845,6 +2017,7 @@ int enhance_menu_open(uint64_t now_ms)
     s_now = now_ms;
     if (!s_built)
         build_slots();
+    shaders_check();
     /* What changed elsewhere since (the stats action, a mod's toggle)
      * shows as it is now; a change of the menu's own waits for Save. */
     for (int i = 0; i < s_nslot; i++) {
@@ -1889,7 +2062,12 @@ int enhance_menu_is_open(void)
 
 static void page_to(int p)
 {
-    s_page = (p + PAGE_COUNT) % PAGE_COUNT;
+    /* A hidden page is stepped over in the direction of travel. */
+    int d = p < s_page ? -1 : 1;
+    p = (p + PAGE_COUNT) % PAGE_COUNT;
+    for (int k = 0; k < PAGE_COUNT && !page_shown(p); k++)
+        p = (p + d + PAGE_COUNT) % PAGE_COUNT;
+    s_page = p;
     s_mod_sub = -1;
     s_confirm = 0;
     stats_page_use();
@@ -2034,6 +2212,15 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
                     &xbox_mod_desc_shown(r->ref >> 8)->controls[r->ref & 0xff];
                 status("%s: read-only for now; set [input.controls] \"%s.%s\" in config.toml",
                        r->label, xbox_mod_name(r->ref >> 8), c->id);
+            }
+            break;
+        case R_PARAM:
+            change_param(r->ref, dir, ok);
+            break;
+        case R_PRESET:
+            if (ok) {
+                nv2a_present_chain_params_reset(s_pkey_active);
+                status("%s: preset values; Save keeps it", s_pkey_active);
             }
             break;
         case R_MODRESET:
@@ -2430,7 +2617,7 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
     int pad = nv2a_ovl_px(s, t->pad), th = nv2a_ovl_text_height(fb);
     int ty = r.y + (r.h - th) / 2, x = r.x + pad, right = r.x + r.w - pad;
     const struct slot *sl = rw->type == R_SLOT ? &s_slot[rw->ref] : NULL;
-    const struct enhance_item *it = sl ? sl->it : NULL;
+    const struct enhance_item *it = sl ? sl->it : rw->type == R_PARAM ? &s_pitem[rw->ref] : NULL;
     int ro = sl && sl->env;
     mu_Color tint = rw->tint == TINT_BAD ? t->bad : rw->tint == TINT_WARN ? t->warn : t->text_dim;
     char cut[VAL_MAX * 2], forced[96], uv[VAL_MAX + 32];
@@ -2631,14 +2818,16 @@ void enhance_menu_draw(uint64_t now_ms)
         int tabh = nv2a_ovl_text_height(fb);
         for (int p = 0; p < PAGE_COUNT; p++) {
             tx[p] = total;
-            tw[p] = text_w(fb, s_page_name[p]);
-            total += tw[p] + sp;
+            tw[p] = page_shown(p) ? text_w(fb, s_page_name[p]) : 0;
+            total += page_shown(p) ? tw[p] + sp : 0;
         }
         if (tx[s_page] + tw[s_page] > inner)
             off = tx[s_page] + tw[s_page] - inner;
         mu_push_clip_rect(ctx, mu_rect(x0 + pad, y, inner, tabh + nv2a_ovl_px(s, 8)));
         for (int p = 0; p < PAGE_COUNT; p++) {
             int xx = x0 + pad + tx[p] - off;
+            if (!page_shown(p))
+                continue;
             mu_draw_text(ctx, fb, s_page_name[p], -1, mu_vec2(xx, y),
                          p == s_page ? t->text : t->text_dim);
             if (p == s_page)
@@ -2694,7 +2883,7 @@ void enhance_menu_draw(uint64_t now_ms)
                         : cur && cur->type == R_MOD
                             ? live_tag(xbox_mod_has_on_enable(cur->ref) ? ENHANCE_LIVE
                                                                        : ENHANCE_LIVE_RESTART)
-                        : cur && cur->type == R_BIND ? "live" : "";
+                        : cur && (cur->type == R_BIND || cur->type == R_PARAM) ? "live" : "";
         /* The selected row's help stands in for the controls while no
          * status shows (D5): the status line still wins. */
         int news = s_status[0] && s_status_t && now_ms - s_status_t < STATUS_MS;
@@ -2776,7 +2965,9 @@ void enhance_menu_hook(unsigned port, uint32_t held, XBOX_INPUT_STATE *st, uint6
         break;
     }
     if (s_state == ST_OPEN) {
+        /* Shaders: the parameters appear once the backend built the chain. */
         int w, h, px, py, live = s_page == PAGE_STATS || s_page == PAGE_DEBUG
+                                 || s_page == PAGE_SHADERS
                                  || s_page == PAGE_PACK || s_page == PAGE_CONTROLS;
         nv2a_overlay_placement(&px, &py, &w, &h);
         if (w <= 0 || h <= 0)
@@ -2842,10 +3033,15 @@ const char *enhance_menu_page_name(int page)
 
 int enhance_menu_page(void) { return s_page; }
 
+int enhance_menu_page_shown(int page)
+{
+    return page >= 0 && page < PAGE_COUNT && page_shown(page);
+}
+
 int enhance_menu_set_page(const char *name)
 {
     int p = page_by_name(name, -1);
-    if (p < 0)
+    if (p < 0 || !page_shown(p))
         return 0;
     page_to(p);
     return 1;
@@ -2882,6 +3078,8 @@ int enhance_menu_row(int i, char *label, size_t ln, char *value, size_t vn, int 
 
 int enhance_menu_row_live(int i)
 {
+    if (i >= 0 && i < s_nrow && s_row[i].type == R_PARAM)
+        return ENHANCE_LIVE;
     if (i < 0 || i >= s_nrow || s_row[i].type != R_SLOT)
         return -1;
     return (int)s_slot[s_row[i].ref].it->live;
@@ -2914,6 +3112,7 @@ void enhance_menu_reset_for_test(void)
     s_snap_on = s_stats_on = 0;
     s_state = ST_CLOSED;
     s_page = 0;
+    s_shaders_off = s_shaders_said = 0;
     memset(s_sel, 0, sizeof s_sel);
     memset(s_scroll, 0, sizeof s_scroll);
     s_mod_sub = -1;
@@ -2939,6 +3138,8 @@ void enhance_menu_reset_for_test(void)
     memset(s_adirty, 0, sizeof s_adirty);
     s_nslot = 0;
     s_nset = 0;
+    s_nptab = 0;
+    s_pkey_active[0] = 0;
     s_rw_done = 0;
     s_built = 0;
     s_ntitle = 0;

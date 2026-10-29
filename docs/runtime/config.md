@@ -164,6 +164,7 @@ the stock settings, `present.pacing = "spin"` included.
 | `present.fullscreen` | bool | borderless fullscreen at start | `false` | `RECOMP_PRESENT_FULLSCREEN` |
 | `present.pacing` | string | `"sleep"`, `"spin"` (stock, the console-original timing): how a lowered guest busy-wait waits | `"sleep"` | `RECOMP_PRESENT_PACING` |
 | `present.shader` | string | `"none"`, `"crt-lottes"`, `"crt-lottes-fast"`, `"crt-hyllian"`, `"fsr"`, or a `.slangp` path: a RetroArch slang preset run by librashader in place of the final present, on Metal and D3D11 ([present.shader](#presentshader)) | `"none"` | `RECOMP_PRESENT_SHADER` |
+| `present.shader_params.<preset>.<param>` | number | a slang preset's runtime parameter, per preset: `<preset>` is the bundled name or a path's file stem, `<param>` a `#pragma parameter` name. Clamped to the parameter's range ([shader parameters](#shaderparams)) | the preset's own value | none |
 | `present.shader_lib` | string | the librashader library; relative to the executable's directory. Loaded as given, with no hash check (the sha256 pin covers only the build's own copy) | `librashader.dll` beside the executable; macOS `librashader.dylib` beside it, then `../Frameworks/librashader.dylib` | `RECOMP_PRESENT_SHADER_LIB` |
 | `present.surface` | string | `"auto"`, `"window"`, `"internal"`: who scales the frame to the screen, the game or the compositor | `"auto"` | `RECOMP_PRESENT_SURFACE` |
 | `textures.pack` | string | a texture pack file ([texture-pack.md](../formats/texture-pack.md)); relative to the executable's directory | none | `RECOMP_TEXTURES_PACK` |
@@ -462,12 +463,63 @@ same requests at given flips, to check a switch without the menu.
   path the player names, as any library they put there would. A missing
   library, one with another ABI, or (Windows) a missing Visual C++
   Redistributable gives one `[SHADER]` line and the stock present. The menu's *Shader* row
-  (Render page) switches it live: the next present builds the new chain,
+  (Shaders page) switches it live: the next present builds the new chain,
   and a preset that fails to build is not retried until the next change.
+  The menu leaves the Shaders page out where no shader can run: no chain
+  presenter (the SDL renderer, or the CPU rasteriser's window on Windows),
+  or a library that is missing or does not load. It says why once
+  (`[SHADER] the menu's Shaders page is hidden: ...`). With a working
+  library and `none`, the page stays, for its picker.
   `none` costs one atomic load per present and loads nothing. D3D11 frame
   dumps add `present_NNNNN.bmp`, the back buffer after the shader, beside
   the usual render-target dumps, which stay the game's own frame. The
   CPU rasteriser ignores the key.
+
+  While a shader runs, `present.surface = internal` draws at the output
+  size, as `window` does: the chain's mask and scanlines are drawn per
+  output pixel and per source line, and a compositor that scaled a
+  frame-sized result (gamescope's 640x480 to 1280x800) resampled them
+  into colour fringes and moiré. D3D11 under gamescope or fullscreen turns
+  the window into a borderless one over the monitor, with the swap chain
+  at that size; otherwise the swap chain follows the window's client
+  area. Metal's drawable follows the window. With the shader set back to
+  `none` the frame-sized surface comes back at the next present.
+  `render.scale` above the output's height still gives more source lines
+  than output lines, which aliases the scanlines; pick a lower scale with
+  a CRT preset.
+- **Shader parameters.** <a id="shaderparams"></a>A slang preset declares
+  runtime parameters (`#pragma parameter`: a name, a label, a range and a
+  step). librashader reads them when the chain is built, and the menu's
+  **Shaders** page lists the active preset's under its *Shader* row, one
+  range row each: the label, the value at the step's decimals, and the
+  name, range and preset in the footer. A change applies at the next
+  present on Metal and D3D11; *Reset to preset* drops the active preset's
+  overrides, and the Save page's *Reset to defaults* drops every preset's.
+  Save writes each preset's overrides as differences only, in their own
+  table:
+
+  ```toml
+  [present.shader_params.crt-lottes]
+  warpX = 0.0       # no horizontal curvature
+  maskDark = 0.6
+  ```
+
+  A value equal to the preset's own is no override, so Save deletes that
+  key. Overrides of a preset that is not running are kept as read. The
+  table may sit in any layer (defaults, user, title; a later one wins);
+  Save writes the user file only, so a title or defaults value that a
+  slider or a reset removed loads again at the next start; remove it from
+  that file to drop it for good. Overrides are keyed
+  by file stem, so a path preset named like a bundled one
+  (`mods/x/crt-lottes.slangp`) shares the bundled one's. A key whose name has no `<preset>.<param>`
+  shape, or whose value is not a number, warns once and is skipped; a
+  parameter the preset does not declare is ignored. There is no
+  environment variable for the parameters. The bundled `crt-lottes` and
+  `crt-lottes-fast` set a gentler curvature than upstream (their
+  `assets/shaders` README lists both); no bundled preset has a
+  convergence control, so the mask settings (`shadowMask`, `maskDark`,
+  `maskLight`, `MASK`, `MASK_INTENSITY`) are the ones to adjust colour
+  fringes with.
 - **`present.pacing`.** Only for a title generated with
   `tools.recomp --spin-waits` ([lifting](../pipeline/04-lifting.md#spin-waits)),
   whose busy-wait loops call `RECOMP_SPIN_WAIT` on their back edge. `sleep`
@@ -1016,7 +1068,7 @@ a second after the close.
 | Y | F5 | Save |
 | X | Delete | clear an action's bindings |
 
-The pages are Render, Pack, Game (a title's own items, from
+The pages are Render, Shaders, Pack, Game (a title's own items, from
 `enhance_menu_add`), Mods, Stats, Controls, Debug and Save.
 
 - **Controls** lists every action with its bindings, grouped by owner
@@ -1453,6 +1505,21 @@ Schema 1. Fields are only added; one removed or changed in meaning bumps
   warnings above). The dump builds the action table as a
   start does, so `refused` is what the game would drop; the launcher
   shows these unbound instead of rerunning the rules itself.
+
+A top-level `shaders` field lists the presets the menu can pick
+(the bundled ones, and the configured preset when it is a path), each
+with its parameters parsed from the preset file, without a GPU:
+
+```json
+"shaders": {"active": "crt-lottes", "presets": [
+  {"name": "crt-lottes", "params": [
+    {"name": "warpX", "label": "warpX", "min": 0, "max": 0.125, "step": 0.01,
+     "default": 0.01, "value": 0, "key": "present.shader_params.crt-lottes.warpX"}]}]}
+```
+
+`default` is the preset's value and `value` the one this run resolved
+(an override, or the default). `presets` is empty when the library is
+missing, and a preset that is not there or does not parse is left out.
 
 `tests/mod_desc/expected.json` is the full dump of the test table.
 

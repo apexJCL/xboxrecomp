@@ -874,7 +874,8 @@ static void test_dump(void)
     xbox_mod_init_describe();
     CHECK(xbox_mod_describe_write("empty.json") == 0);
     got = read_all("empty.json");
-    CHECK(got && !strcmp(got, "{\"schema\": 1, \"api\": 3, \"mods\": []}\n"));
+    CHECK(got && !strcmp(got, "{\"schema\": 1, \"api\": 3, \"mods\": [], \"shaders\": "
+                             "{\"active\": \"none\", \"presets\": []}}\n"));
     free(got);
 
 #ifndef _WIN32
@@ -916,6 +917,52 @@ static void test_dump(void)
                                  " write it (") != NULL);
         CHECK(got && strstr(got, "actions hook=") == NULL);
         free(got);
+    }
+
+    /* The shaders field: the requested preset (a path) parsed by a
+     * librashader stand-in, with the config's override as its value. A
+     * child, since the loader keeps its first answer for the process. */
+    {
+        int st;
+        pid_t pid;
+
+        remove("shaders.json");
+        write_file("dump_test.slangp", "shaders = 0\n");
+        fflush(NULL);
+        pid = fork();
+        if (pid == 0) {
+            int fd = OPEN_TRUNC("child_stderr.txt");
+            if (fd >= 0) {
+                DUP2(fd, 2);
+                CLOSE(fd);
+            }
+            set_env("RECOMP_MODS_DESCRIBE", "json");
+            set_env("RECOMP_MODS_DESCRIBE_OUT", "shaders.json");
+            write_file("config/config.toml",
+                       "[present]\nshader = \"dump_test.slangp\"\nshader_lib = \"" FAKE_LRS_PARAMS
+                       "\"\n[present.shader_params.dump_test]\nmaskDark = 0.8\n");
+            xbox_mod_register_table(NULL);
+            xbox_enhance_init(".", NULL);
+            _exit(9);
+        }
+        CHECK(pid > 0 && waitpid(pid, &st, 0) == pid);
+        CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+        got = read_all("shaders.json");
+        CHECK(got && strstr(got, "\"shaders\": {\"active\": \"dump_test.slangp\", \"presets\": [\n"
+                                 "    {\"name\": \"dump_test\", \"params\": [\n"
+                                 "      {\"name\": \"warpX\", \"label\": \"warpX\", \"min\": 0, ")
+                  != NULL);
+        CHECK(got && strstr(got, "{\"name\": \"maskDark\", \"label\": \"Lottes maskDark\", "
+                                 "\"min\": 0, \"max\": 2, \"step\": 0.05, \"default\": 0.5, "
+                                 "\"value\": 0.8, \"key\": "
+                                 "\"present.shader_params.dump_test.maskDark\"}]}\n  ]}}\n")
+                  != NULL);
+        if (got && s_fail)
+            fprintf(stderr, "shaders.json:\n%s", got);
+        free(got);
+        remove("shaders.json");
+        remove("dump_test.slangp");
+        remove("config/config.toml");
     }
 #endif
 }

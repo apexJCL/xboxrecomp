@@ -30,6 +30,42 @@ static int path_is_absolute(const char *p)
         || (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':');
 }
 
+#define SHADER_PARAMS "present.shader_params."
+
+/* [present.shader_params.<preset>] <param> = <number>: the overrides of
+ * every preset, defaults file first so the user and title files win. No env
+ * tier: there is one key per parameter of a preset the code does not know
+ * until the chain is built. A key with a name the preset lacks stays
+ * harmless (librashader ignores an unknown parameter). */
+static void load_shader_params(void)
+{
+    for (int f = 2; f >= 0; f--) {
+        const recomp_cfg *c = enhance_cfg_file(f);
+        const char *k;
+        for (size_t i = 0; c && (k = recomp_cfg_key_at(c, i)); i++) {
+            const char *rest, *dot;
+            char key[64];
+            recomp_cfg_type t;
+            if (strncmp(k, SHADER_PARAMS, sizeof SHADER_PARAMS - 1))
+                continue;
+            enhance_cfg_lookup(k);   /* read here, not unused */
+            rest = k + sizeof SHADER_PARAMS - 1;
+            dot = strchr(rest, '.');
+            t = recomp_cfg_type_of(c, k);
+            if (!dot || dot == rest || !dot[1] || strchr(dot + 1, '.')
+                || (size_t)(dot - rest) >= sizeof key || (t != RCFG_FLOAT && t != RCFG_INT)) {
+                fprintf(stderr, LOGP "config warning: %s:%d: %s is not"
+                        " present.shader_params.<preset>.<param> = <number>\n",
+                        recomp_cfg_name(c), recomp_cfg_line(c, k), k);
+                continue;
+            }
+            memcpy(key, rest, (size_t)(dot - rest));
+            key[dot - rest] = 0;
+            nv2a_present_chain_override_load(key, dot + 1, (float)recomp_cfg_float(c, k, 0));
+        }
+    }
+}
+
 /* textures.pack: a pack file, relative to the executable's directory,
  * where config.default.toml (which --hud-pack writes the key into) and the
  * pack ship, so a bundle names enhance/hud.pack; not relative to `root`,
@@ -205,6 +241,7 @@ int xbox_enhance_init(const char *root, const char *title)
     shader = enhance_cfg_string("present.shader", "none");
     shader_lib = enhance_cfg_string("present.shader_lib", "");
     nv2a_present_chain_set_lib(shader_lib);
+    load_shader_params();
     nv2a_present_chain_request(shader);
     if (shader && *shader && strcmp(shader, "none"))
         fprintf(stderr, LOGP "present.shader=%s%s%s\n", shader,

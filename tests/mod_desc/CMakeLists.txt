@@ -46,6 +46,14 @@ if(NOT WIN32)
 endif()
 # enhance.c sets present.shader; the chain module dlopens librashader.
 target_link_libraries(mod_desc_test PRIVATE ${CMAKE_DL_LIBS})
+# A librashader stand-in with a fixed parameter table, for the dump's
+# shaders field.
+add_library(fake_lrs_params MODULE ${CMAKE_CURRENT_LIST_DIR}/../present_chain/fake_lrs.c)
+target_compile_definitions(fake_lrs_params PRIVATE FAKE_ABI=2 FAKE_API=5 FAKE_PARAMS)
+set_target_properties(fake_lrs_params PROPERTIES PREFIX "")
+add_dependencies(mod_desc_test fake_lrs_params)
+target_compile_definitions(mod_desc_test PRIVATE
+    FAKE_LRS_PARAMS="$<TARGET_FILE:fake_lrs_params>")
 enable_testing()
 add_test(NAME mod_desc COMMAND mod_desc_test
          WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})

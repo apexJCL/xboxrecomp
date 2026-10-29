@@ -17,6 +17,10 @@
  *             array, an item, a value back at its default removed
  *   mouse     the Controls page's Mouse group and the capture choice
  *   snapshot  the pack's miss ring copied at the flip only while shown
+ *   shaders   the Shaders page: the picker, the active preset's parameters
+ *             live, Save as differences, the next start, Reset to preset
+ *   shaders_hidden  no chain presenter, or no library: the page is left out
+ *             of the tab strip and the paging, and why is said once
  *   pages     each page's draw list at 1920x1080 against a pinned sum
  *
  * Runs in its working directory, where it writes config/config.toml. A
@@ -36,6 +40,7 @@
 #include "nv2a_overlay.h"
 #include "nv2a_overlay_int.h"
 #include "nv2a_pb_state.h"
+#include "nv2a_present_chain.h"
 #include "nv2a_tex_pack.h"
 #include "pad_map.h"
 #include "recomp_env.h"
@@ -261,6 +266,7 @@ static const char *start_with(const char *toml, const struct xbox_mod *const *mo
     const char *out;
     xbox_mod_shutdown();
     enhance_menu_reset_for_test();
+    nv2a_present_chain_params_reset_for_test();
     nv2a_overlay_reset_for_test();
     xbox_InputSetBackend(&k_fake);
     xbox_InputKeysClear();
@@ -367,7 +373,7 @@ static void test_navigate(void)
     CHECK(enhance_menu_is_open());
     CHECK(enhance_menu_page() == 0);
     CHECK(!strcmp(enhance_menu_page_name(enhance_menu_page()), "Render"));
-    CHECK(enhance_menu_page_count() == 8);
+    CHECK(enhance_menu_page_count() == 9);
 
     /* The title: no buttons, one packet number while the pad changes. A
      * trigger: the menu reads none, so the press does nothing there. */
@@ -405,9 +411,6 @@ static void test_navigate(void)
     advance(60);
     poll0();
     CHECK(!strcmp(selected_label(), "Scaling filter"));
-    advance(60);
-    poll0();
-    CHECK(!strcmp(selected_label(), "Shader"));
     advance(60);
     poll0();
     CHECK(!strcmp(selected_label(), "Fullscreen"));
@@ -1245,6 +1248,130 @@ static void test_controls_groups(void)
     }
 }
 
+/* ---- 7b. the Shaders page --------------------------------------------- */
+
+/* The backend built a chain for the request in force: publish the stand-in
+ * library's table (warpX 0.01 in 0..0.125 step 0.01; maskDark 0.5 in 0..2
+ * step 0.05), as Metal and D3D11 do before their chain create. */
+static void chain_built(void)
+{
+    int preset = 0;
+    CHECK(nv2a_present_chain_lib() != NULL);
+    nv2a_present_chain_params_publish(&preset, nv2a_present_chain_gen());
+}
+
+static void test_shaders(void)
+{
+    const char *f;
+    float v = 0;
+    unsigned applied;
+
+    /* No shader: the picker and one info row. */
+    start_with(ARMED, NULL);
+    open_menu();
+    CHECK(enhance_menu_set_page("Shaders"));
+    CHECK(row_value("Shader") && !strcmp(row_value("Shader"), "none"));
+    CHECK(row_value("Parameters") && !strcmp(row_value("Parameters"), "no shader"));
+    CHECK(!enhance_menu_select_row("Reset to preset"));
+    open_menu();
+
+    /* A shader whose chain is not up yet; the config holds an override for
+     * it and one for another preset. */
+    start_with(ARMED "[present]\nshader = \"crt-lottes\"\nshader_lib = \"" FAKE_LRS_PARAMS "\"\n"
+               "[present.shader_params.crt-lottes]\nmaskDark = 0.8\n"
+               "[present.shader_params.fsr]\nFSR_SHARPENING = 0.1\n", NULL);
+    open_menu();
+    CHECK(enhance_menu_set_page("Shaders"));
+    CHECK(row_value("Parameters") && !strcmp(row_value("Parameters"), "loading"));
+    chain_built();
+    flip();
+    CHECK(row_value("warpX") && !strcmp(row_value("warpX"), "0.01"));
+    CHECK(row_value("Lottes maskDark") && !strcmp(row_value("Lottes maskDark"), "0.80"));
+    CHECK(enhance_menu_unsaved() == 0);
+
+    /* Right: one step, live; the backend sees it at its next present. */
+    applied = nv2a_present_chain_params_gen();
+    CHECK(enhance_menu_select_row("warpX"));
+    CHECK(enhance_menu_row_live(enhance_menu_selected()) == ENHANCE_LIVE);
+    tap(0x27);
+    CHECK(!strcmp(row_value("warpX"), "0.02"));
+    CHECK(nv2a_present_chain_params_gen() != applied);
+    CHECK(nv2a_present_chain_param_get("warpX", &v) && v > 0.0199f && v < 0.0201f);
+    /* Left past the bottom stays there. */
+    tap(0x25);
+    tap(0x25);
+    tap(0x25);
+    CHECK(!strcmp(row_value("warpX"), "0.00"));
+    CHECK(enhance_menu_unsaved() == 1);
+    {
+        const char *keys[16], *vals[16];
+        int n = enhance_menu_pending(keys, vals, 16);
+        CHECK(n == 1);
+        CHECK(n == 1 && !strcmp(keys[0], "present.shader_params.crt-lottes.warpX") && vals[0]
+              && !strcmp(vals[0], "0.0"));
+    }
+    tap(VK_F5);
+    CHECK(strstr(enhance_menu_status(), "Saved 1 change") != NULL);
+    CHECK(enhance_menu_unsaved() == 0);
+    f = read_file("config/config.toml");
+    CHECK(strstr(f, "[present.shader_params.crt-lottes]") != NULL);
+    CHECK(strstr(f, "warpX = 0.0") != NULL);
+    CHECK(strstr(f, "maskDark = 0.8") != NULL);
+    CHECK(strstr(f, "FSR_SHARPENING = 0.1") != NULL);
+
+    /* Back to the preset's value: the key leaves the file. */
+    CHECK(enhance_menu_select_row("Lottes maskDark"));
+    for (int i = 0; i < 6; i++)
+        tap(0x25);
+    CHECK(!strcmp(row_value("Lottes maskDark"), "0.50"));
+    tap(VK_F5);
+    f = read_file("config/config.toml");
+    CHECK(strstr(f, "maskDark") == NULL);
+    CHECK(strstr(f, "warpX = 0.0") != NULL);
+    open_menu();
+
+    /* The next start reads them back. */
+    start_with(read_file("config/config.toml"), NULL);
+    open_menu();
+    CHECK(enhance_menu_set_page("Shaders"));
+    chain_built();
+    flip();
+    CHECK(row_value("warpX") && !strcmp(row_value("warpX"), "0.00"));
+
+    /* Reset to preset: this preset's overrides go, the other preset's
+     * stay; Save writes the removal. */
+    CHECK(enhance_menu_select_row("Reset to preset"));
+    tap(0x0D);
+    CHECK(strstr(enhance_menu_status(), "crt-lottes") != NULL);
+    CHECK(!strcmp(row_value("warpX"), "0.01"));
+    tap(VK_F5);
+    f = read_file("config/config.toml");
+    CHECK(strstr(f, "warpX") == NULL);
+    CHECK(strstr(f, "FSR_SHARPENING = 0.1") != NULL);
+
+    /* The Save page's Reset to defaults clears every preset's. */
+    CHECK(enhance_menu_set_page("Save"));
+    CHECK(enhance_menu_select_row("Reset to defaults"));
+    tap(0x0D);
+    CHECK(enhance_menu_select_row("Reset everything? A / Enter: yes"));
+    tap(0x0D);
+    tap(VK_F5);
+    f = read_file("config/config.toml");
+    CHECK(strstr(f, "FSR_SHARPENING") == NULL);
+    open_menu();
+
+    /* A key without the <preset>.<param> shape, or not a number, warns and
+     * is skipped. */
+    {
+        const char *out = start_with(ARMED "[present.shader_params]\nwarpX = 1.0\n"
+                                     "[present.shader_params.x]\ny = \"a\"\n", NULL);
+        CHECK(strstr(out, "present.shader_params.warpX") != NULL);
+        CHECK(strstr(out, "present.shader_params.x.y") != NULL);
+        CHECK(!nv2a_present_chain_override_get("x", "y", NULL));
+    }
+    nv2a_present_chain_params_clear();
+}
+
 static uint32_t sum_of(const struct nv2a_ovl_list *l)
 {
     return nv2a_overlay_list_sum(l->vtx, l->nvtx, l->idx, l->nidx, l->cmd, l->ncmd);
@@ -1252,16 +1379,16 @@ static uint32_t sum_of(const struct nv2a_ovl_list *l)
 
 static void test_pages(void)
 {
-    /* Render, Pack, Game, Mods, Stats, Controls, Debug, Save. */
-    static const uint32_t k_sum[8] = {
-        0xFF69828Fu, 0xC5E14D56u, 0xC918F275u, 0xEF138353u,
-        0x7B20659Eu, 0x13A93A10u, 0x42BC3478u, 0x4D09DFE6u };
+    /* Render, Shaders, Pack, Game, Mods, Stats, Controls, Debug, Save. */
+    static const uint32_t k_sum[9] = {
+        0xC7247387u, 0x53B87B2Du, 0x14C4B84Eu, 0x9990C101u, 0x677BFFE6u,
+        0xE26B4D93u, 0xAE5AA710u, 0x99277F45u, 0x37C23792u };
     start_with(ARMED, k_mods);
     open_menu();
     CHECK(enhance_menu_is_open());
     for (int p = 0; p < enhance_menu_page_count(); p++) {
         const struct nv2a_ovl_list *l;
-        uint32_t want = p < 8 ? k_sum[p] : 0;   /* a ninth page lands unpinned */
+        uint32_t want = p < 9 ? k_sum[p] : 0;   /* a tenth page lands unpinned */
         CHECK(enhance_menu_set_page(enhance_menu_page_name(p)));
         enhance_menu_draw(100000);
         l = nv2a_overlay_acquire(NV2A_OVL_MENU);
@@ -1283,6 +1410,82 @@ static void test_pages(void)
     }
     open_menu();
     CHECK(!(nv2a_overlay_visible() & (1u << NV2A_OVL_MENU)));
+}
+
+/* The library in force for every other test: the stand-in, loaded once,
+ * under a presenter that says it runs chains (Metal and D3D11 do at init). */
+static void shaders_supported(void)
+{
+    nv2a_present_chain_lib_reset_for_test();
+    nv2a_present_chain_set_lib(FAKE_LRS_PARAMS);
+    CHECK(nv2a_present_chain_lib() != NULL);
+    nv2a_present_chain_host("test");
+}
+
+static int page_index(const char *name)
+{
+    for (int p = 0; p < enhance_menu_page_count(); p++)
+        if (!strcmp(enhance_menu_page_name(p), name))
+            return p;
+    return -1;
+}
+
+/* Shaders hidden where none can run (the user, 2026-10-29). */
+static void test_shaders_hidden(void)
+{
+    const char *out;
+    int sp = page_index("Shaders");
+
+    /* Supported with no shader: the page stays, for its picker. */
+    start_with(ARMED, NULL);
+    open_menu();
+    CHECK(enhance_menu_page_shown(sp));
+    CHECK(enhance_menu_set_page("Shaders"));
+    open_menu();
+
+    /* The library does not load (as on a Windows without D3DX9). */
+    nv2a_present_chain_lib_reset_for_test();
+    nv2a_present_chain_host("test");
+    start_with(ARMED "[present]\nshader = \"crt-lottes\"\n"
+               "shader_lib = \"no-such-librashader.bin\"\n", NULL);
+    capture_begin();
+    open_menu();
+    out = capture_end();
+    CHECK(enhance_menu_is_open());
+    CHECK(strstr(out, "[SHADER] the menu's Shaders page is hidden: librashader not found") != NULL);
+    CHECK(!enhance_menu_page_shown(sp));
+    CHECK(!enhance_menu_set_page("Shaders"));
+    CHECK(!strcmp(enhance_menu_page_name(enhance_menu_page()), "Render"));
+    /* The picker is not moved to Render. */
+    CHECK(row_value("Shader") == NULL);
+    tap('E');
+    CHECK(!strcmp(enhance_menu_page_name(enhance_menu_page()), "Pack"));
+    tap('Q');
+    CHECK(!strcmp(enhance_menu_page_name(enhance_menu_page()), "Render"));
+    tap('Q');
+    CHECK(!strcmp(enhance_menu_page_name(enhance_menu_page()), "Save"));
+    tap('E');
+    CHECK(!strcmp(enhance_menu_page_name(enhance_menu_page()), "Render"));
+    /* Said once: a second open is quiet. */
+    open_menu();
+    capture_begin();
+    open_menu();
+    out = capture_end();
+    CHECK(enhance_menu_is_open() && !strstr(out, "Shaders page is hidden"));
+    open_menu();
+
+    /* The library loads, but no presenter runs chains (the SDL renderer,
+     * the CPU rasteriser's window on Windows). */
+    nv2a_present_chain_lib_reset_for_test();
+    start_with(ARMED "[present]\nshader_lib = \"" FAKE_LRS_PARAMS "\"\n", NULL);
+    capture_begin();
+    open_menu();
+    out = capture_end();
+    CHECK(strstr(out, "Shaders page is hidden: this presenter runs no shader chain") != NULL);
+    CHECK(!enhance_menu_set_page("Shaders"));
+    open_menu();
+
+    shaders_supported();
 }
 
 /* Save under a root whose folders do not exist yet makes all of them (N7). */
@@ -1401,6 +1604,7 @@ int main(int argc, char **argv)
     set_env("RECOMP_MENU", NULL);
     set_env("RECOMP_TRACE", NULL);
     set_env("RECOMP_PB_BACKEND", NULL);
+    shaders_supported();
     test_start();
     test_navigate();
     test_mods();
@@ -1416,10 +1620,12 @@ int main(int argc, char **argv)
     test_controls_groups();
     test_mouse();
     test_snapshot();
+    test_shaders();
     test_pages();
     test_save_deep();   /* after the pins: its Save moves the Debug page's options gen */
     test_save_tables();
     test_stage_row();
+    test_shaders_hidden();
     xbox_mod_shutdown();
     enhance_menu_reset_for_test();
     enhance_actions_reset();

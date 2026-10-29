@@ -30,6 +30,12 @@ static atomic_int s_wanted;
 
 static struct nv2a_lrs s_lrs;
 static int s_lib_state;             /* 0 not tried, 1 loaded, -1 failed */
+static char s_lib_why[640];         /* why it failed, for the menu */
+/* The load runs once: the present thread (a chain to build) and the menu
+ * (is the Shaders page shown) may both ask first. Its own flag, since the
+ * request lock is held only for copies. */
+static atomic_flag s_load_lock = ATOMIC_FLAG_INIT;
+static char s_host[16];             /* the chain presenter, "" none */
 #ifdef _WIN32
 static HMODULE s_mod;
 #else
@@ -219,15 +225,62 @@ static void close_lib(void)
     s_mod = NULL;
 }
 
+static const struct nv2a_lrs *lib_load(void);
+
 const struct nv2a_lrs *nv2a_present_chain_lib(void)
+{
+    const struct nv2a_lrs *l;
+    while (atomic_flag_test_and_set_explicit(&s_load_lock, memory_order_acquire))
+        ;
+    l = s_lib_state ? (s_lib_state > 0 ? &s_lrs : NULL) : lib_load();
+    atomic_flag_clear_explicit(&s_load_lock, memory_order_release);
+    return l;
+}
+
+void nv2a_present_chain_host(const char *name)
+{
+    lock();
+    snprintf(s_host, sizeof s_host, "%s", name && *name ? name : "?");
+    unlock();
+}
+
+int nv2a_present_chain_supported(char *why, size_t cap)
+{
+    char host[sizeof s_host];
+    lock();
+    memcpy(host, s_host, sizeof host);
+    unlock();
+    if (!host[0]) {
+        snprintf(why, cap, "this presenter runs no shader chain (Metal and D3D11 do)");
+        return 0;
+    }
+    if (!nv2a_present_chain_lib()) {
+        snprintf(why, cap, "%s", s_lib_why);
+        return 0;
+    }
+    if (cap)
+        why[0] = 0;
+    return 1;
+}
+
+void nv2a_present_chain_lib_reset_for_test(void)
+{
+    close_lib();
+    s_lib_state = 0;
+    s_lib_why[0] = 0;
+    memset(&s_lrs, 0, sizeof s_lrs);
+    lock();
+    s_host[0] = 0;
+    unlock();
+}
+
+static const struct nv2a_lrs *lib_load(void)
 {
     char paths[2][1024], why[512] = "", over[512];
     PFN_libra_instance_abi_version abi;
     PFN_libra_instance_api_version api;
     int n, i;
 
-    if (s_lib_state)
-        return s_lib_state > 0 ? &s_lrs : NULL;
     s_lib_state = -1;
     lock();
     snprintf(over, sizeof over, "%s", s_lib_path);
@@ -246,6 +299,7 @@ const struct nv2a_lrs *nv2a_present_chain_lib(void)
             break;
     if (i == n) {
         fprintf(stderr, LOGP "present.shader off: librashader %s (%s)\n", why, paths[n - 1]);
+        snprintf(s_lib_why, sizeof s_lib_why, "librashader %s", why);
         return NULL;
     }
     abi = (PFN_libra_instance_abi_version)lrs_sym("libra_instance_abi_version");
@@ -253,6 +307,7 @@ const struct nv2a_lrs *nv2a_present_chain_lib(void)
     if (!abi || !api) {
         fprintf(stderr, LOGP "present.shader off: %s has no librashader version"
                 " exports\n", paths[i]);
+        snprintf(s_lib_why, sizeof s_lib_why, "librashader has no version exports");
         close_lib();
         return NULL;
     }
@@ -264,6 +319,8 @@ const struct nv2a_lrs *nv2a_present_chain_lib(void)
         fprintf(stderr, LOGP "present.shader off: %s is ABI %u API %u; this build needs"
                 " ABI %d API %d or later (librashader 0.12)\n", paths[i], s_lrs.abi,
                 s_lrs.api, LIBRASHADER_CURRENT_ABI, LIBRASHADER_CURRENT_VERSION);
+        snprintf(s_lib_why, sizeof s_lib_why, "librashader is ABI %u API %u, not 0.12",
+                 s_lrs.abi, s_lrs.api);
         close_lib();
         return NULL;
     }
@@ -279,20 +336,12 @@ static int has_path_chars(const char *s)
     return strchr(s, '/') || strchr(s, '\\') || (n > 7 && !strcmp(s + n - 7, ".slangp"));
 }
 
-int nv2a_present_chain_preset(char *out, size_t cap, unsigned *gen_out)
+/* The preset file for request req into out: 1 found, -1 not (said when
+ * say is set, with what was tried). */
+static int preset_path(const char *req, char *out, size_t cap, int say)
 {
-    char req[512];
     const char *dir = recomp_exe_dir();
-    unsigned gen;
 
-    lock();
-    snprintf(req, sizeof req, "%s", s_req);
-    gen = atomic_load(&s_gen);
-    unlock();
-    if (gen_out)
-        *gen_out = gen;
-    if (is_none(req))
-        return 0;
     if (has_path_chars(req)) {
         if (path_is_absolute(req))
             snprintf(out, cap, "%s", req);
@@ -300,7 +349,8 @@ int nv2a_present_chain_preset(char *out, size_t cap, unsigned *gen_out)
             snprintf(out, cap, "%s/%s", dir, req);
         if (file_exists(out))
             return 1;
-        fprintf(stderr, LOGP "present.shader=%s: no such file (%s)\n", req, out);
+        if (say)
+            fprintf(stderr, LOGP "present.shader=%s: no such file (%s)\n", req, out);
         return -1;
     }
     snprintf(out, cap, "%s/shaders/%s.slangp", dir, req);
@@ -311,9 +361,54 @@ int nv2a_present_chain_preset(char *out, size_t cap, unsigned *gen_out)
     if (file_exists(out))
         return 1;
 #endif
-    fprintf(stderr, LOGP "present.shader=%s: no shaders/%s.slangp beside the executable"
-            " (%s)\n", req, req, dir);
+    if (say)
+        fprintf(stderr, LOGP "present.shader=%s: no shaders/%s.slangp beside the executable"
+                " (%s)\n", req, req, dir);
     return -1;
+}
+
+int nv2a_present_chain_preset(char *out, size_t cap, unsigned *gen_out)
+{
+    char req[512];
+    unsigned gen;
+
+    lock();
+    snprintf(req, sizeof req, "%s", s_req);
+    gen = atomic_load(&s_gen);
+    unlock();
+    if (gen_out)
+        *gen_out = gen;
+    if (is_none(req))
+        return 0;
+    return preset_path(req, out, cap, 1);
+}
+
+int nv2a_present_chain_describe(const char *request, struct nv2a_present_param *out, int cap)
+{
+    PFN_libra_preset_create pc;
+    PFN_libra_preset_free pf;
+    libra_shader_preset_t preset = NULL;
+    libra_error_t e;
+    char path[1024], why[256];
+    int n;
+
+    /* The file first: a dump with no preset on disk loads no library. */
+    if (is_none(request) || preset_path(request, path, sizeof path, 0) < 0
+        || !nv2a_present_chain_lib())
+        return -1;
+    pc = (PFN_libra_preset_create)lrs_sym("libra_preset_create");
+    pf = (PFN_libra_preset_free)lrs_sym("libra_preset_free");
+    if (!pc || !pf)
+        return -1;
+    e = pc(path, &preset);
+    if (e) {
+        nv2a_present_chain_error(e, why, sizeof why);
+        fprintf(stderr, LOGP "%s: %s\n", path, why);
+        return -1;
+    }
+    n = nv2a_present_chain_params_read(&preset, out, cap);
+    pf(&preset);
+    return n;
 }
 
 void nv2a_present_chain_error(void *err, char *out, size_t cap)
@@ -334,4 +429,356 @@ void nv2a_present_chain_error(void *err, char *out, size_t cap)
     }
     if (fe)
         fe(&e);
+}
+
+/* ---- Runtime parameters ---- */
+
+/* Overrides of every preset seen this session: the config's, then the
+ * menu's. A row is kept after its override is removed, so Save can delete
+ * the key it once wrote. */
+#define OVR_MAX NV2A_PRESENT_OVERRIDES_MAX
+struct ovr {
+    char key[64], name[64];
+    float v, saved_v;
+    unsigned char has, saved_has;
+};
+
+static struct nv2a_present_param s_params[NV2A_PRESENT_PARAMS_MAX];
+static int s_nparams;
+static char s_params_key[64];
+static atomic_uint s_pgen;
+static struct ovr s_ovr[OVR_MAX];
+static int s_novr;
+
+void nv2a_present_chain_preset_key(const char *request, char *out, size_t cap)
+{
+    const char *b, *s;
+    size_t n, i, o = 0;
+
+    if (!cap)
+        return;
+    out[0] = 0;
+    if (is_none(request))
+        return;
+    b = request;
+    if (has_path_chars(request)) {
+        for (s = request; *s; s++)
+            if (*s == '/' || *s == '\\')
+                b = s + 1;
+    }
+    n = strlen(b);
+    if (n > 7 && !strcmp(b + n - 7, ".slangp"))
+        n -= 7;
+    /* A config section name: keep it to what a bare TOML key allows. */
+    for (i = 0; i < n && o + 1 < cap; i++) {
+        char c = b[i];
+        out[o++] = ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')
+                    || c == '-' || c == '_') ? c : '_';
+    }
+    out[o] = 0;
+}
+
+int nv2a_present_chain_params_read(void *preset, struct nv2a_present_param *out, int cap)
+{
+    PFN_libra_preset_get_runtime_params get =
+        (PFN_libra_preset_get_runtime_params)lrs_sym("libra_preset_get_runtime_params");
+    PFN_libra_preset_free_runtime_params fr =
+        (PFN_libra_preset_free_runtime_params)lrs_sym("libra_preset_free_runtime_params");
+    libra_preset_param_list_t list;
+    libra_error_t e;
+    int n = 0;
+    uint64_t i;
+
+    if (!get || !fr || !preset)
+        return 0;
+    memset(&list, 0, sizeof list);
+    e = get((const libra_shader_preset_t *)preset, &list);
+    if (e) {
+        char why[256];
+        nv2a_present_chain_error(e, why, sizeof why);
+        fprintf(stderr, LOGP "preset parameters unreadable: %s\n", why);
+        return 0;
+    }
+    for (i = 0; i < list.length && n < cap; i++) {
+        const libra_preset_param_t *p = &list.parameters[i];
+        struct nv2a_present_param *d = &out[n];
+        if (!p->name || !p->name[0])
+            continue;
+        snprintf(d->name, sizeof d->name, "%s", p->name);
+        snprintf(d->desc, sizeof d->desc, "%s", p->description ? p->description : "");
+        d->initial = p->initial;
+        d->min = p->minimum;
+        d->max = p->maximum > p->minimum ? p->maximum : p->minimum;
+        d->step = p->step > 0 ? p->step : 0;
+        n++;
+    }
+    fr(list);
+    return n;
+}
+
+static struct ovr *ovr_find(const char *key, const char *name)
+{
+    int i;
+    for (i = 0; i < s_novr; i++)
+        if (!strcmp(s_ovr[i].key, key) && !strcmp(s_ovr[i].name, name))
+            return &s_ovr[i];
+    return NULL;
+}
+
+static struct ovr *ovr_add(const char *key, const char *name)
+{
+    static int s_full_said;
+    struct ovr *o = ovr_find(key, name);
+    int i;
+    if (o)
+        return o;
+    if (s_novr < OVR_MAX) {
+        o = &s_ovr[s_novr++];
+    } else {
+        /* A row with no value now and none on disk has nothing left for
+         * Save to delete: reuse it, so a long session of slider moves
+         * across presets does not fill the table. */
+        for (i = 0; i < s_novr && !o; i++)
+            if (!s_ovr[i].has && !s_ovr[i].saved_has)
+                o = &s_ovr[i];
+        if (!o) {
+            if (!s_full_said) {
+                s_full_said = 1;
+                fprintf(stderr, LOGP "shader_params: %d overrides held, %s.%s not kept\n",
+                        OVR_MAX, key, name);
+            }
+            return NULL;
+        }
+    }
+    memset(o, 0, sizeof *o);
+    snprintf(o->key, sizeof o->key, "%s", key);
+    snprintf(o->name, sizeof o->name, "%s", name);
+    return o;
+}
+
+static const struct nv2a_present_param *active_find(const char *name)
+{
+    int i;
+    for (i = 0; i < s_nparams; i++)
+        if (!strcmp(s_params[i].name, name))
+            return &s_params[i];
+    return NULL;
+}
+
+static float clampf(float v, float lo, float hi)
+{
+    return v < lo ? lo : v > hi ? hi : v;
+}
+
+/* The value a row runs at: its override, clamped to the preset's range (a
+ * hand-edited config can hold anything), or the preset's own. */
+static float active_value(const struct nv2a_present_param *p)
+{
+    const struct ovr *o = ovr_find(s_params_key, p->name);
+    return o && o->has ? clampf(o->v, p->min, p->max) : p->initial;
+}
+
+void nv2a_present_chain_params_publish(void *preset, unsigned gen)
+{
+    struct nv2a_present_param t[NV2A_PRESENT_PARAMS_MAX];
+    char req[512], key[64];
+    int n = nv2a_present_chain_params_read(preset, t, NV2A_PRESENT_PARAMS_MAX);
+
+    lock();
+    if (gen == atomic_load(&s_gen)) {
+        snprintf(req, sizeof req, "%s", s_req);
+        nv2a_present_chain_preset_key(req, key, sizeof key);
+        memcpy(s_params, t, (size_t)n * sizeof t[0]);
+        s_nparams = n;
+        snprintf(s_params_key, sizeof s_params_key, "%s", key);
+        atomic_fetch_add(&s_pgen, 1);
+    }
+    unlock();
+}
+
+void nv2a_present_chain_params_clear(void)
+{
+    lock();
+    if (s_nparams || s_params_key[0]) {
+        s_nparams = 0;
+        s_params_key[0] = 0;
+        atomic_fetch_add(&s_pgen, 1);
+    }
+    unlock();
+}
+
+unsigned nv2a_present_chain_params_gen(void)
+{
+    return atomic_load(&s_pgen);
+}
+
+int nv2a_present_chain_params(struct nv2a_present_param *out, int cap, char *key, size_t keycap)
+{
+    int n;
+    lock();
+    n = s_nparams < cap ? s_nparams : cap;
+    if (n > 0)
+        memcpy(out, s_params, (size_t)n * sizeof s_params[0]);
+    if (key && keycap)
+        snprintf(key, keycap, "%s", s_params_key);
+    unlock();
+    return n;
+}
+
+int nv2a_present_chain_param_get(const char *name, float *out)
+{
+    const struct nv2a_present_param *p;
+    lock();
+    p = active_find(name);
+    if (p && out)
+        *out = active_value(p);
+    unlock();
+    return p != NULL;
+}
+
+int nv2a_present_chain_param_set(const char *name, float v)
+{
+    const struct nv2a_present_param *p;
+    struct ovr *o;
+    float eps;
+
+    lock();
+    p = active_find(name);
+    if (!p) {
+        unlock();
+        return 0;
+    }
+    v = clampf(v, p->min, p->max);
+    /* Within a thousandth of a step of the preset's value is the preset's
+     * value: menu steps add up in floats. */
+    eps = p->step > 0 ? p->step * 0.001f : 1e-6f;
+    o = ovr_find(s_params_key, name);
+    if (v > p->initial - eps && v < p->initial + eps) {
+        if (o)
+            o->has = 0;
+    } else if ((o = ovr_add(s_params_key, name)) != NULL) {
+        o->v = v;
+        o->has = 1;
+    }
+    atomic_fetch_add(&s_pgen, 1);
+    unlock();
+    return 1;
+}
+
+void nv2a_present_chain_params_reset(const char *key)
+{
+    int i;
+    lock();
+    for (i = 0; i < s_novr; i++)
+        if (!key || !strcmp(s_ovr[i].key, key))
+            s_ovr[i].has = 0;
+    atomic_fetch_add(&s_pgen, 1);
+    unlock();
+}
+
+void nv2a_present_chain_params_apply(unsigned *applied, nv2a_present_param_set_fn set, void *ctx)
+{
+    struct { char name[64]; float v; } t[NV2A_PRESENT_PARAMS_MAX];
+    unsigned g = atomic_load(&s_pgen);
+    int n, i;
+
+    if (g == *applied)
+        return;
+    lock();
+    g = atomic_load(&s_pgen);
+    n = s_nparams;
+    for (i = 0; i < n; i++) {
+        memcpy(t[i].name, s_params[i].name, sizeof t[i].name);
+        t[i].v = active_value(&s_params[i]);
+    }
+    unlock();
+    /* Every row, not only the one that moved: a reset or a new preset
+     * changes many, and a set_param is a store into the chain's table. */
+    for (i = 0; i < n; i++)
+        set(ctx, t[i].name, t[i].v);
+    *applied = g;
+}
+
+void nv2a_present_chain_override_load(const char *key, const char *name, float v)
+{
+    struct ovr *o;
+    lock();
+    if ((o = ovr_add(key, name)) != NULL) {
+        o->v = o->saved_v = v;
+        o->has = o->saved_has = 1;
+        atomic_fetch_add(&s_pgen, 1);
+    }
+    unlock();
+}
+
+static int ovr_dirty(const struct ovr *o)
+{
+    return o->has != o->saved_has || (o->has && o->v != o->saved_v);
+}
+
+int nv2a_present_chain_override_at(int i, char *key, size_t keycap, char *name,
+                                   size_t namecap, float *v, int *has, int *dirty)
+{
+    int ok;
+    lock();
+    ok = i >= 0 && i < s_novr;
+    if (ok) {
+        const struct ovr *o = &s_ovr[i];
+        if (key && keycap)
+            snprintf(key, keycap, "%s", o->key);
+        if (name && namecap)
+            snprintf(name, namecap, "%s", o->name);
+        if (v)
+            *v = o->v;
+        if (has)
+            *has = o->has;
+        if (dirty)
+            *dirty = ovr_dirty(o);
+    }
+    unlock();
+    return ok;
+}
+
+void nv2a_present_chain_overrides_saved(void)
+{
+    int i;
+    lock();
+    for (i = 0; i < s_novr; i++) {
+        s_ovr[i].saved_v = s_ovr[i].v;
+        s_ovr[i].saved_has = s_ovr[i].has;
+    }
+    unlock();
+}
+
+int nv2a_present_chain_overrides_dirty(void)
+{
+    int i, d = 0;
+    lock();
+    for (i = 0; i < s_novr; i++)
+        d += ovr_dirty(&s_ovr[i]);
+    unlock();
+    return d;
+}
+
+int nv2a_present_chain_override_get(const char *key, const char *name, float *v)
+{
+    const struct ovr *o;
+    int has;
+    lock();
+    o = ovr_find(key, name);
+    has = o && o->has;
+    if (has && v)
+        *v = o->v;
+    unlock();
+    return has;
+}
+
+void nv2a_present_chain_params_reset_for_test(void)
+{
+    lock();
+    s_nparams = 0;
+    s_params_key[0] = 0;
+    s_novr = 0;
+    atomic_fetch_add(&s_pgen, 1);
+    unlock();
 }

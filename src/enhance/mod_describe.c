@@ -13,9 +13,11 @@
 #include <errno.h>
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "enhance_menu.h"
+#include "nv2a_present_chain.h"
 #include "recomp_env.h"
 
 #define LOGP "[MOD] "
@@ -59,6 +61,24 @@ static void jnum(FILE *f, double v)
         return;
     }
     xbox_mod_num_text(t, sizeof t, v);
+    fputs(t, f);
+}
+
+/* A float as the shortest text that reads back as the same float: shader
+ * parameters are floats, and their double form (0.009999999776482582)
+ * is not what the preset says (0.01). */
+static void jfloat(FILE *f, float v)
+{
+    char t[32];
+    if (!isfinite(v)) {
+        fputs("null", f);
+        return;
+    }
+    for (int p = 1; p <= 9; p++) {
+        snprintf(t, sizeof t, "%.*g", p, (double)v);
+        if ((float)strtod(t, NULL) == v)
+            break;
+    }
     fputs(t, f);
 }
 
@@ -265,6 +285,75 @@ static void mod(FILE *f, int i)
     fputs("]}", f);
 }
 
+/* One preset's parameters (present.shader_params, nv2a_present_chain.h):
+ * the range, the preset's value, the value this run would use (a config
+ * override clamped to the range) and the key that sets it. 0 when the
+ * preset cannot be read. */
+static int shader_preset(FILE *f, int *any, const char *request)
+{
+    static struct nv2a_present_param p[NV2A_PRESENT_PARAMS_MAX];
+    char key[64], full[192];
+    int n = nv2a_present_chain_describe(request, p, NV2A_PRESENT_PARAMS_MAX), first = 1;
+
+    if (n < 0)
+        return 0;
+    nv2a_present_chain_preset_key(request, key, sizeof key);
+    fputs(*any ? ",\n    {" : "\n    {", f);
+    *any = 1;
+    jkey(f, &first, "name");
+    jstr(f, key);
+    jkey(f, &first, "params");
+    fputc('[', f);
+    for (int i = 0; i < n; i++) {
+        int pf = 1;
+        float v = p[i].initial;
+        if (nv2a_present_chain_override_get(key, p[i].name, &v))
+            v = v < p[i].min ? p[i].min : v > p[i].max ? p[i].max : v;
+        snprintf(full, sizeof full, "present.shader_params.%s.%s", key, p[i].name);
+        fputs(i ? ",\n      {" : "\n      {", f);
+        jkey(f, &pf, "name");
+        jstr(f, p[i].name);
+        jkey(f, &pf, "label");
+        jstr(f, p[i].desc[0] ? p[i].desc : p[i].name);
+        jkey(f, &pf, "min");
+        jfloat(f, p[i].min);
+        jkey(f, &pf, "max");
+        jfloat(f, p[i].max);
+        jkey(f, &pf, "step");
+        jfloat(f, p[i].step);
+        jkey(f, &pf, "default");
+        jfloat(f, p[i].initial);
+        jkey(f, &pf, "value");
+        jfloat(f, v);
+        jkey(f, &pf, "key");
+        jstr(f, full);
+        fputc('}', f);
+    }
+    fputs("]}", f);
+    return 1;
+}
+
+/* "shaders": the request in force and every bundled preset's parameters,
+ * plus the requested one when it is a path. Without the library the list
+ * is empty: a reader shows no Shaders settings. */
+static void shaders(FILE *f)
+{
+    char req[512];
+    int any = 0, bundled = 0;
+
+    nv2a_present_chain_requested(req, sizeof req);
+    fputs(", \"shaders\": {\"active\": ", f);
+    jstr(f, req);
+    fputs(", \"presets\": [", f);
+    for (int i = 0; nv2a_present_chain_names[i]; i++) {
+        shader_preset(f, &any, nv2a_present_chain_names[i]);
+        bundled |= !strcmp(req, nv2a_present_chain_names[i]);
+    }
+    if (!bundled && strcmp(req, "none"))
+        shader_preset(f, &any, req);
+    fputs(any ? "\n  ]}" : "]}", f);
+}
+
 int xbox_mod_describe_wanted(void)
 {
     const char *v = recomp_env(RENV_MODS_DESCRIBE);
@@ -296,7 +385,9 @@ int xbox_mod_describe_write(const char *path)
             fputc(',', f);
         mod(f, i);
     }
-    fputs(n ? "\n]}\n" : "]}\n", f);
+    fputs(n ? "\n]" : "]", f);
+    shaders(f);
+    fputs("}\n", f);
     bad = ferror(f);
     if (f != stdout)
         bad |= fclose(f) != 0;

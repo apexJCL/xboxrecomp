@@ -58,6 +58,16 @@ struct nv2a_lrs {
 };
 const struct nv2a_lrs *nv2a_present_chain_lib(void);
 
+/* The presenter that runs chains (Metal's, D3D11's) says so once it is up.
+ * One that has none never does: the SDL renderer, or Windows' GDI window
+ * under the CPU rasteriser. name: for the log ("Metal", "D3D11"). */
+void nv2a_present_chain_host(const char *name);
+
+/* 1 when a shader can run here: a chain presenter is up and the library
+ * loads (loaded now if it was not tried yet). 0 with the reason in why. It
+ * does not look at the request: "none" is still supported. Any thread. */
+int nv2a_present_chain_supported(char *why, size_t cap);
+
 /* The preset file for the current request into out. Returns 1 found,
  * 0 for "none", -1 not found (said, with what was tried). gen_out gets the
  * generation the path belongs to. */
@@ -79,6 +89,96 @@ float nv2a_present_chain_rate(uint64_t now_ns);
 /* librashader's message for an error object into out, and frees the error.
  * err is a libra_error_t. */
 void nv2a_present_chain_error(void *err, char *out, size_t cap);
+
+/* ---- Runtime parameters (present.shader_params) ----
+ *
+ * A preset declares parameters (#pragma parameter: name, label, range,
+ * step). The backend that built a chain publishes the preset's table here;
+ * the menu and the config set per-preset overrides; the backend follows
+ * nv2a_present_chain_params_gen() with the chain's set_param. Overrides are
+ * keyed by preset (the bundled name, or a path's file stem) so each preset
+ * keeps its own. A value equal to the preset's own removes the override,
+ * so the config only ever holds differences. */
+#define NV2A_PRESENT_PARAMS_MAX 64
+#define NV2A_PRESENT_OVERRIDES_MAX 256   /* over every preset */
+
+struct nv2a_present_param {
+    char name[64];
+    char desc[96];
+    float initial, min, max, step;   /* initial: the preset's value */
+};
+
+/* The preset key of a request ("crt-lottes", or a path's sanitised stem)
+ * into out; "" for "none". */
+void nv2a_present_chain_preset_key(const char *request, char *out, size_t cap);
+
+/* Read a parsed preset's parameters (preset: a libra_shader_preset_t *)
+ * into out. Returns the count (0 when the library lacks the call). */
+int nv2a_present_chain_params_read(void *preset, struct nv2a_present_param *out, int cap);
+
+/* The backend built its chain for generation gen from preset (a
+ * libra_shader_preset_t *): read and publish its parameters as the active
+ * table. Ignored when a newer request has arrived. */
+void nv2a_present_chain_params_publish(void *preset, unsigned gen);
+
+/* The chain was released or failed: no active table. */
+void nv2a_present_chain_params_clear(void);
+
+/* Moves on every publish, clear, set and reset. */
+unsigned nv2a_present_chain_params_gen(void);
+
+/* A copy of the active table into out (cap rows) and its preset key.
+ * Returns the row count; 0 with key "" when no chain is up. */
+int nv2a_present_chain_params(struct nv2a_present_param *out, int cap, char *key, size_t keycap);
+
+/* The active preset's current value of name (override or initial); the
+ * value is snapped to the row's range. Returns 0 when name is not active. */
+int nv2a_present_chain_param_get(const char *name, float *out);
+
+/* Set name on the active preset (clamped to its range); equal to the
+ * preset's value removes the override. Returns 0 when not active. */
+int nv2a_present_chain_param_set(const char *name, float v);
+
+/* Remove the overrides of preset key (NULL: of every preset). */
+void nv2a_present_chain_params_reset(const char *key);
+
+/* The backend applies the parameters: when the params generation moved
+ * past *applied, set(ctx, name, value) for every active row (override or
+ * initial), then *applied takes the generation. The backend's present
+ * thread, with its chain built. */
+typedef void (*nv2a_present_param_set_fn)(void *ctx, const char *name, float v);
+void nv2a_present_chain_params_apply(unsigned *applied, nv2a_present_param_set_fn set, void *ctx);
+
+/* Config: an override read at start (any layer; a later call wins). It
+ * counts as saved. */
+void nv2a_present_chain_override_load(const char *key, const char *name, float v);
+
+/* Overrides for Save: row i (from 0) while it returns 1. has: the
+ * override is set (else it was removed since the last save); dirty: it
+ * differs from what was loaded or saved last. */
+int nv2a_present_chain_override_at(int i, char *key, size_t keycap, char *name,
+                                   size_t namecap, float *v, int *has, int *dirty);
+
+/* Save wrote the overrides: they are clean now. */
+void nv2a_present_chain_overrides_saved(void);
+
+/* The overrides that differ from what was loaded or saved. */
+int nv2a_present_chain_overrides_dirty(void);
+
+/* The override of name for preset key: 1 with *v set, 0 when none. */
+int nv2a_present_chain_override_get(const char *key, const char *name, float *v);
+
+/* Tests: drop the active table and every override, as a fresh start. */
+void nv2a_present_chain_params_reset_for_test(void);
+
+/* Forget the presenter and the library (closing it), so a test can load
+ * another one or none. */
+void nv2a_present_chain_lib_reset_for_test(void);
+
+/* The descriptor dump: the parameters of request (a bundled name or a
+ * path) parsed from its preset, with no GPU and no chain. The count, or -1
+ * when the library or the preset is missing or does not parse. */
+int nv2a_present_chain_describe(const char *request, struct nv2a_present_param *out, int cap);
 
 #ifdef __cplusplus
 }

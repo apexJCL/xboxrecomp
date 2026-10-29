@@ -241,6 +241,11 @@ int fbm_create(SDL_Window *win, int vsync, int shots, char *err, size_t errn)
         if (w > 0 && h > 0)
             s_layer.drawableSize = CGSizeMake(w, h);
     }
+#ifdef XBOXRECOMP_ENHANCE
+    /* Every backend presents through here on macOS, the CPU rasteriser's
+     * frames too, so the menu's Shaders page is shown for all of them. */
+    nv2a_present_chain_host("Metal");
+#endif
     return 1;
 }
 
@@ -546,6 +551,8 @@ static libra_mtl_filter_chain_t s_chain;
 static unsigned s_chain_gen;
 static size_t s_chain_frames;
 static PFN_libra_mtl_filter_chain_frame s_chain_ff;   /* with the chain */
+static PFN_libra_mtl_filter_chain_set_param s_chain_sp;
+static unsigned s_chain_pgen;       /* the parameter generation applied */
 static int s_chain_ov_said;
 
 static void chain_free(void)
@@ -560,6 +567,23 @@ static void chain_free(void)
         fr(&s_chain);
     s_chain = NULL;
     s_chain_ff = NULL;
+    s_chain_sp = NULL;
+    nv2a_present_chain_params_clear();
+}
+
+/* nv2a_present_chain_params_apply's setter. librashader refuses a name the
+ * chain lacks (UnknownShaderParameter), but the names come from the table
+ * read off this chain's own preset, so none is unknown; an error here would
+ * repeat on every change, so it is dropped unlogged. */
+static void chain_set_param(void *ctx, const char *name, float v)
+{
+    libra_error_t e;
+    char msg[256];
+    if (!s_chain_sp)
+        return;
+    e = s_chain_sp((libra_mtl_filter_chain_t *)ctx, name, v);
+    if (e)
+        nv2a_present_chain_error(e, msg, sizeof msg);
 }
 
 /* The chain for the current request, (re)built when its generation moved:
@@ -595,12 +619,16 @@ static libra_mtl_filter_chain_t chain_get(void)
     pf = (PFN_libra_preset_free)l->sym("libra_preset_free");
     cc = (PFN_libra_mtl_filter_chain_create)l->sym("libra_mtl_filter_chain_create");
     s_chain_ff = (PFN_libra_mtl_filter_chain_frame)l->sym("libra_mtl_filter_chain_frame");
+    s_chain_sp = (PFN_libra_mtl_filter_chain_set_param)l->sym("libra_mtl_filter_chain_set_param");
     if (!pc || !pf || !cc || !s_chain_ff) {
         fprintf(stderr, "[SHADER] present.shader off: the library has no Metal runtime\n");
         nv2a_present_chain_failed(gen);
         return NULL;
     }
     e = pc(path, &preset);
+    /* The parameters before the chain: creating it consumes the preset. */
+    if (!e)
+        nv2a_present_chain_params_publish(&preset, gen);
     if (!e)
         e = cc(&preset, s_queue, &co, &s_chain);
     if (preset)
@@ -609,9 +637,12 @@ static libra_mtl_filter_chain_t chain_get(void)
         nv2a_present_chain_error(e, msg, sizeof msg);
         fprintf(stderr, "[SHADER] present.shader off: %s: %s\n", path, msg);
         s_chain = NULL;
+        nv2a_present_chain_params_clear();
         nv2a_present_chain_failed(gen);
         return NULL;
     }
+    /* A new chain starts at the preset's values: apply every override. */
+    s_chain_pgen = nv2a_present_chain_params_gen() - 1;
     fprintf(stderr, "[SHADER] present.shader: %s (Metal)\n", path);
     return s_chain;
 }
@@ -633,12 +664,21 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
         int whole, dw = 0, dh = 0;
         unsigned ov = nv2a_host_opts()->overscan;
         CGSize cur = s_layer.drawableSize;
+        int internal = s_internal;
 #ifdef XBOXRECOMP_ENHANCE
         libra_mtl_filter_chain_t chain = NULL;
         int chained = 0;
 
         if (nv2a_present_chain_wanted() || s_chain)
             chain = chain_get();
+        if (chain) {
+            nv2a_present_chain_params_apply(&s_chain_pgen, chain_set_param, &s_chain);
+            /* The chain draws its mask and scanlines per output pixel: it
+             * must draw at the window's size. Drawn at the frame's and
+             * scaled after (by the layer here, by gamescope on the Deck),
+             * they are resampled into colour fringes and moire. */
+            internal = 0;
+        }
         /* The chain reads the whole slot: a crop has no place in it. */
         if (chain && ov) {
             if (!s_chain_ov_said)
@@ -653,7 +693,7 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
          * displays of another scale need not arrive as SIZE_CHANGED. Under
          * present.surface=internal the drawable is the frame instead (a
          * render.scale change from the menu resizes it). */
-        if (s_internal) {
+        if (internal) {
             layer_filter(filter);
             if (fw && fh) {
                 dw = (int)fw;
@@ -686,7 +726,7 @@ int fbm_present(SDL_Window *win, int k, uint32_t fw, uint32_t fh, unsigned n,
                 nv2a_present_crop(fw, fh, fw, fh, n, pad, ov, filter, &c);
             whole = nv2a_present_rect(ov ? c.fit_w : fw, ov ? c.fit_h : fh, (uint32_t)dw,
                                       (uint32_t)dh, filter, &r);
-            if (s_internal) {
+            if (internal) {
                 /* 1:1: the layer does the scaling. A crop is zoomed into the
                  * whole drawable with the present filter's sampler, except
                  * integer, which stays nearest (D3D11 matches). */

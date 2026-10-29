@@ -1,7 +1,8 @@
 # present_chain - present.shader's loader and request state
 # (src/kernel/nv2a_present_chain.c): a missing library, a library with the
-# wrong ABI, a stand-in with the right one, and the preset lookup beside the
-# executable. The stand-ins export only librashader's two version calls, so
+# wrong ABI, a stand-in with the right one, the preset lookup beside the
+# executable, and the runtime-parameter store (present.shader_params) with
+# its overrides, save state and the descriptor dump's preset parse. The stand-ins export only librashader's two version calls, so
 # the test needs neither the real library nor a GPU. Pure C:
 #   cmake -S tests/present_chain -B build/present_chain
 #   cmake --build build/present_chain && ctest --test-dir build/present_chain
@@ -34,6 +35,10 @@ foreach(v good:2:5 old_api:2:4 bad_abi:1:5)
     set_target_properties(fake_lrs_${name} PROPERTIES PREFIX "")
     add_dependencies(present_chain_test fake_lrs_${name})
 endforeach()
+add_library(fake_lrs_params MODULE fake_lrs.c)
+target_compile_definitions(fake_lrs_params PRIVATE FAKE_ABI=2 FAKE_API=5 FAKE_PARAMS)
+set_target_properties(fake_lrs_params PROPERTIES PREFIX "")
+add_dependencies(present_chain_test fake_lrs_params)
 add_library(fake_lrs_no_exports MODULE fake_lrs.c)
 target_compile_definitions(fake_lrs_no_exports PRIVATE FAKE_NO_EXPORTS)
 set_target_properties(fake_lrs_no_exports PROPERTIES PREFIX "")
@@ -43,7 +48,8 @@ if(NOT MSVC)
     target_compile_options(present_chain_test PRIVATE -Wall -Wextra)
 endif()
 enable_testing()
-foreach(c request rate preset missing bad_abi old_api no_exports good)
+foreach(c request rate preset missing bad_abi old_api no_exports good params params_key
+        describe describe_nolib)
     add_test(NAME present_chain_${c} COMMAND present_chain_test ${c}
              $<TARGET_FILE_DIR:fake_lrs_good>
              WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
