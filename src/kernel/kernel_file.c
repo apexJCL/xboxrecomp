@@ -19,6 +19,7 @@
 #endif
 #include "kernel.h"
 #include "kernel_ramfs.h"
+#include <stddef.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -69,6 +70,49 @@ uint32_t g_xbox_last_file_error;
 uint32_t xbox_LastFileError(void)
 {
     return g_xbox_last_file_error;
+}
+
+/* FileFsVolumeInformation, shared by every backend.
+ *
+ * XAPI's GetFileInformationByHandle asks for it first (for the serial number),
+ * then FileInternalInformation, then FileNetworkOpenInformation. Without it the
+ * whole call fails, and a title that does not check takes stack garbage for the
+ * file size: Kingdom Under Fire: Heroes read 512 bytes of install_image.dds and
+ * stopped on its fatal error screen.
+ *
+ * FATX keeps no volume label, so the backends pass "" and the reply always
+ * fits; the overflow rule is NT's for a label that does not. NT's I/O manager
+ * refuses a buffer smaller than the structure itself before the file system
+ * sees it, and reports the bytes written in Information. */
+NTSTATUS xbox_FsVolumeInformation(PXBOX_IO_STATUS_BLOCK IoStatusBlock,
+    PVOID FsInformation, ULONG Length, ULONG SerialNumber, const char *Label)
+{
+    PXBOX_FILE_FS_VOLUME_INFORMATION info = (PXBOX_FILE_FS_VOLUME_INFORMATION)FsInformation;
+    const ULONG fixed = (ULONG)offsetof(XBOX_FILE_FS_VOLUME_INFORMATION, VolumeLabel);
+    ULONG label_len = Label ? (ULONG)strlen(Label) : 0, room;
+    NTSTATUS st = STATUS_SUCCESS;
+
+    if (!IoStatusBlock || !FsInformation)
+        return STATUS_INVALID_PARAMETER;
+    if (Length < sizeof(XBOX_FILE_FS_VOLUME_INFORMATION)) {
+        IoStatusBlock->Status = STATUS_INFO_LENGTH_MISMATCH;
+        IoStatusBlock->Information = 0;
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+    memset(info, 0, fixed);
+    info->VolumeSerialNumber = SerialNumber;
+    info->VolumeLabelLength = label_len;
+    info->SupportsObjects = FALSE;
+    room = Length - fixed;
+    if (label_len > room) {
+        label_len = room;
+        st = STATUS_BUFFER_OVERFLOW;
+    }
+    if (label_len)
+        memcpy(info->VolumeLabel, Label, label_len);
+    IoStatusBlock->Status = st;
+    IoStatusBlock->Information = fixed + label_len;
+    return st;
 }
 
 #if defined(_WIN32)
@@ -466,7 +510,6 @@ static NTSTATUS host_NtQueryInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FileInformation, ULONG Length, XBOX_FILE_INFORMATION_CLASS FileInformationClass)
 {
-    (void)Length;
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
 
@@ -517,6 +560,23 @@ static NTSTATUS host_NtQueryInformationFile(
             info->CurrentByteOffset = pos;
             IoStatusBlock->Status = STATUS_SUCCESS;
             IoStatusBlock->Information = sizeof(XBOX_FILE_POSITION_INFORMATION);
+            return STATUS_SUCCESS;
+        }
+        case XboxFileInternalInformation: {
+            /* XAPI GetFileInformationByHandle's nFileIndex: the volume's own
+             * file index, as NT reports it. */
+            PXBOX_FILE_INTERNAL_INFORMATION info = (PXBOX_FILE_INTERNAL_INFORMATION)FileInformation;
+            BY_HANDLE_FILE_INFORMATION fi;
+            if (Length < sizeof(XBOX_FILE_INTERNAL_INFORMATION)) {
+                IoStatusBlock->Status = STATUS_INFO_LENGTH_MISMATCH;
+                IoStatusBlock->Information = 0;
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            if (!GetFileInformationByHandle(FileHandle, &fi))
+                return STATUS_UNSUCCESSFUL;
+            info->IndexNumber.QuadPart = ((LONGLONG)fi.nFileIndexHigh << 32) | fi.nFileIndexLow;
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            IoStatusBlock->Information = sizeof(XBOX_FILE_INTERNAL_INFORMATION);
             return STATUS_SUCCESS;
         }
         case XboxFileNetworkOpenInformation: {
@@ -651,11 +711,18 @@ static NTSTATUS host_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
 {
-    (void)FileHandle; (void)Length;
     if (!IoStatusBlock || !FsInformation)
         return STATUS_INVALID_PARAMETER;
 
     switch (FsInformationClass) {
+        case XboxFileFsVolumeInformation: {
+            /* The host volume's serial; 0 for a handle that has none. */
+            BY_HANDLE_FILE_INFORMATION fi;
+            ULONG serial = GetFileInformationByHandle(FileHandle, &fi)
+                         ? fi.dwVolumeSerialNumber : 0;
+            return xbox_FsVolumeInformation(IoStatusBlock, FsInformation, Length,
+                                            serial, "");
+        }
         case XboxFileFsSizeInformation: {
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             ULARGE_INTEGER free_bytes, total_bytes, total_free;
@@ -1328,7 +1395,6 @@ static NTSTATUS host_NtQueryInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FileInformation, ULONG Length, XBOX_FILE_INFORMATION_CLASS FileInformationClass)
 {
-    (void)Length;
     if (!IoStatusBlock || !FileInformation)
         return STATUS_INVALID_PARAMETER;
 
@@ -1375,6 +1441,20 @@ static NTSTATUS host_NtQueryInformationFile(
             info->CurrentByteOffset.QuadPart = pos;
             IoStatusBlock->Status = STATUS_SUCCESS;
             IoStatusBlock->Information = sizeof(XBOX_FILE_POSITION_INFORMATION);
+            return STATUS_SUCCESS;
+        }
+        case XboxFileInternalInformation: {
+            /* XAPI GetFileInformationByHandle's nFileIndex; the inode is the
+             * host's index of the file on its volume. */
+            PXBOX_FILE_INTERNAL_INFORMATION info = (PXBOX_FILE_INTERNAL_INFORMATION)FileInformation;
+            if (Length < sizeof(XBOX_FILE_INTERNAL_INFORMATION)) {
+                IoStatusBlock->Status = STATUS_INFO_LENGTH_MISMATCH;
+                IoStatusBlock->Information = 0;
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+            info->IndexNumber.QuadPart = (LONGLONG)st.st_ino;
+            IoStatusBlock->Status = STATUS_SUCCESS;
+            IoStatusBlock->Information = sizeof(XBOX_FILE_INTERNAL_INFORMATION);
             return STATUS_SUCCESS;
         }
         case XboxFileNetworkOpenInformation: {
@@ -1549,11 +1629,19 @@ static NTSTATUS host_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass)
 {
-    (void)Length;
     if (!IoStatusBlock || !FsInformation)
         return STATUS_INVALID_PARAMETER;
 
     switch (FsInformationClass) {
+        case XboxFileFsVolumeInformation: {
+            /* The host device number stands in for the serial: it names the
+             * volume, as the serial does, and is 0 for a handle without one. */
+            struct stat st;
+            int fd = w32_handle_fd(FileHandle);
+            ULONG serial = fd >= 0 && fstat(fd, &st) == 0 ? (ULONG)st.st_dev : 0;
+            return xbox_FsVolumeInformation(IoStatusBlock, FsInformation, Length,
+                                            serial, "");
+        }
         case XboxFileFsSizeInformation: {
             PXBOX_FILE_FS_SIZE_INFORMATION info = (PXBOX_FILE_FS_SIZE_INFORMATION)FsInformation;
             struct statvfs vfs;

@@ -1018,7 +1018,6 @@ int xbox_ramfs_query_info(HANDLE h, PXBOX_IO_STATUS_BLOCK ios, PVOID info,
     ram_file *f;
     ram_node *n;
 
-    (void)len;
     AcquireSRWLockExclusive(&s_lock);
     f = find_file(h, NULL);
     if (!f) {
@@ -1060,6 +1059,19 @@ int xbox_ramfs_query_info(HANDLE h, PXBOX_IO_STATUS_BLOCK ios, PVOID info,
             ((PXBOX_FILE_POSITION_INFORMATION)info)->CurrentByteOffset.QuadPart =
                 (LONGLONG)f->pos;
             ios->Information = sizeof(XBOX_FILE_POSITION_INFORMATION);
+            break;
+        case XboxFileInternalInformation:
+            /* As the disk backends, for XAPI GetFileInformationByHandle: the
+             * node id names the file for as long as the store lives. */
+            if (len < sizeof(XBOX_FILE_INTERNAL_INFORMATION)) {
+                *st = STATUS_INFO_LENGTH_MISMATCH;
+                ios->Status = *st;
+                ios->Information = 0;
+                goto out;
+            }
+            ((PXBOX_FILE_INTERNAL_INFORMATION)info)->IndexNumber.QuadPart =
+                (LONGLONG)n->id;
+            ios->Information = sizeof(XBOX_FILE_INTERNAL_INFORMATION);
             break;
         case XboxFileNetworkOpenInformation:
             fill_net(n, (PXBOX_FILE_NETWORK_OPEN_INFORMATION)info);
@@ -1157,7 +1169,6 @@ out:
 int xbox_ramfs_query_volume(HANDLE h, PXBOX_IO_STATUS_BLOCK ios, PVOID info,
                             ULONG len, XBOX_FS_INFORMATION_CLASS cls, NTSTATUS *st)
 {
-    (void)len;
     AcquireSRWLockExclusive(&s_lock);
     if (!find_file(h, NULL)) {
         ReleaseSRWLockExclusive(&s_lock);
@@ -1175,6 +1186,9 @@ int xbox_ramfs_query_volume(HANDLE h, PXBOX_IO_STATUS_BLOCK ios, PVOID info,
             (LONGLONG)(s_used < cap ? (cap - s_used) / RAMFS_CLUSTER : 0);
         ios->Status = *st = STATUS_SUCCESS;
         ios->Information = sizeof *s;
+    } else if (cls == XboxFileFsVolumeInformation) {
+        /* Any fixed serial: the store is one volume for the whole run. */
+        *st = xbox_FsVolumeInformation(ios, info, len, 0x52414D43u /* "RAMC" */, "");
     } else {
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_FILE,
                  "ram cache NtQueryVolumeInformationFile: unhandled class %d", cls);

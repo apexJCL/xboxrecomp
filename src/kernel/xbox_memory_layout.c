@@ -6179,6 +6179,36 @@ static uint32_t heap_alloc(uint32_t size, uint32_t alignment)
     return r;
 }
 
+/* Under reclaim, free blocks that end at the bump cursor go back to it, so
+ * the cursor starts at the lowest of them. Returns 1 if the cursor moved.
+ *
+ * Only for a bump that would not fit: a free block at the cursor too small
+ * for the request, plus the room above it, is one run that can hold it. KUF
+ * frees a 32 MB block at the cursor and asks for 33558528 bytes: the room
+ * above was 11.9 MB, the run 44.7 MB, and the request failed. A bump that
+ * fits leaves the tail alone, so a title that works today keeps the
+ * addresses it gets (JSRF depends on which address a free hands back). */
+static int heap_fold_free_tail(void)
+{
+    int t = g_heap_block_count - 1, moved = 0;
+
+    if (!g_heap_next)
+        return 0;
+    for (;;) {
+        /* Empty slots left by merges sit between blocks; skip them, and
+         * the count drops past them with the block below. */
+        while (t >= 0 && g_heap_blocks[t].size == 0) t--;
+        if (t < 0 || !g_heap_blocks[t].free ||
+            g_heap_blocks[t].addr + g_heap_blocks[t].size != g_heap_next)
+            break;
+        /* Its pages were forgotten when it was freed. */
+        g_heap_next = g_heap_blocks[t].addr;
+        g_heap_block_count = t--;
+        moved = 1;
+    }
+    return moved;
+}
+
 static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
 {
     uint32_t result;
@@ -6234,6 +6264,9 @@ static uint32_t heap_alloc_locked(uint32_t size, uint32_t alignment)
     result = (g_heap_next + alignment - 1) & ~(alignment - 1);
 
     if (result + size > XBOX_HEAP_TOP) {
+        /* A free tail and the room above it may hold what neither does alone. */
+        if (xbox_HeapReclaimEnabled() && heap_fold_free_tail())
+            return heap_alloc_locked(size, alignment);
         /* Held blocks are free memory the title already gave back. */
         if (heap_quarantine_drain())
             return heap_alloc_locked(size, alignment);

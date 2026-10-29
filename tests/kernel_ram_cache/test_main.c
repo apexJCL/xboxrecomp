@@ -9,7 +9,8 @@
  * Covered: off until asked; seed reads; create, rewrite, seek and size; the
  * FATX overwrite semantics the disk backends keep; the cap (STATUS_DISK_FULL)
  * and the volume size; delete and delete-on-close; directories and patterns;
- * rename; Partition3 reaching the same files; and the host Cache untouched.
+ * rename; Partition3 reaching the same files; the volume and file index
+ * queries; and the host Cache untouched.
  * Then the review's cases: a GENERIC_WRITE handle writing at its offset (on
  * the store and on the host backend), duplicates, a double close, shrink and
  * regrow, a deleted seed staying deleted, seeds listed unopened, a restarted
@@ -514,6 +515,54 @@ static void test_cap(const unsigned char *buf)
     check(xbox_RamCacheUsed() == used0, "deleting the ring gives the space back", NULL);
 }
 
+/* XAPI GetFileInformationByHandle asks for the volume and the file index
+ * before the size; either refused, the whole call fails. */
+static void test_info_classes(void)
+{
+    XBOX_FILE_FS_VOLUME_INFORMATION vol[2];
+    XBOX_FILE_INTERNAL_INFORMATION ia, ib;
+    XBOX_IO_STATUS_BLOCK ios;
+    HANDLE a, b;
+    NTSTATUS st, sa, sb;
+    char d[160];
+
+    printf("\nInfo classes\n");
+    open_file("z:\\ia.rec", XBOX_FILE_OVERWRITE_IF, &a);
+    open_file("z:\\ib.rec", XBOX_FILE_OVERWRITE_IF, &b);
+    sa = xbox_NtQueryInformationFile(a, &ios, &ia, sizeof ia, XboxFileInternalInformation);
+    sb = xbox_NtQueryInformationFile(b, &ios, &ib, sizeof ib, XboxFileInternalInformation);
+    snprintf(d, sizeof d, "status 0x%08X 0x%08X, index %lld %lld", (unsigned)sa, (unsigned)sb,
+             (long long)ia.IndexNumber.QuadPart, (long long)ib.IndexNumber.QuadPart);
+    check(sa == 0 && sb == 0 && ios.Information == sizeof ib &&
+          ia.IndexNumber.QuadPart != ib.IndexNumber.QuadPart,
+          "file index: answered, one per file", d);
+    ios.Status = 0;
+    ios.Information = 99;
+    st = xbox_NtQueryInformationFile(a, &ios, &ia, 4, XboxFileInternalInformation);
+    snprintf(d, sizeof d, "status 0x%08X, ios 0x%08X/%u", (unsigned)st,
+             (unsigned)ios.Status, (unsigned)ios.Information);
+    check((uint32_t)st == 0xC0000004u && (uint32_t)ios.Status == 0xC0000004u &&
+          ios.Information == 0, "file index: a 4-byte buffer is refused, in the status block too", d);
+    memset(vol, 0xCC, sizeof vol);
+    st = xbox_NtQueryVolumeInformationFile(a, &ios, vol, sizeof vol[0],
+                                           XboxFileFsVolumeInformation);
+    snprintf(d, sizeof d, "status 0x%08X, info %u, label %u", (unsigned)st,
+             (unsigned)ios.Information, (unsigned)vol[0].VolumeLabelLength);
+    check(st == 0 && ios.Information == 17 && vol[0].VolumeLabelLength == 0 &&
+          vol[0].VolumeSerialNumber != 0 && vol[0].VolumeCreationTime.QuadPart == 0,
+          "volume: answered, a serial and no label", d);
+    xbox_NtClose(a);
+    xbox_NtClose(b);
+    {
+        XBOX_ANSI_STRING nm;
+        XBOX_OBJECT_ATTRIBUTES oa;
+        set_name(&nm, &oa, "z:\\ia.rec", NULL);
+        xbox_NtDeleteFile(&oa);
+        set_name(&nm, &oa, "z:\\ib.rec", NULL);
+        xbox_NtDeleteFile(&oa);
+    }
+}
+
 static void test_delete(void)
 {
     XBOX_FILE_DISPOSITION_INFORMATION di;
@@ -772,6 +821,7 @@ int main(int argc, char **argv)
     test_file_io(buf);
     test_fatx_overwrite(buf);
     test_cap(buf);
+    test_info_classes();
     test_delete();
     test_dirs();
     test_append("\\Device\\Harddisk0\\Partition1\\UDATA\\gw.bin");

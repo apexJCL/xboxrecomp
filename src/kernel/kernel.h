@@ -88,6 +88,9 @@ enum {
 #ifndef STATUS_NOT_IMPLEMENTED
 #define STATUS_NOT_IMPLEMENTED          ((NTSTATUS)0xC0000002L)
 #endif
+#ifndef STATUS_INFO_LENGTH_MISMATCH
+#define STATUS_INFO_LENGTH_MISMATCH     ((NTSTATUS)0xC0000004L)
+#endif
 #ifndef STATUS_INVALID_HANDLE
 #define STATUS_INVALID_HANDLE           ((NTSTATUS)0xC0000008L)
 #endif
@@ -273,6 +276,22 @@ typedef struct _XBOX_FILE_FS_SIZE_INFORMATION {
     ULONG         SectorsPerAllocationUnit;
     ULONG         BytesPerSector;
 } XBOX_FILE_FS_SIZE_INFORMATION, *PXBOX_FILE_FS_SIZE_INFORMATION;
+
+/* FILE_INTERNAL_INFORMATION: the file's index on its volume */
+typedef struct _XBOX_FILE_INTERNAL_INFORMATION {
+    LARGE_INTEGER IndexNumber;
+} XBOX_FILE_INTERNAL_INFORMATION, *PXBOX_FILE_INTERNAL_INFORMATION;
+
+/* FS_VOLUME_INFORMATION. The NT layout, but the label is OCHAR, a byte, like
+ * every other name the Xbox kernel takes, so it starts at offset 17, not 18.
+ * VolumeLabelLength counts bytes. */
+typedef struct _XBOX_FILE_FS_VOLUME_INFORMATION {
+    LARGE_INTEGER VolumeCreationTime;
+    ULONG         VolumeSerialNumber;
+    ULONG         VolumeLabelLength;
+    BOOLEAN       SupportsObjects;
+    CHAR          VolumeLabel[1]; /* Variable length */
+} XBOX_FILE_FS_VOLUME_INFORMATION, *PXBOX_FILE_FS_VOLUME_INFORMATION;
 
 /* Memory statistics */
 typedef struct _XBOX_MM_STATISTICS {
@@ -733,6 +752,13 @@ NTSTATUS __stdcall xbox_NtSetInformationFile(
 NTSTATUS __stdcall xbox_NtQueryVolumeInformationFile(
     HANDLE FileHandle, PXBOX_IO_STATUS_BLOCK IoStatusBlock,
     PVOID FsInformation, ULONG Length, XBOX_FS_INFORMATION_CLASS FsInformationClass);
+
+/* Fills an FS_VOLUME_INFORMATION reply into a Length-byte buffer, as NT
+ * does: STATUS_INFO_LENGTH_MISMATCH below the fixed part, and
+ * STATUS_BUFFER_OVERFLOW with the label cut short when it does not fit. Every
+ * backend answers through this (kernel_file.c). */
+NTSTATUS xbox_FsVolumeInformation(PXBOX_IO_STATUS_BLOCK IoStatusBlock,
+    PVOID FsInformation, ULONG Length, ULONG SerialNumber, const char *Label);
 
 /* NtSetInformationFile(FileRenameInformation), with the guest's
  * FILE_RENAME_INFORMATION already unpacked: its FileName is a guest pointer,

@@ -24,6 +24,11 @@
  *   3. Freeing three neighbours in an awkward order merges all three. Merging
  *      left an empty slot behind that later frees did not step over, so the
  *      third block never joined the other two.
+ *   3b. (default too) Two freed blocks that end at the cursor, with too
+ *      little room above it, hold a request larger than either: the tail
+ *      folds back into the cursor. Reclaim used to fail it, as KUF's
+ *      33558528-byte request failed with a 44.7 MB free run. With room
+ *      above, a request still bumps past the free tail, in every mode.
  *   4. NtFreeVirtualMemory(MEM_RELEASE) on memory NtAllocateVirtualMemory took
  *      from the heap gives it back. It handed the 32-bit guest slot to the host
  *      VirtualFree as a pointer, which failed, so none of it ever returned.
@@ -413,6 +418,41 @@ int main(int argc, char **argv)
         snprintf(d, sizeof d, "got 0x%08X, expected 0x%08X", m, x);
         check(y == x + 64 && z == y + 64 && m == x,
               "three freed neighbours merge into one 192-byte block", d);
+    }
+
+    /* 3b. A free tail joins the room above the cursor, and only when the
+     * bump would not fit. 4 MB blocks, larger than anything the checks
+     * above left free (t's 3 MB included), so they are bumped. */
+    if (!ext) {
+        const uint32_t MB = 1024u * 1024u;
+        uint32_t t = xbox_HeapAlloc(3 * MB, 4096), p, f, fill, r, u, v;
+
+        xbox_HeapFree(t);
+        p = xbox_HeapAlloc(4 * MB, 4096);
+        snprintf(d, sizeof d, "freed tail 0x%08X, 4 MB at 0x%08X", t, p);
+        if (!reclaim) {
+            check(p == t + 3 * MB, "default: a larger request bumps past the free tail", d);
+            xbox_HeapFree(p);
+        } else {
+            /* A title that works today keeps its addresses: with room above
+             * the cursor, the free tail is left where it is. */
+            check(p == t + 3 * MB, "with room above, a larger request bumps past the free tail", d);
+            /* Fill to 1 MB short of two more 4 MB blocks below the top. */
+            fill = (XBOX_HEAP_TOP - (p + 4 * MB) - 8 * MB - 1 * MB) & ~4095u;
+            f = xbox_HeapAlloc(fill, 4096);
+            r = xbox_HeapAlloc(4 * MB, 4096);
+            u = xbox_HeapAlloc(4 * MB, 4096);
+            snprintf(d, sizeof d, "fill 0x%08X+%u, r 0x%08X, u 0x%08X", f, fill, r, u);
+            check(r == f + fill && u == r + 4 * MB, "two 4 MB blocks bumped side by side", d);
+            xbox_HeapFree(r);
+            xbox_HeapFree(u);       /* merges into r: one 8 MB free tail */
+            v = xbox_HeapAlloc(9 * MB, 4096);
+            snprintf(d, sizeof d, "9 MB at 0x%08X, expected 0x%08X", v, r);
+            check(v == r, "a request larger than the free tail and the room above alone starts at the tail", d);
+            xbox_HeapFree(v);
+            xbox_HeapFree(f);
+            xbox_HeapFree(p);
+        }
     }
 
     /* 4. Releasing NtAllocateVirtualMemory memory returns it. */
