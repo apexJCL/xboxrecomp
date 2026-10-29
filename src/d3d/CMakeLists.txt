@@ -133,3 +133,7 @@ add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/shader_cache
 # macOS also compiles each case with Metal.
 add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/d3d8_msl_split
                  ${CMAKE_CURRENT_BINARY_DIR}/d3d8_msl_split)
+# The basic shaders' texts (nv2a_basic_hlsl.h, nv2a_basic_msl.h): the stock
+# ones locked by checksum, render.snap_2d's compiled with Metal on macOS.
+add_subdirectory(${CMAKE_CURRENT_LIST_DIR}/../../tests/basic_shaders
+                 ${CMAKE_CURRENT_BINARY_DIR}/basic_shaders)

@@ -394,9 +394,12 @@ static void test_navigate(void)
     xbox_InputKeyEvent(0x28, 1);    /* Down */
     advance(16);
     poll0();
-    CHECK(!strcmp(selected_label(), "Anisotropic filtering"));
+    CHECK(!strcmp(selected_label(), "2D on guest grid"));
     /* Held: the first repeat after 150 ms, then every 60. */
     advance(100);
+    poll0();
+    CHECK(!strcmp(selected_label(), "2D on guest grid"));
+    advance(60);
     poll0();
     CHECK(!strcmp(selected_label(), "Anisotropic filtering"));
     advance(60);
@@ -1251,7 +1254,7 @@ static void test_pages(void)
 {
     /* Render, Pack, Game, Mods, Stats, Controls, Debug, Save. */
     static const uint32_t k_sum[8] = {
-        0x885F7EB2u, 0xC5E14D56u, 0xC918F275u, 0xEF138353u,
+        0xFF69828Fu, 0xC5E14D56u, 0xC918F275u, 0xEF138353u,
         0x7B20659Eu, 0x13A93A10u, 0x42BC3478u, 0x4D09DFE6u };
     start_with(ARMED, k_mods);
     open_menu();

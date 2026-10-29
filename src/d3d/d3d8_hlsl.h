@@ -50,15 +50,16 @@ int d3d8_vsh_generate_hlsl_ex(const NV2AVshProgram *program, unsigned flags,
 
 /**
  * Guest-rate sampling of a unity rect-texture stage at render scale N > 1
- * (tex_scale[n].z = N, nv2a_rect_snap_scale). uv is the stage's coordinate
- * in texels, pos the host pixel centre (SV_POSITION.xy). When the mapping
- * is screen-aligned and one texel per guest pixel on both axes, uv moves to
+ * (tex_scale[n].z = N, nv2a_uv_snap). uv is the stage's coordinate in
+ * texels, pos the host pixel centre (SV_POSITION.xy). When the mapping is
+ * screen-aligned and one texel per guest pixel on both axes, uv moves to
  * where the 1x render sampled the guest pixel this host pixel belongs to:
  * the N x N block's centre, by affine extrapolation along the derivatives.
  * Host-rate samples between two texel centres would otherwise blend in the
  * padding texel past a rect texture's picture (a coloured line on the
  * right and bottom edges at scale 2). The derivatives come first: they
- * need uniform control flow. At .z = 0 uv comes back as it is.
+ * need uniform control flow. At .z <= 0 uv comes back as it is. The stock
+ * text: render.snap_2d's shaders take D3D8_HLSL_SNAP_2D on top of it.
  */
 #define D3D8_HLSL_SNAP_UV \
     "float2 nv2a_snap_uv(float2 uv, float2 pos, float4 ts) {\n" \
@@ -70,6 +71,50 @@ int d3d8_vsh_generate_hlsl_ex(const NV2AVshProgram *program, unsigned flags,
     "        uv += dx * d.x + dy * d.y;\n" \
     "    }\n" \
     "    return uv;\n" \
+    "}\n"
+
+/**
+ * render.snap_2d's sampling (nv2a_snap_2d_on), for the shaders built only
+ * while it is on, so the stock ones keep D3D8_HLSL_SNAP_UV's text alone
+ * (a stock pixel shader that grew the gradients and a SampleGrad
+ * branch moved JSRF's D3D11 loading flips). |tex_scale[n].z| = N:
+ *   .z = N (any batch, linear formats): nv2a_snap_uv's unity blit.
+ *   .z = -N (a centred 2D batch, nv2a_snap_flat2d): any axis-aligned
+ *   mapping, magnified, minified or with a constant u or v (0..1 for a
+ *   swizzled format); the batch's affine mapping makes the quad's
+ *   derivatives the whole primitive's. Through WRAP a host-rate sample
+ *   would blend in a tile's far edge.
+ * nv2a_snap_uv2d moves uv as nv2a_snap_uv does where nv2a_snap_ok holds.
+ * nv2a_snap_grad gives a .z = -N stage its sampling gradients (ddx, ddy
+ * as xy, zw): the 1x derivatives (N times the host ones) where the snap
+ * applies, the host ones elsewhere. A snapped uv is constant over each
+ * N x N block, so its own derivatives are 0 inside a quad (N = 2) or jump
+ * between 0 and N times the 1x ones (N = 3): an implicit-gradient sample
+ * would read mip 0 with the mag filter where the 1x render read mip k
+ * with the min filter, or switch LOD from quad to quad. The .z = N blits
+ * are unity at 1x (LOD 0, the mag filter either way) and keep the
+ * implicit sample.
+ */
+#define D3D8_HLSL_SNAP_2D \
+    "bool nv2a_snap_ok(float2 dx, float2 dy, float4 ts) {\n" \
+    "    float n = abs(ts.z), eps = 1.0 / 64.0;\n" \
+    "    return n > 1.0 && (ts.z < 0.0\n" \
+    "        ? abs(dx.y) <= abs(dx.x) * eps && abs(dy.x) <= abs(dy.y) * eps\n" \
+    "        : abs(dx.y) <= eps && abs(dy.x) <= eps\n" \
+    "          && abs(abs(dx.x) * n - 1.0) <= eps && abs(abs(dy.y) * n - 1.0) <= eps);\n" \
+    "}\n" \
+    "float2 nv2a_snap_uv2d(float2 uv, float2 pos, float4 ts) {\n" \
+    "    float2 dx = ddx(uv), dy = ddy(uv);\n" \
+    "    if (nv2a_snap_ok(dx, dy, ts)) {\n" \
+    "        float n = abs(ts.z);\n" \
+    "        float2 d = (floor(pos / n) + 0.5) * n - pos;\n" \
+    "        uv += dx * d.x + dy * d.y;\n" \
+    "    }\n" \
+    "    return uv;\n" \
+    "}\n" \
+    "float4 nv2a_snap_grad(float2 uv, float4 ts) {\n" \
+    "    float2 dx = ddx(uv), dy = ddy(uv);\n" \
+    "    return float4(dx, dy) * (nv2a_snap_ok(dx, dy, ts) ? abs(ts.z) : 1.0);\n" \
     "}\n"
 
 /**

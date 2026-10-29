@@ -152,6 +152,26 @@ static int snap_check(void)
         printf("FAIL: rect_snap does not sample stage 0 through nv2a_snap_uv\n");
         bad = 1;
     }
+    /* render.snap_2d off: the stock text, no 2D helpers or gradients */
+    if (strstr(text, "nv2a_snap_grad") || strstr(text, "SampleGrad")
+            || strstr(text, "nv2a_snap_uv2d")) {
+        printf("FAIL: rect_snap without snap_2d emits the 2D snap\n");
+        bad = 1;
+    }
+    /* snap_2d: a 2D-snapped stage (.z < 0) takes the 1x gradients
+     * (nv2a_snap_grad) */
+    st.snap_2d = 1;
+    if (d3d8_combiners_generate_hlsl(&st, text, (int)sizeof text) <= 0)
+        return 1;
+    if (!strstr(text, D3D8_HLSL_SNAP_2D)
+            || !strstr(text, "uv = nv2a_snap_uv2d(uv, i.pos.xy, tex_scale[0]);")
+            || !strstr(text, "float4 g = nv2a_snap_grad(uv, tex_scale[0]) * tex_scale[0].xyxy;")
+            || !strstr(text, "if (tex_scale[0].z < 0.0) x8 = tex0.SampleGrad(samp0, uv, g.xy, g.zw);\n"
+                             "        else x8 = tex0.Sample(samp0, uv);")) {
+        printf("FAIL: snap_2d does not sample a .z < 0 stage 0 with the 1x gradients\n");
+        bad = 1;
+    }
+    st.snap_2d = 0;
     (void)n;
     st.rect_snap = 0;
     if (d3d8_combiners_generate_hlsl(&st, text, (int)sizeof text) <= 0)

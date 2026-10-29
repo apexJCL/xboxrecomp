@@ -251,6 +251,13 @@ typedef struct NV2ACombinerState {
      * > 1 so the stock shader text is unchanged; part of the cache key. */
     int rect_snap;
 
+    /* 1: with rect_snap, 2D stages sample through D3D8_HLSL_SNAP_2D
+     * instead: nv2a_snap_uv2d, and the 1x gradients where tex_scale[n].z
+     * < 0. A backend flag, set only while render.snap_2d is on
+     * (nv2a_snap_2d_on), so the stock shader text is unchanged; part of
+     * the cache key. */
+    int snap_2d;
+
     /* 1: 2D and bump stages add tex_scale[n].w to the sampled x, the hor+
      * offset of a centred batch into a padded render target's guest columns
      * (nv2a_aspect_place). A backend flag, set only while display.aspect

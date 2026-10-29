@@ -1295,6 +1295,7 @@ static void opts_at_flip(uint32_t flip)
         if (e->mask & NV2A_OPT_ANISO) o.aniso = e->o.aniso;
         if (e->mask & NV2A_OPT_MOVIE) o.movie_mode = e->o.movie_mode;
         if (e->mask & NV2A_OPT_OVERSCAN) o.overscan = e->o.overscan;
+        if (e->mask & NV2A_OPT_SNAP2D) o.snap_2d = e->o.snap_2d;
         nv2a_host_opts_request(&o, e->mask);
     }
 }
@@ -6803,7 +6804,10 @@ static uint16_t s_mrg_save[NV2A_MERGE_BATCH_MAX];
 
 /* Whether this batch's END may hold it: on a backend that takes merged
  * lists, with display.aspect stock (Hor+ places each batch from its own
- * vertices, nv2a_aspect_place) and pb_merge not 0. */
+ * vertices, nv2a_aspect_place), render.snap_2d off (it classes each batch
+ * from its own vertices too: one w, one depth, a sample of 33, so a chain
+ * of sprites at several depths or with a 3D tail would snap differently
+ * merged) and pb_merge not 0. */
 static int merge_on(void)
 {
     static int env = -1;
@@ -6812,7 +6816,7 @@ static int merge_on(void)
         env = !(e && !strcmp(e, "0"));
     }
     return env && s_backend->merge_draws && s_backend->on_draw
-        && !nv2a_host_opts()->aspect_w;
+        && !nv2a_host_opts()->aspect_w && !nv2a_snap_2d_on(nv2a_host_render_scale());
 }
 
 /* Draw the held batches. Runs before the method that ended the chain is

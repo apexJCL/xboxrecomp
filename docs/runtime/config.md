@@ -156,6 +156,7 @@ the stock settings, `present.pacing = "spin"` included.
 |---|---|---|---|---|
 | `render.scale` | int | internal resolution factor: 1, 2, 3, ... | `1` | `RECOMP_RENDER_SCALE` |
 | `render.aniso` | int | anisotropic filtering on mipmapped textures: `0` (off), `2`..`16` | `0` | `RECOMP_RENDER_ANISO` |
+| `render.snap_2d` | bool | above `render.scale` 1, 2D batches sample their textures on the guest grid, as at 1x (no seams between tiles, blockier 2D art) | `false` | `RECOMP_RENDER_SNAP_2D` |
 | `display.aspect` | string | `"W:H"`: `"4:3"` (stock) or a wider ratio such as `"16:9"`, `"16:10"`, `"21:9"`: Hor+ on Metal and D3D11 ([Hor+](#hor-widescreen-displayaspect)); the CPU rasteriser ignores it with a log line | `"4:3"` | `RECOMP_DISPLAY_ASPECT` |
 | `display.movie` | string | `"black"`, `"fit"`, `"fill"`: with a wide aspect, a full-screen movie or still is pillarboxed, stretched to the width, or scaled to cover it (top and bottom cropped) | `"black"` | `RECOMP_DISPLAY_MOVIE` |
 | `display.overscan` | int | guest pixels cropped from each left and right edge at present, top and bottom in proportion: `0` (stock) to `64` ([Overscan](#display-overscan-displayoverscan)); ignored with a wide `display.aspect` and by the CPU rasteriser, each with a log line | `0` | `RECOMP_DISPLAY_OVERSCAN` |
@@ -337,7 +338,20 @@ same requests at given flips, to check a switch without the menu.
   linear-format (rect) texture drawn 1:1 to guest pixels, such as a movie
   frame, is sampled where the 1x render samples it: each N x N block of
   host pixels reads its guest pixel's 1x sample point, so the padding past
-  the picture does not bleed into the last row and column. The frame the
+  the picture does not bleed into the last row and column. A bilinear
+  texture on a 2D batch (a pre-transformed one, always; a program one
+  whose vertices share one whole w and one depth; on an unpadded target or
+  centred on a padded one), swizzled and compressed ones too, with u along x and v along y
+  (mirrored or not; a mapping turned 90 degrees is left alone), is
+  sampled the same way: a WRAP tile's edge pixels would otherwise pull
+  part of the opposite edge's texel and draw a thin light line between
+  loading-screen tiles. This 2D form is behind `render.snap_2d` (default
+  off, so stock scaling blends 2D art at the host rate as before); when on,
+  such textures look as at 1x, in N x N blocks, not with host-rate
+  bilinear smoothing, and keep the 1x mip level and min/mag filter through
+  explicit gradients. 3D batches and render-target textures are left
+  alone. With it on, the walker does not merge back-to-back batches (as
+  under Hor+), since each batch is classed from its own vertices. The frame the
   guest sees is still guest-sized: Metal box-filters its write-back to
   guest memory, so `RECOMP_FB_DUMP` and `fb_dump_at` frames stay 640x480.
   The box filter averages the stored (gamma-encoded) values, not linear
@@ -1086,7 +1100,7 @@ points, its live class; the footer names the selected row's:
 
 | Class | Takes effect | Items |
 |---|---|---|
-| live | at the next flip | `render.aniso`, `present.filter`, `present.shader`, `present.pacing`, `display.overscan`, `display.movie`, `overlay.stats`, `input.mouse_capture`, every action binding, a mod with `on_enable` |
+| live | at the next flip | `render.aniso`, `render.snap_2d`, `present.filter`, `present.shader`, `present.pacing`, `display.overscan`, `display.movie`, `overlay.stats`, `input.mouse_capture`, every action binding, a mod with `on_enable` |
 | at the flip | at the next flip, rebuilding the targets or the texture cache | `render.scale`, `present.fullscreen`, `textures.pack`, `textures.font`, `textures.text` |
 | next stage | at a later game point (a title's item) | none of the toolkit's |
 | next activation | when the mod next turns its feature on | a mod setting the descriptor marks so (the free camera's HUD choice) |
@@ -1115,6 +1129,7 @@ exist only when the layer is built (`RECOMP_ENV_HAVE_ENHANCE_KEYS`):
 |---|---|
 | `RECOMP_CONFIG` | path of the player's file, which replaces both `config.toml` files, or `none` for no file at all (the defaults included). `RECOMP_ENHANCE_CONFIG` is its earlier name, read with a deprecation line |
 | `RECOMP_RENDER_SCALE` | overrides `render.scale` |
+| `RECOMP_RENDER_SNAP_2D` | overrides `render.snap_2d` |
 | `RECOMP_DISPLAY_ASPECT` | overrides `display.aspect` |
 | `RECOMP_DISPLAY_MOVIE` | overrides `display.movie` |
 | `RECOMP_DISPLAY_OVERSCAN` | overrides `display.overscan` |

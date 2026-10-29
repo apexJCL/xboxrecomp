@@ -99,6 +99,7 @@ static void req(void (*edit)(struct nv2a_host_opts *, const char *), const char 
 
 static void e_scale(struct nv2a_host_opts *o, const char *v) { o->render_scale = (unsigned)atoi(v); }
 static void e_aniso(struct nv2a_host_opts *o, const char *v) { o->aniso = (unsigned)atoi(v); }
+static void e_snap(struct nv2a_host_opts *o, const char *v) { o->snap_2d = on_text(v); }
 static void e_full(struct nv2a_host_opts *o, const char *v) { o->fullscreen = on_text(v); }
 static void e_overscan(struct nv2a_host_opts *o, const char *v) { o->overscan = (unsigned)atoi(v); }
 static void e_pack(struct nv2a_host_opts *o, const char *v) { (void)v; o->pack_off = s_pack_off; }
@@ -125,6 +126,7 @@ static void e_movie(struct nv2a_host_opts *o, const char *v)
 
 static void set_scale(const struct enhance_item *it, const char *v) { (void)it; req(e_scale, v, NV2A_OPT_SCALE); }
 static void set_aniso(const struct enhance_item *it, const char *v) { (void)it; req(e_aniso, v, NV2A_OPT_ANISO); }
+static void set_snap(const struct enhance_item *it, const char *v) { (void)it; req(e_snap, v, NV2A_OPT_SNAP2D); }
 static void set_filter(const struct enhance_item *it, const char *v) { (void)it; req(e_filter, v, NV2A_OPT_FILTER); }
 static void set_full(const struct enhance_item *it, const char *v) { (void)it; req(e_full, v, NV2A_OPT_FULLSCREEN); }
 static void set_overscan(const struct enhance_item *it, const char *v) { (void)it; req(e_overscan, v, NV2A_OPT_OVERSCAN); }
@@ -183,6 +185,13 @@ static const char *get_aniso(const struct enhance_item *it, char *b, size_t n)
 {
     (void)it;
     snprintf(b, n, "%u", nv2a_host_opts()->aniso);
+    return b;
+}
+
+static const char *get_snap(const struct enhance_item *it, char *b, size_t n)
+{
+    (void)it;
+    snprintf(b, n, "%s", nv2a_host_opts()->snap_2d ? "true" : "false");
     return b;
 }
 
@@ -261,6 +270,8 @@ static const char *get_capture(const struct enhance_item *it, char *b, size_t n)
 static const struct enhance_item k_items[] = {
     { ITEM("render.scale", "Render scale", "Render", ENHANCE_ITEM_RANGE), .lo = 1, .hi = 4,
       .step = 1, .set = set_scale, .get = get_scale, .live = ENHANCE_LIVE_FLUSH, .def = "1" },
+    { ITEM("render.snap_2d", "2D on guest grid", "Render", ENHANCE_ITEM_TOGGLE),
+      .note = "scale 2+", .set = set_snap, .get = get_snap, .def = "false" },
     { ITEM("render.aniso", "Anisotropic filtering", "Render", ENHANCE_ITEM_CHOICE),
       .choices = k_aniso, .set = set_aniso, .get = get_aniso, .flags = ENHANCE_ITEM_NUMERIC,
       .def = "0" },

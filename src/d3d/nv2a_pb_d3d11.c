@@ -46,6 +46,7 @@
 #include "d3d8_vsh.h"
 #include "d3d8_combiners.h"
 #include "d3d8_swizzle.h"
+#include "nv2a_basic_hlsl.h"
 #include "nv2a_pb_state.h"
 #include "nv2a_backend_common.h"
 #include "nv2a_stats.h"
@@ -220,14 +221,7 @@ _Static_assert(sizeof(PsConsts) == sizeof(NV2APSConstants),
                "PsConsts and NV2APSConstants differ in size");
 #undef PS_ABI_SAME
 
-#define PS_CB_DECL \
-    "cbuffer CombinerCB : register(b0) {\n" \
-    "    float4 c0[8]; float4 c1[8]; float4 fc0; float4 fc1; float4 fog_color;\n" \
-    "    float alpha_ref; uint alpha_func; uint alpha_test_enable; uint fog_enable;\n" \
-    "    uint4 alpha_only; float4 tex_scale[4]; uint4 tex_mode;\n" \
-    "    float4 bump[4]; float4 bumpls[4]; uint4 clip_mode;\n" \
-    "};\n"
-
+/* PS_CB_DECL (nv2a_basic_hlsl.h) is that layout in HLSL. */
 static uint64_t s_presents, s_clears, s_draws, s_draws_skipped;
 /* Draws dropped because CULL_FACE was FRONT_AND_BACK (D3D11 has no such
  * mode); counted apart from s_draws_skipped, which means "could not draw". */
@@ -535,61 +529,10 @@ static ID3D11Buffer *make_buffer(UINT size, UINT bind)
     return b;
 }
 
-/* The VS output struct d3d8_vsh.c emits. A pixel shader that declares the
- * same struct links with any of its vertex shaders. */
-#define VS_OUT_DECL \
-    "struct VS_OUT {\n" \
-    "    float4 oPos : SV_POSITION;\n" \
-    "    float4 oD0  : COLOR0;\n" \
-    "    float4 oD1  : COLOR1;\n" \
-    "    float4 oT0  : TEXCOORD0;\n" \
-    "    float4 oT1  : TEXCOORD1;\n" \
-    "    float4 oT2  : TEXCOORD2;\n" \
-    "    float4 oT3  : TEXCOORD3;\n" \
-    "    float  oFog : FOG;\n" \
-    "    float  oPts : PSIZE;\n" \
-    "    float4 oB0  : TEXCOORD4;\n" \
-    "    float4 oB1  : TEXCOORD5;\n" \
-    "};\n"
-
-/* Batches without register combiners: the CPU path's MODULATE, oD0 * T0
- * when stage 0 is on, a CLIPPLANE stage 0's kill, then the alpha test
- * (D3DCMP numbering, on the 8-bit values the way the CPU compares them). */
-static const char s_ps_src[] =
-    VS_OUT_DECL
-    PS_CB_DECL
-    D3D8_HLSL_SNAP_UV
-    D3D8_HLSL_CLIP_KILLS
-    "Texture2D tex0 : register(t0);\n"
-    "SamplerState samp0 : register(s0);\n"
-    "float4 main(VS_OUT i) : SV_Target {\n"
-    "    float4 c = i.oD0;\n"
-    "    if (tex_mode.x == 4u) {\n"
-    "        c *= saturate(i.oT0);\n"
-    "    } else if (tex_mode.x != 0u) {\n"
-    "        float2 uv = i.oT0.xy;\n"
-    "        if (tex_mode.x == 1u && i.oT0.w != 0.0 && i.oT0.w != 1.0) uv /= i.oT0.w;\n"
-    "        uv = nv2a_snap_uv(uv, i.oPos.xy, tex_scale[0]);\n"
-    /* tex_scale.w: the hor+ offset into a padded target, 0 otherwise */
-    "        float4 t = tex0.Sample(samp0, uv * tex_scale[0].xy + float2(tex_scale[0].w, 0.0));\n"
-    "        if (alpha_only.x == 2u) t.a = 1.0;\n"
-    "        c *= t;\n"
-    "    }\n"
-    "    if (nv2a_clip_kills(clip_mode.x, i.oT0)) discard;\n"
-    "    if (alpha_test_enable != 0u) {\n"
-    "        uint a = (uint)(saturate(c.a) * 255.0 + 0.5), r = (uint)(alpha_ref * 255.0 + 0.5);\n"
-    "        bool ok = true;\n"
-    "        if      (alpha_func == 1u) ok = false;\n"
-    "        else if (alpha_func == 2u) ok = a <  r;\n"
-    "        else if (alpha_func == 3u) ok = a == r;\n"
-    "        else if (alpha_func == 4u) ok = a <= r;\n"
-    "        else if (alpha_func == 5u) ok = a >  r;\n"
-    "        else if (alpha_func == 6u) ok = a != r;\n"
-    "        else if (alpha_func == 7u) ok = a >= r;\n"
-    "        if (!ok) discard;\n"
-    "    }\n"
-    "    return c;\n"
-    "}\n";
+/* The basic pixel shader (nv2a_basic_hlsl.h): the stock text, and
+ * render.snap_2d's, built when it first draws (snap_ps). */
+static const char s_ps_src[] = NV2A_HLSL_PS_BASIC;
+static const char s_ps_snap_src[] = NV2A_HLSL_PS_BASIC_SNAP;
 
 /* Batches without a vertex program: attribute 0 is already in surface pixels
  * (x, y, z, rhw), snapped to the NV2A's 1/16-pixel grid (nv2a_screen_snap);
@@ -2250,6 +2193,29 @@ static uint32_t rc_hash(const NV2ACombinerState *st)
     return h ? h : 1;
 }
 
+/* s_ps with render.snap_2d's sampling (s_ps_snap_src), built the first
+ * time the setting draws so a stock run never compiles it. NULL when it
+ * cannot be built: the caller falls back to s_ps. */
+static ID3D11PixelShader *snap_ps(void)
+{
+    static int tried;
+    static ID3D11PixelShader *ps;
+    ID3DBlob *code = NULL;
+
+    if (tried)
+        return ps;
+    tried = 1;
+    if (compile("nv2a_ps_diffuse_snap", s_ps_snap_src, "ps_5_0", &code)) {
+        ID3D11Device_CreatePixelShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                                       ID3D10Blob_GetBufferSize(code), NULL, &ps);
+        ID3D10Blob_Release(code);
+    }
+    if (!ps)
+        fprintf(stderr, LOGP "nv2a_ps_diffuse_snap: FAILED to build, render.snap_2d"
+                " draws the stock shader\n");
+    return ps;
+}
+
 /* NULL when the shader cannot be built: the caller falls back to s_ps. */
 static ID3D11PixelShader *combiner_ps(const NV2ACombinerState *st)
 {
@@ -2487,6 +2453,7 @@ struct aspect_batch {
     const uint32_t *idx;
     uint32_t lo, count, nidx;
     float lo_x, hi_x;
+    int vary_z;         /* a program's 2D batch off one oPos.z (nv2a_aspect_gate) */
 };
 
 /* Whether hp's batch is a full-width screen quad (nv2a_aspect_screen_quad;
@@ -2654,6 +2621,16 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
                                       s_cur->w == s_cur->h ? NV2A_MOVIE_BLACK
                                                            : nv2a_host_opts()->movie_mode);
     }
+    if (s_cur && nv2a_snap_2d_on(s_cur->n)) {
+        /* render.snap_2d: a centred 2D batch samples guest textures at its
+         * guest pixels' 1x points (nv2a_uv_snap), as metal_on_draw. */
+        unsigned rt_mask = 0;
+        for (n = 0; n < 4; n++)
+            if (s_stage_rt[n])
+                rt_mask |= 1u << n;
+        nv2a_ps_consts_snap(&pc, s_stage, rt_mask, s_cur->n,
+                            nv2a_snap_flat2d(hp->two_d && !hp->vary_z, hp->place));
+    }
     /* A batch sampling a padded target the stock way reads it whole, pads
      * and all, which is what a stretched pass wants, short of a square's
      * overscan (nv2a_rt_stretch_read). Any other reads its
@@ -2729,7 +2706,8 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
         key[34] = v->rc_fcw1;
         key[35] = modes;
         /* render.scale changes at run time: each scale class has its own text */
-        key[36] = (nv2a_host_render_scale() > 1) | (nv2a_host_opts()->aspect_w ? 2u : 0u);
+        key[36] = (nv2a_host_render_scale() > 1) | (nv2a_host_opts()->aspect_w ? 2u : 0u)
+                | (nv2a_snap_2d_on(nv2a_host_render_scale()) ? 4u : 0u);
         key[37] = inputs;
         hit = memo_on() && memo.key_ok && !memcmp(memo.r, key, sizeof key);
         if (!hit) {
@@ -2738,7 +2716,8 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
                                      v->rc_fcw1, modes, &st);
             st.fog_input = 1;   /* FOG.a is the interpolated vertex fog factor */
             st.rect_snap = (int)(key[36] & 1u);   /* nv2a_snap_uv; in rc_hash via st */
-            st.rt_offset = (int)(key[36] >> 1);    /* hor+: tex_scale.w, nv2a_aspect_place */
+            st.rt_offset = (int)(key[36] >> 1 & 1u);   /* hor+: tex_scale.w, nv2a_aspect_place */
+            st.snap_2d = (int)(key[36] >> 2 & 1u);     /* render.snap_2d: nv2a_snap_uv2d */
             for (n = 0; n < 4; n++)
                 st.tex_input[n] = (int)((inputs >> (4 * n)) & 0xF);
             st.bump_on = 1;
@@ -2768,6 +2747,11 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp)
         s_last_rc_on = 0;
     {
         ID3D11PixelShader *ps = s_dbg_post ? NULL : debug_ps();
+        if (ps)
+            return ps;
+    }
+    if (nv2a_snap_2d_on(nv2a_host_render_scale())) {
+        ID3D11PixelShader *ps = snap_ps();
         if (ps)
             return ps;
     }
@@ -3456,7 +3440,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
     struct aspect_batch hp = {0, 0, NV2A_PLACE_CENTRE, 0, NULL};
-    int have_x = 0, tris = 0, flat = 0;
+    int have_x = 0, tris = 0, flat = 0, scan;
     float lo_x = 0, hi_x = 0;      /* hor+: a 2D batch's x range, surface pixels */
     D3D11_PRIMITIVE_TOPOLOGY topo;
     ID3D11Buffer *vbs[NV2A_VS_MAX_INPUTS];
@@ -3616,7 +3600,10 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
      * decides from it), as metal_on_draw does. A pass-through batch is 2D,
      * its positions in surface pixels; a program batch is 2D when its own
      * output is orthographic (nv2a_aspect_scan). Its inputs are gathered
-     * as float4 only when the gate is due to run it. */
+     * as float4 only when the gate is due to run it. With render.snap_2d
+     * above render scale 1 the 2D test runs without hor+ too: a 2D batch's
+     * stages sample at their 1x points (nv2a_snap_flat2d). */
+    scan = rt->pad || nv2a_snap_2d_on(rt->n);
     tris = rt->pad && topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
     if (tris && count > hxy_cap) {
         float (*grown)[2] = (float (*)[2])realloc(hxy, (size_t)count * sizeof *hxy);
@@ -3639,7 +3626,9 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             }
         }
         hp.two_d = have_x = 1;
-    } else if (rt->pad && d->program && nv2a_aspect_due(&vs->hp)) {
+    } else if (!rt->pad && scan && !d->program) {
+        hp.two_d = 1;
+    } else if (scan && d->program && nv2a_aspect_due(&vs->hp)) {
         int slot[NV2A_VS_MAX_INPUTS];
         unsigned nf4 = 0;
         for (i = 0; i < NV2A_VS_MAX_INPUTS; i++)
@@ -3660,6 +3649,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
                                                  v->start, (float (*)[4])(uintptr_t)v->c,
                                                  hvf, nf4, slot, count, NULL,
                                                  &lo_x, &hi_x);
+            hp.vary_z = have_x && vs->hp.vary_z;
             /* Full-width bounds: every vertex, for the per-triangle test
              * (a 2D program is scanned every batch, so the gate passes). */
             if (have_x && tris && nv2a_aspect_full_width(lo_x, hi_x, rt->w))
@@ -3667,7 +3657,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
                                  (float (*)[4])(uintptr_t)v->c, hvf, nf4, slot, count, hxy,
                                  &lo_x, &hi_x);
         }
-    } else if (rt->pad && d->program) {
+    } else if (scan && d->program) {
         /* not due: count the batch so the gate's cadence holds */
         nv2a_aspect_scan(&vs->hp, NULL, 0, NULL, NULL, 0, NULL, 0, NULL, &lo_x, &hi_x);
     }

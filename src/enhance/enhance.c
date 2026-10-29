@@ -81,7 +81,7 @@ int xbox_enhance_init(const char *root, const char *title)
     const char *aspect, *shader, *shader_lib;
     long long scale, aniso, overscan;
     int rc, pacing, surface;
-    char surface_txt[48], overscan_txt[32] = "";
+    char surface_txt[48], overscan_txt[64] = "";
 
     rc = enhance_cfg_init(root, title) < 0 ? -1 : 0;
     memset(&o, 0, sizeof o);
@@ -103,6 +103,9 @@ int xbox_enhance_init(const char *root, const char *title)
         aniso = c;
     }
     o.aniso = aniso < 2 ? 0 : (unsigned)aniso;
+    /* 2D on the guest grid above scale 1 (nv2a_snap_2d_on): off is stock,
+     * and scale 1 ignores it. */
+    o.snap_2d = enhance_cfg_bool("render.snap_2d", 0);
     /* Indexes match enum nv2a_present_filter. */
     o.present_filter = enhance_cfg_choice("present.filter", s_filters, NV2A_PRESENT_NEAREST);
     o.fullscreen = enhance_cfg_bool("present.fullscreen", 0);
@@ -175,6 +178,10 @@ int xbox_enhance_init(const char *root, const char *title)
     o.overscan = (unsigned)overscan;
     if (o.overscan)
         snprintf(overscan_txt, sizeof overscan_txt, " display.overscan=%u", o.overscan);
+    /* Named only when on, as the overscan: the stock line stays as it was. */
+    if (o.snap_2d)
+        snprintf(overscan_txt + strlen(overscan_txt), sizeof overscan_txt - strlen(overscan_txt),
+                 " render.snap_2d=1");
 
     /* The pack's kinds a player can turn off; read whether or not a pack
      * is configured, so the keys are never reported unused. */

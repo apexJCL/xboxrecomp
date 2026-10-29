@@ -16,7 +16,7 @@ int nv2a_aspect_scan(struct nv2a_aspect_gate *gate,
                      const float *vf, unsigned nf4, const int *slot, uint32_t count,
                      float (*xy)[2], float *lo, float *hi)
 {
-    float in[NV2A_VSH_INPUTS][4], w0 = 1.0f;
+    float in[NV2A_VSH_INPUTS][4], w0 = 1.0f, z0 = 0.0f;
     Nv2aVshOut out;
     uint32_t step = !xy && count > 32 ? count / 32 : 1, j;
     unsigned k;
@@ -48,8 +48,12 @@ int nv2a_aspect_scan(struct nv2a_aspect_gate *gate,
         }
         if (j == 0) {
             w0 = out.o[NV2A_VSH_O_POS][3];
+            z0 = out.o[NV2A_VSH_O_POS][2];
+            gate->vary_z = 0;
             *lo = *hi = x;
         } else {
+            if (out.o[NV2A_VSH_O_POS][2] != z0)
+                gate->vary_z = 1;
             if (x < *lo) *lo = x;
             if (x > *hi) *hi = x;
         }

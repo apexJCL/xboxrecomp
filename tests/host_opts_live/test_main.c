@@ -254,6 +254,21 @@ static void test_r1(void)
     nv2a_host_opts_request(&o, NV2A_OPT_ANISO);
     CHECK(nv2a_host_opts_apply() == NV2A_OPT_ANISO && nv2a_host_opts()->aniso == 0, "aniso off");
 
+    /* render.snap_2d, as the menu toggles it: any non-zero is on, a
+     * second on is no change, and off goes back to stock. */
+    o.snap_2d = 2;
+    nv2a_host_opts_request(&o, NV2A_OPT_SNAP2D);
+    CHECK(nv2a_host_opts()->snap_2d == 0, "snap_2d applied before the flip");
+    CHECK(nv2a_host_opts_apply() == NV2A_OPT_SNAP2D && nv2a_host_opts()->snap_2d == 1,
+          "snap_2d on: %d", nv2a_host_opts()->snap_2d);
+    o.snap_2d = 1;
+    nv2a_host_opts_request(&o, NV2A_OPT_SNAP2D);
+    CHECK(nv2a_host_opts_apply() == 0, "snap_2d on twice is a change");
+    o.snap_2d = 0;
+    nv2a_host_opts_request(&o, NV2A_OPT_SNAP2D);
+    CHECK(nv2a_host_opts_apply() == NV2A_OPT_SNAP2D && nv2a_host_opts()->snap_2d == 0,
+          "snap_2d off");
+
     /* A movie mode out of range leaves the current one. */
     o.movie_mode = 7;
     nv2a_host_opts_request(&o, NV2A_OPT_MOVIE);

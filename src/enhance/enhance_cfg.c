@@ -50,6 +50,7 @@ static void bind_builtins(void)
 #ifdef RECOMP_ENV_HAVE_ENHANCE_KEYS
     enhance_cfg_bind_env("render.scale", RENV_RENDER_SCALE);
     enhance_cfg_bind_env("render.aniso", RENV_RENDER_ANISO);
+    enhance_cfg_bind_env("render.snap_2d", RENV_RENDER_SNAP_2D);
     enhance_cfg_bind_env("display.aspect", RENV_DISPLAY_ASPECT);
     enhance_cfg_bind_env("display.movie", RENV_DISPLAY_MOVIE);
     enhance_cfg_bind_env("display.overscan", RENV_DISPLAY_OVERSCAN);

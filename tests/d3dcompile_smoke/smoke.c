@@ -14,7 +14,9 @@
  *   5. the HLSL d3d8_combiners_generate_hlsl emits for a one-stage
  *      texture * diffuse state compiles;
  *   6. an input layout built from NV2A attribute formats
- *      (d3d8_vsh_nv2a_input_layout) matches each program's signature.
+ *      (d3d8_vsh_nv2a_input_layout) matches each program's signature;
+ *   7. the backend's basic pixel shader compiles, stock and with
+ *      render.snap_2d's gradient sampling (nv2a_basic_hlsl.h).
  *
  * Exit code 0 only if every step passed. Output goes to stdout and, because
  * Proton drops a GUI process's stdio, also to the file named by
@@ -32,6 +34,7 @@
 
 #include "d3d8_vsh.h"
 #include "d3d8_combiners.h"
+#include "nv2a_basic_hlsl.h"
 
 typedef HRESULT (WINAPI *PFN_D3DCOMPILE)(LPCVOID, SIZE_T, LPCSTR,
     const D3D_SHADER_MACRO *, ID3DInclude *, LPCSTR, LPCSTR, UINT, UINT,
@@ -339,6 +342,8 @@ int main(int argc, char **argv)
     compile("trivial_vs", k_vs, "vs_5_0");
     compile("trivial_ps", k_ps, "ps_5_0");
     compile_combiner();
+    compile("nv2a_ps_diffuse", NV2A_HLSL_PS_BASIC, "ps_5_0");
+    compile("nv2a_ps_diffuse_snap", NV2A_HLSL_PS_BASIC_SNAP, "ps_5_0");
     for (i = 1; i < argc; i++)
         compile_dump(argv[i]);
 

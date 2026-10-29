@@ -70,6 +70,9 @@ int nv2a_opts_at_parse(const char *p, struct nv2a_opts_at *out)
                 } else if (OPTS_AT_KEY("overscan")) {
                     e.o.overscan = (unsigned)n;
                     e.mask = NV2A_OPT_OVERSCAN;
+                } else if (OPTS_AT_KEY("snap_2d")) {
+                    e.o.snap_2d = n != 0;
+                    e.mask = NV2A_OPT_SNAP2D;
                 } else {
                     ok = 0;
                 }

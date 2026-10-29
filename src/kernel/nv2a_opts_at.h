@@ -6,7 +6,7 @@
  *
  * Syntax: <flip>:<key>=<value>,...  Keys: scale, filter
  * (nearest|linear|integer), fullscreen, aniso, movie (black|fit|fill),
- * overscan, pacing (spin|sleep).
+ * overscan, snap_2d (0|1), pacing (spin|sleep).
  */
 #ifndef NV2A_OPTS_AT_H
 #define NV2A_OPTS_AT_H

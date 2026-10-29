@@ -87,6 +87,7 @@
 #include "nv2a_stats.h"
 #include "nv2a_tex_pack.h"
 #include "d3d8_msl.h"
+#include "nv2a_basic_msl.h"
 #include "metal_compile.h"
 /* xbox_memory_layout.h pulls in the Win32 shim (BOOL, GetCurrentThread),
  * which collides with Objective-C and CoreServices: declare what is used. */
@@ -171,81 +172,10 @@ _Static_assert(sizeof(float) == 4 && sizeof(uint32_t) == 4, "alpha_ref is read a
 #define VTX_F4 7
 static const int s_vtx_attr[VTX_F4] = {0, 3, 4, 9, 10, 11, 12};
 
-static const char s_msl[] =
-    "#include <metal_stdlib>\n"
-    "using namespace metal;\n"
-    "struct VpConsts { float4 c[3]; uint4 u[2]; };\n"
-    D3D8_MSL_PSCONSTS
-    /* The emitters' VOut (d3d8_msl.h), so vs_pass links with a combiner
-     * fs_main and a program's vs_main with fs_basic. */
-    D3D8_MSL_VOUT
-    /* Attribute 0 is already in surface pixels (x, y, z, rhw), snapped to
-     * the NV2A's 1/16-pixel grid (nv2a_screen_snap): c[0] is (2/w, -2/h,
-     * 1/zmax, 0) and c[1] (-1, 1, 0, 0), as the D3D11 pass-through's
-     * vp_scale / vp_off. */
-    "vertex VOut vs_pass(uint vid [[vertex_id]],\n"
-    "                    const device float4 *vb [[buffer(0)]],\n"
-    "                    constant VpConsts &vp [[buffer(1)]]) {\n"
-    "    const device float4 *v = vb + vid * 7u;\n"
-    "    VOut o;\n"
-    "    o.pos = float4((trunc(v[0].xy * 16.0) / 16.0) * vp.c[0].xy + vp.c[1].xy,\n"
-    "                   saturate(v[0].z * vp.c[0].z), 1.0);\n"
-    "    o.d0 = v[1]; o.d1 = v[2];\n"
-    "    o.t0 = v[3]; o.t1 = v[4]; o.t2 = v[5]; o.t3 = v[6];\n"
-    "    o.fog = 1.0; o.psize = 1.0;\n"
-    "    return o;\n"
-    "}\n"
-    /* Batches without register combiners (and, in M1, all of them): the CPU
-     * path's MODULATE, oD0 * T0 when stage 0 is on, a CLIPPLANE stage 0's
-     * kill, then the alpha test (D3DCMP numbering, on the 8-bit values the
-     * way the CPU compares them). Line for line the D3D11 backend's s_ps_src. */
-    D3D8_MSL_SNAP_UV
-    D3D8_MSL_CLIP_KILLS
-    "fragment float4 fs_basic(VOut i [[stage_in]],\n"
-    "                         constant PsConsts &pc [[buffer(0)]],\n"
-    "                         texture2d<float> tex0 [[texture(0)]],\n"
-    "                         sampler samp0 [[sampler(0)]]) {\n"
-    "    float4 c = i.d0;\n"
-    "    if (pc.tex_mode.x == 4u) {\n"
-    "        c *= saturate(i.t0);\n"
-    "    } else if (pc.tex_mode.x != 0u) {\n"
-    "        float2 uv = i.t0.xy;\n"
-    "        if (pc.tex_mode.x == 1u && i.t0.w != 0.0 && i.t0.w != 1.0) uv /= i.t0.w;\n"
-    "        uv = nv2a_snap_uv(uv, i.pos.xy, pc.tex_scale[0]);\n"
-    /* tex_scale.w: the hor+ offset into a padded target, 0 otherwise */
-    "        float4 t = tex0.sample(samp0, uv * pc.tex_scale[0].xy"
-    " + float2(pc.tex_scale[0].w, 0.0), bias(pc.tex_bias.x));\n"
-    /* alpha_only 2: a target read as a format without alpha (nv2a_rt_no_alpha) */
-    "        if (pc.alpha_only.x == 2u) t.a = 1.0;\n"
-    "        c *= t;\n"
-    "    }\n"
-    "    if (nv2a_clip_kills(pc.clip_mode.x, i.t0)) discard_fragment();\n"
-    "    if (pc.atest.z != 0u) {\n"
-    "        float ref = as_type<float>(pc.atest.x);\n"
-    "        uint a = (uint)(saturate(c.a) * 255.0 + 0.5), r = (uint)(ref * 255.0 + 0.5);\n"
-    "        bool ok = true;\n"
-    "        uint f = pc.atest.y;\n"
-    "        if      (f == 1u) ok = false;\n"
-    "        else if (f == 2u) ok = a <  r;\n"
-    "        else if (f == 3u) ok = a == r;\n"
-    "        else if (f == 4u) ok = a <= r;\n"
-    "        else if (f == 5u) ok = a >  r;\n"
-    "        else if (f == 6u) ok = a != r;\n"
-    "        else if (f == 7u) ok = a >= r;\n"
-    "        if (!ok) discard_fragment();\n"
-    "    }\n"
-    "    return c;\n"
-    "}\n"
-    /* A colour clear of part of a target (metal_on_clear): a full-screen
-     * triangle under a scissor, the clear colour as it is. */
-    "struct ClearV { float4 pos [[position]]; };\n"
-    "vertex ClearV vs_clear(uint vid [[vertex_id]]) {\n"
-    "    float2 t = float2((vid << 1) & 2, vid & 2);\n"
-    "    ClearV o;\n"
-    "    o.pos = float4(t * float2(2, -2) + float2(-1, 1), 0, 1);\n"
-    "    return o;\n"
-    "}\n"
-    "fragment float4 fs_clear(constant float4 &c [[buffer(0)]]) { return c; }\n";
+/* The basic library (fs_basic, vs_pass, the clears) and render.snap_2d's
+ * fs_basic_snap, built when it first draws (fs_basic): nv2a_basic_msl.h. */
+static const char s_msl[] = NV2A_MSL_BASIC;
+static const char s_msl_snap[] = NV2A_MSL_BASIC_SNAP;
 
 /* ---- device ---------------------------------------------------------------- */
 
@@ -1855,6 +1785,23 @@ static uint32_t fnv(const void *p, size_t n)
     return h;
 }
 
+/* The fragment function for a batch without combiners: fs_basic, or
+ * while render.snap_2d is on fs_basic_snap (s_msl_snap), built the first
+ * time it is asked for. fs_basic when it cannot be built. */
+static id<MTLFunction> fs_basic(void)
+{
+    static int tried;
+    static id<MTLFunction> fn;
+
+    if (!nv2a_snap_2d_on(nv2a_host_render_scale()))
+        return s_fs_basic;
+    if (!tried) {
+        tried = 1;
+        fn = compile_fn(s_msl_snap, @"fs_basic_snap", "fs_basic_snap");
+    }
+    return fn ? fn : s_fs_basic;
+}
+
 /* The fragment function for the batch: its register combiners when they
  * are programmed (v->rc_set and a stage count), else fs_basic. As the D3D11
  * setup_pixel, only 2D textures are bound, so every sampling mode is passed
@@ -1870,7 +1817,7 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v)
     int n;
 
     if (!(v->rc_set && (v->rc_ctl & 0xFF)))
-        return s_fs_basic;
+        return fs_basic();
     for (n = 0; n < 4; n++) {
         /* As D3D11: BUMPENVMAP(_LUMINANCE) from stage 1 on, reading the
          * stage OTHER_STAGE_INPUT names. */
@@ -1888,7 +1835,8 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v)
     key[34] = v->rc_fcw1;
     key[35] = modes;
     /* render.scale changes at run time: each scale class has its own text */
-    key[36] = (nv2a_host_render_scale() > 1) | (nv2a_host_opts()->aspect_w ? 2u : 0u);
+    key[36] = (nv2a_host_render_scale() > 1) | (nv2a_host_opts()->aspect_w ? 2u : 0u)
+            | (nv2a_snap_2d_on(nv2a_host_render_scale()) ? 4u : 0u);
     key[37] = inputs;
     if (memo.valid && !memcmp(memo.r, key, sizeof key))
         return memo.fn;
@@ -1898,13 +1846,14 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v)
                              v->rc_ctl, v->rc_fcw0, v->rc_fcw1, modes, &st);
     st.fog_input = 1;   /* FOG.a is the interpolated vertex fog factor */
     st.rect_snap = (int)(key[36] & 1u);   /* nv2a_snap_uv; in the hash via st */
-    st.rt_offset = (int)(key[36] >> 1);    /* hor+: tex_scale.w, nv2a_aspect_place */
+    st.rt_offset = (int)(key[36] >> 1 & 1u);   /* hor+: tex_scale.w, nv2a_aspect_place */
+    st.snap_2d = (int)(key[36] >> 2 & 1u);     /* render.snap_2d: nv2a_snap_uv2d */
     for (n = 0; n < 4; n++)
         st.tex_input[n] = (int)((inputs >> (4 * n)) & 0xF);
     st.bump_on = 1;
     hash = fnv(&st, sizeof st);
     if (!s_fs && !(s_fs = (FsEntry *)calloc(FS_MAX, sizeof *s_fs)))
-        return s_fs_basic;
+        return fs_basic();
     for (n = 0; n < s_fs_n; n++)
         if (s_fs[n].hash == hash && !memcmp(&s_fs[n].st, &st, sizeof st)) {
             e = &s_fs[n];
@@ -1912,7 +1861,7 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v)
         }
     if (!e) {
         if (s_fs_n == FS_MAX)
-            return s_fs_basic;
+            return fs_basic();
         e = &s_fs[s_fs_n++];
         e->hash = hash;
         e->st = st;
@@ -1928,7 +1877,7 @@ static id<MTLFunction> fs_select(const struct nv2a_pb_vsh *v)
     }
     memcpy(memo.r, key, sizeof key);
     memo.valid = 1;
-    memo.fn = e->bad ? s_fs_basic : e->fn;   /* as D3D11: the basic PS */
+    memo.fn = e->bad ? fs_basic() : e->fn;   /* as D3D11: the basic PS */
     return memo.fn;
 }
 
@@ -2170,6 +2119,8 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
     int cull = 0, cull_all = 0;
     unsigned bump_src;
     int full_w = 0, guest_tex = 0, flat_rt = 0, two_d = 0, have_x = 0, tris = 0, flat = 0;
+    int vary_z = 0;     /* a program's 2D batch off one oPos.z (nv2a_aspect_gate) */
+    int scan;
     int place = NV2A_PLACE_CENTRE;
     float lo_x = 0, hi_x = 0;   /* hor+: a 2D batch's x range, surface pixels */
     const RenderTarget *srcs[4] = { NULL, NULL, NULL, NULL };
@@ -2306,8 +2257,11 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         /* Hor+: which batches are 2D, and their x range (nv2a_aspect_place
          * decides from it). A pass-through batch is 2D, its positions in
          * surface pixels; a program batch is 2D when its own output is
-         * orthographic (nv2a_aspect_scan). */
+         * orthographic (nv2a_aspect_scan). With render.snap_2d above
+         * render scale 1 the 2D test runs without hor+ too: a 2D batch's
+         * stages sample at their 1x points (nv2a_snap_flat2d). */
         full_w = 0;
+        scan = rt->pad || nv2a_snap_2d_on(rt->n);
         tris = rt->pad && topo == NV2A_TOPO_TRIANGLES;
         if (tris && count > hxy_cap) {
             float (*grown)[2] = (float (*)[2])realloc(hxy, (size_t)count * sizeof *hxy);
@@ -2330,10 +2284,13 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 }
             }
             two_d = have_x = 1;
-        } else if (rt->pad && d->program && ve && count) {
+        } else if (!rt->pad && scan && !d->program) {
+            two_d = 1;
+        } else if (scan && d->program && ve && count) {
             two_d = have_x = nv2a_aspect_scan(&ve->hp, (const uint32_t (*)[4])v->prog, v->start,
                                               (float (*)[4])(uintptr_t)v->c, vf, nf4, slot,
                                               count, NULL, &lo_x, &hi_x);
+            vary_z = have_x && ve->hp.vary_z;
             /* Full-width bounds: every vertex, for the per-triangle test
              * (a 2D program is scanned every batch, so the gate passes). */
             if (have_x && tris && nv2a_aspect_full_width(lo_x, hi_x, rt->w))
@@ -2428,6 +2385,16 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                                             rt->w == rt->h ? NV2A_MOVIE_BLACK
                                                            : nv2a_host_opts()->movie_mode)
                         : NV2A_PLACE_CENTRE;
+        if (nv2a_snap_2d_on(rt->n)) {
+            /* render.snap_2d: a centred 2D batch samples guest textures at
+             * its guest pixels' 1x points (nv2a_uv_snap), as setup_pixel. */
+            unsigned rt_mask = 0;
+            for (k = 0; k < 4; k++)
+                if (srcs[k])
+                    rt_mask |= 1u << k;
+            nv2a_ps_consts_snap(&mpc.b, s_stage, rt_mask, rt->n,
+                                nv2a_snap_flat2d(two_d && !vary_z, place));
+        }
         if (place != NV2A_PLACE_CENTRE)
             s_draws_stretch++;
         if (two_d && rt->pad && aspect_trace())

@@ -85,6 +85,8 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
     EMIT("%s", s_rc_helpers);
     if (state->rect_snap)
         EMIT("%s", D3D8_MSL_SNAP_UV);
+    if (state->rect_snap && state->snap_2d)
+        EMIT("%s", D3D8_MSL_SNAP_2D);
     for (i = 0; i < NV2A_MAX_TEXTURES; i++)
         if ((int)state->tex_mode[i] == NV2A_TEXMODE_CLIPPLANE) {
             EMIT("%s", D3D8_MSL_CLIP_KILLS);
@@ -162,17 +164,35 @@ int d3d8_combiners_generate_msl(const NV2ACombinerState *state,
                 /* As the HLSL: only true 2D stages divide by q. */
                 EMIT("        if (pc.tex_mode[%d] == 1u && i.t%d.w != 0.0 && i.t%d.w != 1.0)"
                      " uv /= i.t%d.w;\n", i, i, i, i);
-            if (state->rect_snap)
-                EMIT("        uv = nv2a_snap_uv(uv, i.pos.xy, pc.tex_scale[%d]);\n", i);
-            if (state->rt_offset)
-                /* hor+: tex_scale.w moves a centred batch's read into the
-                 * guest columns of a padded render target (0 elsewhere). */
-                EMIT("        x%d = tex%d.sample(samp%d, uv * pc.tex_scale[%d].xy"
-                     " + float2(pc.tex_scale[%d].w, 0.0), bias(pc.tex_bias[%d]));\n",
-                     8 + i, i, i, i, i, i);
-            else
-                EMIT("        x%d = tex%d.sample(samp%d, uv * pc.tex_scale[%d].xy,"
-                     " bias(pc.tex_bias[%d]));\n", 8 + i, i, i, i, i);
+            if (state->rect_snap && state->snap_2d) {
+                /* As the HLSL: a .z < 0 stage samples with the 1x
+                 * gradients. gradient2d takes no bias(), so the stage's
+                 * LOD bias scales the gradients by 2^bias instead. */
+                EMIT("        float4 g = nv2a_snap_grad(uv, pc.tex_scale[%d]) * pc.tex_scale[%d].xyxy"
+                     " * exp2(pc.tex_bias[%d]);\n", i, i, i);
+                EMIT("        uv = nv2a_snap_uv2d(uv, i.pos.xy, pc.tex_scale[%d]);\n", i);
+                if (state->rt_offset)
+                    EMIT("        uv = uv * pc.tex_scale[%d].xy + float2(pc.tex_scale[%d].w, 0.0);\n",
+                         i, i);
+                else
+                    EMIT("        uv *= pc.tex_scale[%d].xy;\n", i);
+                EMIT("        if (pc.tex_scale[%d].z < 0.0)"
+                     " x%d = tex%d.sample(samp%d, uv, gradient2d(g.xy, g.zw));\n"
+                     "        else x%d = tex%d.sample(samp%d, uv, bias(pc.tex_bias[%d]));\n",
+                     i, 8 + i, i, i, 8 + i, i, i, i);
+            } else {
+                if (state->rect_snap)
+                    EMIT("        uv = nv2a_snap_uv(uv, i.pos.xy, pc.tex_scale[%d]);\n", i);
+                if (state->rt_offset)
+                    /* hor+: tex_scale.w moves a centred batch's read into the
+                     * guest columns of a padded render target (0 elsewhere). */
+                    EMIT("        x%d = tex%d.sample(samp%d, uv * pc.tex_scale[%d].xy"
+                         " + float2(pc.tex_scale[%d].w, 0.0), bias(pc.tex_bias[%d]));\n",
+                         8 + i, i, i, i, i, i);
+                else
+                    EMIT("        x%d = tex%d.sample(samp%d, uv * pc.tex_scale[%d].xy,"
+                         " bias(pc.tex_bias[%d]));\n", 8 + i, i, i, i, i);
+            }
             EMIT("    }\n");
         }
         EMIT("    if (pc.alpha_only[%d] == 2u) x%d.a = 1.0;\n"

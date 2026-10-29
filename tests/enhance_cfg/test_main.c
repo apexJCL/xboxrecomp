@@ -1038,6 +1038,7 @@ static void enhance_reset_env(void)
     recomp_env_set(RENV_CONFIG, "none");
     recomp_env_set(RENV_RENDER_SCALE, NULL);
     recomp_env_set(RENV_RENDER_ANISO, NULL);
+    recomp_env_set(RENV_RENDER_SNAP_2D, NULL);
     recomp_env_set(RENV_DISPLAY_ASPECT, NULL);
     recomp_env_set(RENV_PRESENT_FILTER, NULL);
     recomp_env_set(RENV_PRESENT_FULLSCREEN, NULL);
@@ -1120,6 +1121,25 @@ static void test_enhance_init(void)
         out = capture_end();
         CHECK(strstr(out, "render.aniso=-1 out of range 0..16; using 0") != NULL);
         recomp_env_set(RENV_RENDER_ANISO, NULL);
+    }
+
+    /* render.snap_2d: off unless asked (the stock line does not name it),
+     * on from the environment, and named on the line then. */
+    {
+        const char *out;
+
+        capture_begin();
+        CHECK(xbox_enhance_init(".", NULL) == 0 && o->snap_2d == 0);
+        out = capture_end();
+        CHECK(strstr(out, "snap_2d") == NULL);
+        capture_begin();
+        recomp_env_set(RENV_RENDER_SNAP_2D, "1");
+        CHECK(xbox_enhance_init(".", NULL) == 0 && o->snap_2d == 1);
+        out = capture_end();
+        CHECK(strstr(out, " render.snap_2d=1") != NULL);
+        recomp_env_set(RENV_RENDER_SNAP_2D, "0");
+        CHECK(xbox_enhance_init(".", NULL) == 0 && o->snap_2d == 0);
+        recomp_env_set(RENV_RENDER_SNAP_2D, NULL);
     }
 
     /* A non-4:3 aspect is reported, nothing else changes. */

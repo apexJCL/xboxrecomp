@@ -69,6 +69,29 @@ extern "C" {
     "    return uv;\n" \
     "}\n"
 
+/** D3D8_HLSL_SNAP_2D (d3d8_hlsl.h) in MSL; pos is [[position]].xy. */
+#define D3D8_MSL_SNAP_2D \
+    "bool nv2a_snap_ok(float2 dx, float2 dy, float4 ts) {\n" \
+    "    float n = abs(ts.z), eps = 1.0 / 64.0;\n" \
+    "    return n > 1.0 && (ts.z < 0.0\n" \
+    "        ? abs(dx.y) <= abs(dx.x) * eps && abs(dy.x) <= abs(dy.y) * eps\n" \
+    "        : abs(dx.y) <= eps && abs(dy.x) <= eps\n" \
+    "          && abs(abs(dx.x) * n - 1.0) <= eps && abs(abs(dy.y) * n - 1.0) <= eps);\n" \
+    "}\n" \
+    "float2 nv2a_snap_uv2d(float2 uv, float2 pos, float4 ts) {\n" \
+    "    float2 dx = dfdx(uv), dy = dfdy(uv);\n" \
+    "    if (nv2a_snap_ok(dx, dy, ts)) {\n" \
+    "        float n = abs(ts.z);\n" \
+    "        float2 d = (floor(pos / n) + 0.5) * n - pos;\n" \
+    "        uv += dx * d.x + dy * d.y;\n" \
+    "    }\n" \
+    "    return uv;\n" \
+    "}\n" \
+    "float4 nv2a_snap_grad(float2 uv, float4 ts) {\n" \
+    "    float2 dx = dfdx(uv), dy = dfdy(uv);\n" \
+    "    return float4(dx, dy) * (nv2a_snap_ok(dx, dy, ts) ? abs(ts.z) : 1.0);\n" \
+    "}\n"
+
 /**
  * The vertex function `vs_main`:
  *

@@ -75,6 +75,7 @@ extern "C" {
     X(CONFIG,            CONFIG, "RECOMP_CONFIG",            "RECOMP_ENHANCE_CONFIG", "configuration: the user's config.toml (a path), or none for no file at all; default <root>/<title>/config.toml, <root>/config/config.toml; config.default.toml beside the executable is read under it") \
     X(RENDER_SCALE,      CONFIG, "RECOMP_RENDER_SCALE",      NULL, "enhancements: render.scale, internal resolution factor (1 = stock)") \
     X(RENDER_ANISO,      CONFIG, "RECOMP_RENDER_ANISO",      NULL, "enhancements: render.aniso, anisotropic filtering on mipmapped textures, 0/1 (stock) or 2..16") \
+    X(RENDER_SNAP_2D,    CONFIG, "RECOMP_RENDER_SNAP_2D",    NULL, "enhancements: render.snap_2d, above render.scale 1 2D batches sample textures on the guest grid, as at 1x (no seams between tiles, blockier 2D art) (1/0, default 0)") \
     X(DISPLAY_ASPECT,    CONFIG, "RECOMP_DISPLAY_ASPECT",    NULL, "enhancements: display.aspect, 4:3 (stock), 16:9, 16:10, 21:9") \
     X(DISPLAY_MOVIE,     CONFIG, "RECOMP_DISPLAY_MOVIE",     NULL, "enhancements: display.movie, the sides of a 4:3 movie or still on a wide display.aspect: black (default, pillarbox), fit (stretched to the width), fill (scaled to cover, top and bottom cropped)") \
     X(DISPLAY_OVERSCAN,  CONFIG, "RECOMP_DISPLAY_OVERSCAN",  NULL, "enhancements: display.overscan, guest px cropped from each side edge at present (top and bottom in proportion), 0 (stock) to 64; ignored with a wide display.aspect") \
@@ -283,7 +284,7 @@ extern "C" {
     X(FB_WINDOW_DUMP_EVERY, DEBUG, "fb_window_dump_every", "RECOMP_FB_WINDOW_DUMP_EVERY", "=n: window dump period") \
     X(WINDOW_SHOT,       DEBUG, "window_shot",     "RECOMP_WINDOW_SHOT",       "=flips: SDL window shots") \
     X(WINDOW_SHOT_PREFIX, DEBUG, "window_shot_prefix", "RECOMP_WINDOW_SHOT_PREFIX", "=prefix: window shot files") \
-    X(OPTS_AT,           DEBUG, "opts_at",         NULL,                       "=flip:key=value,...: live option requests at those flips, as the in-game menu makes them (scale, filter, fullscreen, aniso, movie, overscan, pacing)") \
+    X(OPTS_AT,           DEBUG, "opts_at",         NULL,                       "=flip:key=value,...: live option requests at those flips, as the in-game menu makes them (scale, filter, fullscreen, aniso, movie, overscan, snap_2d, pacing)") \
     X(TEX_DUMP,          DEBUG, "tex_dump",        "RECOMP_TEX_DUMP",          "=prefix: textures, first use") \
     X(TEX_DUMP_EVERY,    DEBUG, "tex_dump_every",  "RECOMP_TEX_DUMP_EVERY",    "=n: tex_dump every nth bind too") \
     X(VSH_DUMP,          DEBUG, "vsh_dump",        "RECOMP_VSH_DUMP",          "=prefix: vertex programs, raw, once each (every backend)") \

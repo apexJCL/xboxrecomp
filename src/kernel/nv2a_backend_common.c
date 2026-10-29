@@ -402,14 +402,25 @@ int nv2a_blend_constant(int enable, uint32_t sfactor, uint32_t dfactor,
     return 1;
 }
 
-unsigned nv2a_rect_snap_scale(const struct nv2a_stage *t, unsigned scale)
+float nv2a_uv_snap(const struct nv2a_stage *t, unsigned n, int flat2d)
 {
-    if (scale <= 1 || !t->mode || t->mode == 4
-            || nv2a_tex_size_from_format(t->color)
+    if (n <= 1 || !t->mode || t->mode == 4
             || !(nv2a_tex_filter_linear(t->filter, 0)
                  || nv2a_tex_filter_linear(t->filter, 1)))
-        return 0;
-    return scale;
+        return 0.0f;
+    if (flat2d)
+        return -(float)n;
+    return nv2a_tex_size_from_format(t->color) ? 0.0f : (float)n;
+}
+
+void nv2a_ps_consts_snap(struct nv2a_ps_consts *pc, const struct nv2a_stage st[4],
+                         unsigned rt_mask, unsigned n, int flat2d)
+{
+    int k;
+
+    for (k = 0; k < 4; k++)
+        if (!(rt_mask >> k & 1u))
+            pc->tex_scale[k][2] = nv2a_uv_snap(&st[k], n, flat2d);
 }
 
 void nv2a_ps_consts_fill(const struct nv2a_pb_vsh *v,
@@ -425,7 +436,7 @@ void nv2a_ps_consts_fill(const struct nv2a_pb_vsh *v,
         pc->tex_mode[n] = (uint32_t)t->mode;
         pc->tex_scale[n][0] = scaled || !t->width ? 1.0f : 1.0f / (float)t->width;
         pc->tex_scale[n][1] = scaled || !t->height ? 1.0f : 1.0f / (float)t->height;
-        pc->tex_scale[n][2] = (float)nv2a_rect_snap_scale(t, nv2a_host_render_scale());
+        pc->tex_scale[n][2] = nv2a_uv_snap(t, nv2a_host_render_scale(), 0);
         memcpy(pc->bump[n], t->bump, sizeof pc->bump[n]);
         pc->bumpls[n][0] = t->bump_scale;
         pc->bumpls[n][1] = t->bump_offset;
@@ -1012,6 +1023,8 @@ void nv2a_host_opts_request(const struct nv2a_host_opts *o, unsigned mask)
         s_req_opts.movie_mode = o->movie_mode;
     if (mask & NV2A_OPT_OVERSCAN)
         s_req_opts.overscan = o->overscan;
+    if (mask & NV2A_OPT_SNAP2D)
+        s_req_opts.snap_2d = o->snap_2d;
     s_req_mask |= mask;
     req_unlock();
     atomic_store_explicit(&s_req_pending, 1u, memory_order_release);
@@ -1078,6 +1091,10 @@ unsigned nv2a_host_opts_apply(void)
             s_host_opts.overscan = ov;
             changed |= NV2A_OPT_OVERSCAN;
         }
+    }
+    if ((mask & NV2A_OPT_SNAP2D) && !r.snap_2d != !s_host_opts.snap_2d) {
+        s_host_opts.snap_2d = r.snap_2d != 0;
+        changed |= NV2A_OPT_SNAP2D;
     }
     if (changed)
         atomic_fetch_add_explicit(&s_opts_gen, 1u, memory_order_release);

@@ -14,8 +14,8 @@ static void good_entries(void)
 {
     int n = nv2a_opts_at_parse("600:aniso=16,700:filter=integer,800:fullscreen=1,"
                                "900:movie=fill,1000:overscan=24,1100:pacing=sleep,"
-                               "1200:scale=3", e);
-    CHECK(n == 7);
+                               "1200:scale=3,1300:snap_2d=1", e);
+    CHECK(n == 8);
     CHECK(e[0].flip == 600 && e[0].mask == NV2A_OPT_ANISO && e[0].o.aniso == 16);
     CHECK(e[1].mask == NV2A_OPT_FILTER && e[1].o.present_filter == NV2A_PRESENT_INTEGER);
     CHECK(e[2].mask == NV2A_OPT_FULLSCREEN && e[2].o.fullscreen == 1);
@@ -23,6 +23,7 @@ static void good_entries(void)
     CHECK(e[4].mask == NV2A_OPT_OVERSCAN && e[4].o.overscan == 24);
     CHECK(e[5].mask == 0 && e[5].pacing == 1);
     CHECK(e[6].mask == NV2A_OPT_SCALE && e[6].o.render_scale == 3);
+    CHECK(e[7].mask == NV2A_OPT_SNAP2D && e[7].o.snap_2d == 1);
     CHECK(e[0].pacing == -1);
     CHECK(nv2a_opts_at_parse(NULL, e) == 0);
     CHECK(nv2a_opts_at_parse("", e) == 0);
@@ -35,7 +36,7 @@ static void bad_entries(void)
         "x:aniso=4", "-1:aniso=4", ":aniso=4", "12a:aniso=4",  /* flip */
         "10:zoom=2", "10:=2", "10aniso=2", "10:aniso",         /* key */
         "10:aniso=", "10:filter=", "10:aniso=4x",              /* value */
-        "10:filter=bilinear", "10:movie=stretch", "10:pacing=nap",
+        "10:filter=bilinear", "10:movie=stretch", "10:pacing=nap", "10:snap_2d=on",
     };
     char buf[64];
     for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {

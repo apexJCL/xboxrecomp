@@ -22,6 +22,9 @@
  *              held ends the chain, and is drawn whole on its own
  *   aspect     with display.aspect set (Hor+ places each batch from its
  *              own vertices) nothing is merged
+ *   snap       with render.snap_2d on above scale 1 (it classes each
+ *              batch from its own vertices) nothing is merged; at scale
+ *              1, where the snap is off, batches merge as stock
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -233,6 +236,32 @@ int main(void)
     batch(NV_PRIM_TRIANGLE_STRIP, 4, 3);
     M(BLEND, 0);
     check("aspect: Hor+ draws every batch on its own", s_draws == 2
+          && draw_is(0, NV_PRIM_TRIANGLE_STRIP, strip4, 4));
+
+    {
+        struct nv2a_host_opts o = *nv2a_host_opts();
+        o.aspect_w = 0;
+        o.aspect_h = 0;
+        o.snap_2d = 1;
+        o.render_scale = 1;
+        nv2a_host_opts_set(&o);
+    }
+    s_draws = 0;
+    batch(NV_PRIM_TRIANGLE_STRIP, 0, 4);
+    batch(NV_PRIM_TRIANGLE_STRIP, 4, 3);
+    M(BLEND, 0);
+    check("snap: at scale 1 the snap is off and the strips merge", s_draws == 1
+          && s_draw[0].prim == NV_PRIM_TRIANGLES);
+    {
+        struct nv2a_host_opts o = *nv2a_host_opts();
+        o.render_scale = 2;
+        nv2a_host_opts_set(&o);
+    }
+    s_draws = 0;
+    batch(NV_PRIM_TRIANGLE_STRIP, 0, 4);
+    batch(NV_PRIM_TRIANGLE_STRIP, 4, 3);
+    M(BLEND, 0);
+    check("snap: render.snap_2d above scale 1 draws every batch on its own", s_draws == 2
           && draw_is(0, NV_PRIM_TRIANGLE_STRIP, strip4, 4));
 
     if (s_fail) {

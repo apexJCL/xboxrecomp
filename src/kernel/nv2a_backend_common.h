@@ -1079,7 +1079,7 @@ struct nv2a_ps_consts {
     uint32_t alpha_test_enable, fog_enable;
     uint32_t alpha_only[4];     /* 1: rgb reads 1 (A8); 2: alpha reads 1 (no alpha) */
     float    tex_scale[4][4];   /* xy: texcoord multiplier (1/size for linear);
-                                 * z: nv2a_rect_snap_scale, 0 for none;
+                                 * z: nv2a_uv_snap (n, -n for 2D), 0 for none;
                                  * w: hor+ x offset into a padded target
                                  * (rt_offset), 0 otherwise */
     uint32_t tex_mode[4];       /* stage texture-shader mode, 0 = none */
@@ -1102,15 +1102,29 @@ struct nv2a_ps_consts {
     uint32_t clip_mode[4];
 };
 
-/* tex_scale[n].z for stage t at render scale `scale`: the scale when the
- * shaders' nv2a_snap_uv may move a host pixel's sample to its guest pixel's
- * 1x sample point, else 0. Only a sampled (mode not 0 or 4), linear-format
- * (coordinates in texels), bilinear-filtered stage at scale > 1: there the
- * N host pixels of a guest pixel sample between texel centres and, at a
- * rect texture's last row and column, blend in the padding past the
- * picture. A point-filtered stage reads one texel and never bleeds. The
- * shader still checks that the mapping is a unity blit. */
-unsigned nv2a_rect_snap_scale(const struct nv2a_stage *t, unsigned scale);
+/* tex_scale[n].z for stage t drawn at render scale n: 0 when the shaders'
+ * nv2a_snap_uv leave the sample at the host pixel, else how they move it to
+ * its guest pixel's 1x sample point. Only a sampled (mode not 0 or 4),
+ * bilinear-filtered stage at n > 1: there the N host pixels of a guest
+ * pixel sample between texel centres, and near a picture's edge bilinear
+ * blends in what lies past it -- a rect texture's padding, or through WRAP
+ * the far edge of a tile (BLiNX 2's loading screen, swizzled DXT1 quads:
+ * a light line at each tile edge). A point-filtered stage reads
+ * one texel and never bleeds.
+ *   flat2d 0 (a 3D batch, or a 2D one off the guest grid): n for a
+ *   linear-format stage (coordinates in texels), whose shader test also
+ *   asks for a unity blit; 0 for any other, so textured 3D surfaces keep
+ *   their scaled detail.
+ *   flat2d 1 (nv2a_snap_flat2d): -n for any format; the shader then asks
+ *   only for an axis-aligned mapping (magnified or minified tiles, a
+ *   constant u or v), and the batch samples exactly as it does at 1x. */
+float nv2a_uv_snap(const struct nv2a_stage *t, unsigned n, int flat2d);
+
+/* Every stage's .z (nv2a_uv_snap at n, the target's render scale) but the
+ * render-target ones (rt_mask bit k): their texels are at host scale
+ * already, and nv2a_ps_consts_rt leaves them 0. */
+void nv2a_ps_consts_snap(struct nv2a_ps_consts *pc, const struct nv2a_stage st[4],
+                         unsigned rt_mask, unsigned n, int flat2d);
 
 /* Fill pc from the combiner registers and the four stages. A stage that
  * samples a render target instead of guest memory is then corrected with
@@ -1412,6 +1426,8 @@ struct nv2a_host_opts {
     int      movie_mode;        /* enum nv2a_movie_mode: display.movie */
     unsigned overscan;          /* display.overscan: guest px cropped from each
                                  * side edge at present, 0 = stock (nv2a_present_crop) */
+    int      snap_2d;           /* render.snap_2d: above scale 1, 2D batches sample
+                                 * on the guest grid (nv2a_snap_flat2d); 0 = off */
 };
 
 /* pack_off bits: the whole pack, or one kind of entry (nv2a_tex_pack.h). */
@@ -1423,7 +1439,8 @@ struct nv2a_host_opts {
 /* Field masks for nv2a_host_opts_request / _apply. ANISO, MOVIE and
  * OVERSCAN need nothing from a backend at the flip: the samplers are keyed
  * on the aniso value, the movie placement is read at each movie draw and the
- * crop at each present, so the stored value is the whole change. */
+ * crop at each present, so the stored value is the whole change. SNAP2D
+ * is read at each draw (nv2a_snap_flat2d) the same way. */
 #define NV2A_OPT_SCALE      0x1u
 #define NV2A_OPT_FILTER     0x2u
 #define NV2A_OPT_FULLSCREEN 0x4u
@@ -1431,6 +1448,7 @@ struct nv2a_host_opts {
 #define NV2A_OPT_ANISO      0x10u
 #define NV2A_OPT_MOVIE      0x20u
 #define NV2A_OPT_OVERSCAN   0x40u
+#define NV2A_OPT_SNAP2D     0x80u
 /* display.overscan's range (enhance.c clamps the key to it): 10% of a
  * 640-wide frame a side, past any TV's overscan. */
 #define NV2A_OVERSCAN_MAX   64u
@@ -1572,6 +1590,31 @@ static inline int nv2a_aspect_place(int two_d, int full_w, int guest_tex, int fl
          : movie_mode == NV2A_MOVIE_FILL ? NV2A_PLACE_COVER : NV2A_PLACE_CENTRE;
 }
 
+/* Whether a batch's stages take nv2a_uv_snap's 2D form: the batch is 2D
+ * (pass-through, or a program on one screen layer, nv2a_aspect_scan), so
+ * its mapping is affine and textured 3D is left alone, and it is centred,
+ * so host pixel p lies in guest pixel floor(p / n): the hor+ offset is the
+ * pad, a whole number of guest pixels. A stretch or cover maps guest
+ * pixels to fractional host spans, where there is no 1x point to snap to.
+ * The backends pass two_d 0 for a program batch whose vertices do not
+ * share one oPos.z (nv2a_aspect_gate's vary_z). */
+static inline int nv2a_snap_flat2d(int two_d, int place)
+{
+    return two_d == 1 && place == NV2A_PLACE_CENTRE;
+}
+
+/* Whether a target drawn at render scale n gets the 2D snap at all:
+ * render.snap_2d (default off) above scale 1. Off, the backends neither
+ * scan for 2D batches without hor+ nor touch tex_scale.z, so every scale
+ * draws as it did before the 2D form: only the movie-style unity blits
+ * snap (nv2a_uv_snap with flat2d 0). The snap trades host-rate smoothing
+ * of magnified 2D art for 1x-exact edges (no seams between WRAP tiles):
+ * a player choice, toggled live from the menu. */
+static inline int nv2a_snap_2d_on(unsigned n)
+{
+    return n > 1 && nv2a_host_opts()->snap_2d;
+}
+
 /* Hor+: how a batch that is not stretched reads a padded render target.
  * The target's guest columns sit pad in from the left of w + 2 pad, so a
  * read at u (0..1 over the stock target) is taken to u * scale + off. A
@@ -1614,6 +1657,12 @@ static inline int nv2a_rt_stretch_read(uint32_t w, uint32_t h, uint32_t pad, flo
 struct nv2a_aspect_gate {
     int      two_d;
     uint32_t n;
+    /* After a scan that returned 1: the scanned vertices did not share one
+     * oPos.z. Hor+ ignores it; render.snap_2d leaves such a batch alone
+     * (nv2a_snap_flat2d), since an orthographic 3D mesh (a menu model at
+     * w 1) is on one layer too, and snapping only its axis-aligned faces
+     * would mix snapped and smooth faces in one mesh. */
+    int      vary_z;
 };
 
 /* Run a program batch's vertices through the interpreter (nv2a_vsh_run) if
