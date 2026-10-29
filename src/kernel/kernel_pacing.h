@@ -94,8 +94,12 @@ typedef struct {
     /* Loops that left on a signal (or at once) or on the timeout; a loop's
      * exit is counted when its thread next waits, more than 0.5 ms later. */
     long exit_wake, exit_timeout;
+    /* At spin pacing: passes the macro made for a waiting guest thread, and
+     * how many of them handed the guest CPU over. */
+    long spin_passes, spin_yields;
 } XboxSpinSiteStats;
-/* Copy the site's counters since the last reset; 0 if the site never ran. */
+/* Copy the site's counters since the last reset; 0 if the site never waited
+ * or made a spin pass. */
 int  xbox_SpinSiteStats(uint32_t va, XboxSpinSiteStats *out);
 void xbox_SpinStatsReset(void);
 

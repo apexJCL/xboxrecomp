@@ -231,7 +231,6 @@ static void exclusion(void)
 /* ── A spin on another guest thread's flag ────────────────────────── */
 
 static volatile LONG s_flag, s_setter_ran;
-static volatile LONG s_waiters_seen;
 
 static DWORD WINAPI setter_thread(LPVOID p)
 {
@@ -248,9 +247,11 @@ static void spin_on_flag(void)
     HANDLE t;
     uint64_t t0;
     XboxGuestCpuStats st;
+    XboxSpinSiteStats site = {0};
 
     set_lock("1");
     s_flag = s_setter_ran = 0;
+    xbox_SpinStatsReset();
     xbox_GuestCpuStatsGet(&st, 1);
     xbox_GuestCpuJoin();
     t = CreateThread(NULL, 0, setter_thread, NULL, 0, NULL);
@@ -259,8 +260,6 @@ static void spin_on_flag(void)
      * thread, and that pass hands the CPU over. */
     t0 = xbox_HostNowNs();
     while (!s_flag) {
-        if (g_xbox_guest_cpu_waiters)
-            s_waiters_seen = 1;
         RECOMP_SPIN_WAIT(0x00060475u);
         if (xbox_HostNowNs() - t0 > 10000000000ull)
             break;
@@ -269,10 +268,17 @@ static void spin_on_flag(void)
      * closed one is the spinner's first (thread creation inside it), ended
      * at the yield; the setter's lasted two stores. */
     xbox_GuestCpuStatsGet(&st, 0);
+    xbox_SpinSiteStats(0x00060475u, &site);
     check(s_flag == 1 && s_setter_ran,
           "spin: the loop ended because its pass yielded to the setter");
     check(xbox_GuestCpuHeld(), "spin: the spinner has the CPU back");
-    check(s_waiters_seen, "spin: the macro saw the waiter");
+    /* The site's own record, not a sample of the waiter count in the loop:
+     * the setter may queue between such a sample and the macro's read, and
+     * then the first pass yields with the sample still 0. The site counts a
+     * spin pass where the wait itself read a waiter, and a yield where that
+     * pass handed the CPU over. */
+    check(site.spin_passes >= 1 && site.spin_yields >= 1,
+          "spin: the macro saw the waiter and its pass yielded");
     check(st.yields >= 1 && st.turns >= 2, "spin: one yield, two turns closed");
     check(st.max_turn_kind != XBOX_GUEST_CPU_SPIN || st.max_turn_where == 0x00060475u,
           "spin: a hold ended at a yield names the lowered loop's VA");

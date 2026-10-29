@@ -301,7 +301,7 @@ int xbox_SpinSiteStats(uint32_t va, XboxSpinSiteStats *out)
 
     for (i = 0; i <= SITE_SLOTS; i++) {
         SpinSite *s = &s_sites[i];
-        if (s->va != (LONG)va || !s->waits)
+        if (s->va != (LONG)va || !(s->waits || s->spin_passes))
             continue;
         out->va = va;
         out->waits = s->waits;
@@ -311,6 +311,8 @@ int xbox_SpinSiteStats(uint32_t va, XboxSpinSiteStats *out)
         out->dispatch = s->dispatch;
         out->exit_wake = s->exit_wake;
         out->exit_timeout = s->exit_timeout;
+        out->spin_passes = s->spin_passes;
+        out->spin_yields = s->spin_yields;
         return 1;
     }
     return 0;
