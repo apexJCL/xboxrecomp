@@ -154,7 +154,7 @@ extern "C" {
     X(PRESENT_TRACE,     TRACE, "present",         "RECOMP_PRESENT_TRACE",     "present-surface choices") \
     X(PRESENT_STATS,     TRACE, "present_stats",   "RECOMP_PRESENT_STATS",     "SDL host present statistics") \
     X(METAL_PROF,        TRACE, "metal_prof",      NULL,                       "Metal flip cost every 300 flips: GPU wait, readbacks, write-back, slot blit, hand-off, GPU time") \
-    X(METAL_TRACE,       TRACE, "metal",           NULL,                       "Metal render-target events: each decode sync and stale drop, with target, texture and flip") \
+    X(METAL_TRACE,       TRACE, "metal",           NULL,                       "Metal render-target events: each decode sync and stale drop, with target, texture and flip; each new pitch-alias pair once") \
     X(METAL_SHADERS,     TRACE, "metal_shaders",   NULL,                       "Metal shader and pipeline builds: each MSL library and pipeline state with its ms, and a [metal] build line for every flip that built one or uploaded textures for 5 ms or more") \
     X(VSH_TRACE,         TRACE, "vsh",             "RECOMP_VSH_TRACE",         "vertex programs and their batches") \
     X(ASPECT_TRACE,      TRACE, "aspect",          NULL,                       "display.aspect: the 2D batches of each vertex program, texture and placement, once each ([aspect.program]), and the padded target per flip") \

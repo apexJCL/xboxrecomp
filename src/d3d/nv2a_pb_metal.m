@@ -277,6 +277,9 @@ static struct {
  * nothing is open (a GET_REPORT commit may still be running). */
 static id<MTLCommandBuffer> s_last_cmd;
 static uint64_t s_decode_syncs;
+static uint64_t s_pitch_alias_binds;   /* binds over a dirty target nv2a_rt_pitch_alias
+                                          * decoded without a write-back */
+static struct nv2a_pair_set s_pitch_alias_seen;   /* its RENV_METAL_TRACE pairs */
 
 static uint64_t prof_now(void)
 {
@@ -1426,6 +1429,24 @@ static id<MTLTexture> tex_bind(const Stage *t)
                     && lo < rlo + rt->pitch * rt->h && rlo < hi) {
                 if (rt_drop_if_stale(rt, "sync"))
                     continue;
+                /* A linear read at a narrower pitch than the target's
+                 * restacks the target's rows, no picture of it on the
+                 * console either: decode the guest bytes as they stand, as
+                 * D3D11 does. KUF's front end reads its XDK supersample
+                 * backbuffer through a half-pitch header every flip, and
+                 * the write-back was a 4.9 MB readback per flip at scale 1. */
+                if (nv2a_rt_pitch_alias(t->color, t->pitch, t->height, rt->fmt, rt->pitch)) {
+                    s_pitch_alias_binds++;
+                    if (recomp_env(RENV_METAL_TRACE)
+                            && nv2a_pair_new(&s_pitch_alias_seen, rt->fmt, rt->pitch, t->color,
+                                             t->pitch))
+                        fprintf(stderr, LOGP "pitch alias: target 0x%08X fmt 0x%X pitch %u,"
+                                " texture 0x%08X fmt 0x%02X %ux%u pitch %u decoded without"
+                                " a write-back, flip %llu\n",
+                                rt->offset, rt->fmt, rt->pitch, t->offset, t->color, t->width,
+                                t->height, t->pitch, (unsigned long long)s_presents);
+                    continue;
+                }
                 s_decode_syncs++;
                 if (recomp_env(RENV_METAL_TRACE))
                     fprintf(stderr, LOGP "decode sync: target 0x%08X %ux%u (%u bytes) for"
@@ -3294,7 +3315,7 @@ static void flip_log(uint32_t surface_offset, RenderTarget *rt)
 
 static void prof_flip_end(uint64_t t_flip0)
 {
-    static uint64_t p_wb, p_ds;
+    static uint64_t p_wb, p_ds, p_pa;
     int i;
     if (!prof_on())
         return;
@@ -3314,16 +3335,18 @@ static void prof_flip_end(uint64_t t_flip0)
         double n = (double)s_pa.n;
         fprintf(stderr, LOGP "prof %llu flips: on_flip %.3f ms = wait %.3f + hostrb %.3f"
                 " + wb %.3f + winrb %.3f + winpush %.3f + blit %.3f (+rest); gpu %.3f ms"
-                " over %.1f cmd buffers/flip; %llu write-backs, %llu decode syncs;"
-                " rt ownership hashes %.3f ms/flip\n",
+                " over %.1f cmd buffers/flip; %llu write-backs, %llu decode syncs,"
+                " %llu pitch-alias binds; rt ownership hashes %.3f ms/flip\n",
                 (unsigned long long)s_presents,
                 s_pa.flip / n / 1e6, s_pa.wait / n / 1e6, s_pa.hostrb / n / 1e6,
                 s_pa.wb / n / 1e6, s_pa.winrb / n / 1e6, s_pa.winpush / n / 1e6,
                 s_pa.blit / n / 1e6, s_pa.gpu / n / 1e6, s_pa.ncmd / n,
                 (unsigned long long)(s_writebacks - p_wb),
-                (unsigned long long)(s_decode_syncs - p_ds), s_pa.hash / n / 1e6);
+                (unsigned long long)(s_decode_syncs - p_ds),
+                (unsigned long long)(s_pitch_alias_binds - p_pa), s_pa.hash / n / 1e6);
         p_wb = s_writebacks;
         p_ds = s_decode_syncs;
+        p_pa = s_pitch_alias_binds;
         memset(&s_pa, 0, sizeof s_pa);
     }
 }
@@ -3470,8 +3493,8 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
         fprintf(stderr, LOGP "present #%llu: surface 0x%08X (%s), %llu clears,"
                 " %llu draws (%llu vertex-program), %llu skipped, %llu culled,"
                 " %llu texture uploads, %llu rehashes, %llu write-backs (%s),"
-                " %llu decode syncs, %llu stale drops, %llu evictions lost, %llu grows,"
-                " %llu partial clears;"
+                " %llu decode syncs, %llu pitch-alias binds, %llu stale drops,"
+                " %llu evictions lost, %llu grows, %llu partial clears;"
                 " shaders %llu vs + %llu fs, %llu compile errors;"
                 " %llu z-clears, %llu depth draws, %llu rt binds (%llu self copies);"
                 " %llu window presents (%s); %llu flushes,"
@@ -3483,8 +3506,9 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_draws_culled,
                 (unsigned long long)s_tex_uploads, (unsigned long long)s_tex_rehash,
                 (unsigned long long)s_writebacks, always ? "always" : "lazy",
-                (unsigned long long)s_decode_syncs, (unsigned long long)s_stale_drops,
-                (unsigned long long)s_evict_lost, (unsigned long long)s_grows,
+                (unsigned long long)s_decode_syncs, (unsigned long long)s_pitch_alias_binds,
+                (unsigned long long)s_stale_drops, (unsigned long long)s_evict_lost,
+                (unsigned long long)s_grows,
                 (unsigned long long)s_partial_clears,
                 (unsigned long long)s_vs_compiled, (unsigned long long)s_fs_compiled,
                 (unsigned long long)s_compile_errors,

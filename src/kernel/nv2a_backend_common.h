@@ -311,27 +311,65 @@ static inline int nv2a_rt_tex_reads(uint32_t color, uint32_t tex_pitch, uint32_t
     }
 }
 
-/* Whether this (target format, target pitch, texture format, texture pitch)
- * is new to the caller's trace of reads nv2a_rt_tex_reads rejects, so each
- * distinct pair is said once. A small open-addressed set per translation
- * unit; full, it says nothing more. */
+/* Whether a texture over a dirty render target's memory that the target
+ * cannot serve (nv2a_rt_tex_reads said no) decodes guest memory as it
+ * stands instead of having the target written back first: a linear read of
+ * a linear target, more than one row tall, at a narrower pitch than the
+ * target's. Each texture row is then a slice of a target row and the next
+ * texture row starts partway along the same target row, so the texels are
+ * the target's rows cut up and restacked: on the console too that is no
+ * picture of the target, and a write-back would only make the decode exact
+ * for bytes no picture depends on. Kingdom Under Fire's front end reads its
+ * 1280x960 pitch-5120 XDK supersample backbuffer through a 640x480
+ * pitch-2560 header into a 256x256 copy it never samples; the
+ * write-back of the whole target cost one readback per flip, worse at each
+ * render scale. A wider pitch keeps the write-back: at k times the target's
+ * pitch each texture row is a whole target row, so the texture is the
+ * target's picture with rows skipped (a field read). So do a one-row read
+ * (a span of one target row), same-pitch, swizzled and DXT reads. */
+static inline int nv2a_rt_pitch_alias(uint32_t color, uint32_t tex_pitch, uint32_t tex_height,
+                                      uint32_t rt_fmt, uint32_t rt_pitch)
+{
+    int rt_swizzled = ((rt_fmt >> 8) & 0xFu) == 2u;   /* SURFACE_FORMAT type */
+
+    return !rt_swizzled && !d3d8_format_is_swizzled(color) && !d3d8_format_dxt_block_bytes(color)
+           && tex_pitch && tex_pitch < rt_pitch && tex_height > 1;
+}
+
+/* Whether a (target format, target pitch, texture format, texture pitch)
+ * key is new to one trace's seen-set, so a trace says each distinct pair
+ * once. A small open-addressed set (NV2A_PAIR_SET slots, the caller's);
+ * half full, it says nothing more. */
+enum { NV2A_PAIR_SET = 256 };
+struct nv2a_pair_set {
+    uint64_t key[NV2A_PAIR_SET];
+    unsigned used;
+};
+
+static inline int nv2a_pair_new(struct nv2a_pair_set *s, uint32_t rt_fmt, uint32_t rt_pitch,
+                                uint32_t color, uint32_t tex_pitch)
+{
+    uint64_t key = (((uint64_t)rt_fmt << 32 | rt_pitch) * 0x9E3779B97F4A7C15ull
+                    ^ ((uint64_t)color << 32 | tex_pitch)) | 1u;
+    unsigned h = (unsigned)(key >> 56) & (NV2A_PAIR_SET - 1u);
+
+    while (s->key[h] && s->key[h] != key)
+        h = (h + 1u) & (NV2A_PAIR_SET - 1u);
+    if (s->key[h] || s->used >= NV2A_PAIR_SET / 2u)
+        return 0;
+    s->key[h] = key;
+    s->used++;
+    return 1;
+}
+
+/* Whether this pair is new to the caller's trace of reads nv2a_rt_tex_reads
+ * rejects. One set per translation unit. */
 static inline int nv2a_rt_reject_new(uint32_t rt_fmt, uint32_t rt_pitch, uint32_t color,
                                      uint32_t tex_pitch)
 {
-    enum { SET = 256 };
-    static uint64_t set[SET];
-    static unsigned used;
-    uint64_t key = (((uint64_t)rt_fmt << 32 | rt_pitch) * 0x9E3779B97F4A7C15ull
-                    ^ ((uint64_t)color << 32 | tex_pitch)) | 1u;
-    unsigned h = (unsigned)(key >> 56) & (SET - 1u);
+    static struct nv2a_pair_set set;
 
-    while (set[h] && set[h] != key)
-        h = (h + 1u) & (SET - 1u);
-    if (set[h] || used >= SET / 2u)
-        return 0;
-    set[h] = key;
-    used++;
-    return 1;
+    return nv2a_pair_new(&set, rt_fmt, rt_pitch, color, tex_pitch);
 }
 
 /* A swizzled surface's side from its SURFACE_FORMAT log2 field, at most

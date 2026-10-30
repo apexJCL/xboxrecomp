@@ -364,6 +364,39 @@ int main(void)
         CHECK(!nv2a_rt_tex_reads(0x11, 1280, 0x103, 640));   /* another pitch */
         CHECK(!nv2a_rt_tex_reads(0x0C, 0, 0x208, 2560));     /* DXT1 */
         CHECK(!nv2a_rt_tex_reads(0x0B, 0, 0x209, 640));      /* P8 */
+        /* Which rejected reads skip the target's write-back: KUF's front end
+         * reads its 1280x960 pitch-5120 A8R8G8B8 backbuffer as a 640x480
+         * pitch-2560 LIN_A8R8G8B8. */
+        CHECK(nv2a_rt_pitch_alias(0x12, 2560, 480, 0x108, 5120));
+        CHECK(nv2a_rt_pitch_alias(0x11, 640, 480, 0x108, 2560));    /* 32-bit target as 16-bit */
+        CHECK(nv2a_rt_pitch_alias(0x11, 320, 2, 0x103, 640));       /* two rows is enough */
+        /* A wider pitch is the target's picture with rows skipped (a field
+         * read at twice the pitch), and one row is a span of one target
+         * row: both keep the write-back. */
+        CHECK(!nv2a_rt_pitch_alias(0x12, 10240, 480, 0x108, 5120));
+        CHECK(!nv2a_rt_pitch_alias(0x11, 1280, 240, 0x103, 640));
+        CHECK(!nv2a_rt_pitch_alias(0x12, 2560, 1, 0x108, 5120));
+        CHECK(!nv2a_rt_pitch_alias(0x12, 2560, 0, 0x108, 5120));
+        CHECK(!nv2a_rt_pitch_alias(0x12, 2560, 480, 0x108, 2560));  /* same pitch: write back */
+        CHECK(!nv2a_rt_pitch_alias(0x11, 640, 480, 0x101, 640));    /* same pitch, other format */
+        /* Swizzled and DXT reads keep it whatever their pitch. */
+        CHECK(!nv2a_rt_pitch_alias(0x05, 0, 256, 0x203, 640));      /* swizzled read and target */
+        CHECK(!nv2a_rt_pitch_alias(0x05, 1280, 240, 0x103, 640));   /* swizzled read, linear target */
+        CHECK(!nv2a_rt_pitch_alias(0x05, 320, 240, 0x103, 640));
+        CHECK(!nv2a_rt_pitch_alias(0x11, 320, 240, 0x203, 640));    /* linear read, swizzled target */
+        CHECK(!nv2a_rt_pitch_alias(0x0C, 1280, 256, 0x108, 2560));  /* DXT1 */
+        CHECK(!nv2a_rt_pitch_alias(0x0E, 1280, 256, 0x108, 2560));  /* DXT3 */
+        CHECK(!nv2a_rt_pitch_alias(0x0F, 1280, 256, 0x108, 2560));  /* DXT5 */
+        CHECK(!nv2a_rt_pitch_alias(0x12, 0, 480, 0x108, 2560));     /* no pitch */
+        CHECK(!nv2a_rt_pitch_alias(0x12, 2560, 480, 0x108, 0));
+        /* The pitch-alias trace keeps its own seen-set, apart from the
+         * reject trace's below. */
+        {
+            static struct nv2a_pair_set seen;
+            CHECK(nv2a_pair_new(&seen, 0x108, 5120, 0x12, 2560)
+                  && !nv2a_pair_new(&seen, 0x108, 5120, 0x12, 2560)
+                  && nv2a_pair_new(&seen, 0x103, 640, 0x1C, 640));
+        }
         /* The reject trace says each distinct pair once. */
         CHECK(nv2a_rt_reject_new(0x103, 640, 0x1C, 640) && !nv2a_rt_reject_new(0x103, 640, 0x1C, 640)
               && nv2a_rt_reject_new(0x103, 640, 0x1C, 1280));
