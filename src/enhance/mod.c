@@ -23,6 +23,7 @@
 #include "enhance_menu.h"
 #include "recomp_cfg.h"
 #include "recomp_exit_hook.h"
+#include "recomp_hook_mod.h"
 #include "xbox_memory_layout.h"
 
 #define LOGP "[MOD] "
@@ -128,6 +129,22 @@ static int s_exit_hooked;
 
 static struct xbox_mod_api s_api;
 
+/* The [ENHANCE] mods= token (D9, 4.9). s_active: -1 while a mod never
+ * called api->active, else its last 0/1 (any thread). s_follows_on: its
+ * follows key differs from that key's default, read once at init.
+ * s_token: the listed table indices as last printed. */
+static int s_active[MOD_MAX];
+static int s_follows_on[MOD_MAX];
+static uint64_t s_token;
+
+/* A mod's hooks go through these, so api.mem is set before the mod's
+ * callback reads an argument: a hooked call can come before the first
+ * frame. */
+#define MOD_HOOK_MAX 64
+struct mod_hook { xbox_mod_hook_fn pre, post; void *user; int owner; };
+static struct mod_hook s_hooks[MOD_HOOK_MAX];
+static int s_nhooks;
+
 static void api_log(const struct xbox_mod *m, const char *fmt, ...)
 {
     va_list ap;
@@ -215,6 +232,74 @@ static int api_on_enable(void (*fn)(int on, void *user), void *user)
     return 1;
 }
 
+static void mod_mem(void);
+
+/* A hook runs while its mod does: on, or on until a restart. Inited
+ * dormant or switched off live, it is left out of the call. */
+static int hook_owner_on(int i)
+{
+    enum xbox_mod_state st = __atomic_load_n(&s_state[i], __ATOMIC_RELAXED);
+    if (st == XBOX_MOD_ON)
+        return 1;
+    return st == XBOX_MOD_RESTART && s_mod[i].start == XBOX_MOD_ON;
+}
+
+static void hook_pre(struct xbox_mod_call *c, void *user)
+{
+    const struct mod_hook *h = user;
+    if (!hook_owner_on(h->owner))
+        return;
+    mod_mem();
+    h->pre(c, h->user);
+}
+
+static void hook_post(struct xbox_mod_call *c, void *user)
+{
+    const struct mod_hook *h = user;
+    if (!hook_owner_on(h->owner))
+        return;
+    mod_mem();
+    h->post(c, h->user);
+}
+
+static int api_hook(uint32_t va, xbox_mod_hook_fn pre, xbox_mod_hook_fn post,
+                    uint32_t flags, void *user)
+{
+    int i = s_init_owner;
+    const char *name;
+    struct mod_hook *h;
+
+    if (i < 0 || i >= MOD_MAX) {
+        fprintf(stderr, LOGP "hook 0x%08X: hooks are taken only during init\n", (unsigned)va);
+        return 0;
+    }
+    name = s_table[i]->name ? s_table[i]->name : "?";
+    if (s_nhooks >= MOD_HOOK_MAX) {
+        fprintf(stderr, "[MOD %s] hook 0x%08X: refused, the hooks are full\n", name,
+                (unsigned)va);
+        return 0;
+    }
+    h = &s_hooks[s_nhooks];
+    h->pre = pre;
+    h->post = post;
+    h->user = user;
+    h->owner = i;
+    if (!recomp_hook_add(&s_mod[i], name, va, pre ? hook_pre : NULL, post ? hook_post : NULL,
+                         flags, h))
+        return 0;
+    s_nhooks++;
+    return 1;
+}
+
+static void api_active(const struct xbox_mod *m, int on)
+{
+    for (int i = 0; m && s_table && i < s_count; i++)
+        if (s_table[i] == m) {
+            __atomic_store_n(&s_active[i], on != 0, __ATOMIC_RELAXED);
+            return;
+        }
+}
+
 /* api.mem, once the guest has mapped its memory (after xbox_enhance_init,
  * before its first frame or draw). Either the guest's thread (frames) or
  * the render thread (filters) may get there first; both store the same
@@ -261,6 +346,8 @@ static void drop_owner(int owner)
         s_mod[owner].arm_idx = -1;
     }
     enhance_actions_drop_owner(owner);
+    if (owner >= 0 && owner < MOD_MAX)
+        recomp_hook_drop_owner(&s_mod[owner]);
 }
 
 static void exit_hook(const char *why)
@@ -892,6 +979,120 @@ static int init_rule(int i)
     return s_menu_on && e->live == ENHANCE_LIVE ? 2 : 0;
 }
 
+/* A config value in one spelling, so "on", true and 1 compare equal, and
+ * 1.0 and 1: the bool words to 0/1, a number to its double, the rest
+ * lowercased. */
+static void follows_norm(const char *v, char *out, size_t n)
+{
+    static const char *const on[] = { "on", "yes", "true", NULL };
+    static const char *const off[] = { "off", "no", "false", NULL };
+    char low[128];
+    double d;
+    size_t k;
+
+    for (k = 0; v[k] && k + 1 < sizeof low; k++)
+        low[k] = (char)((v[k] >= 'A' && v[k] <= 'Z') ? v[k] - 'A' + 'a' : v[k]);
+    low[k] = 0;
+    for (k = 0; on[k]; k++)
+        if (!strcmp(low, on[k])) {
+            snprintf(out, n, "1");
+            return;
+        }
+    for (k = 0; off[k]; k++)
+        if (!strcmp(low, off[k])) {
+            snprintf(out, n, "0");
+            return;
+        }
+    if (recomp_cfg_parse_double(low, &d))
+        snprintf(out, n, "%.17g", d);
+    else
+        snprintf(out, n, "%s", low);
+}
+
+/* A file row's value as text, whatever its TOML type. NULL for an array. */
+static const char *follows_row(const recomp_cfg *f, const char *key, char *buf, size_t n)
+{
+    switch (recomp_cfg_type_of(f, key)) {
+    case RCFG_STRING: return recomp_cfg_string(f, key, "");
+    case RCFG_INT: snprintf(buf, n, "%lld", recomp_cfg_int(f, key, 0)); return buf;
+    case RCFG_FLOAT: snprintf(buf, n, "%.17g", recomp_cfg_float(f, key, 0)); return buf;
+    case RCFG_BOOL: return recomp_cfg_bool(f, key, 0) ? "true" : "false";
+    default: return NULL;
+    }
+}
+
+/* Whether a mod's follows key holds something other than its default
+ * (config.default.toml): the environment over the user files. A key the
+ * defaults file lacks differs once anything sets it. With no follows key
+ * the mod is not held back. */
+static int follows_on(const char *key)
+{
+    struct enhance_cfg_hit hit[4];
+    const char *cur = NULL, *def = NULL;
+    char cb[64], db[64], cn[128], dn[128];
+    int n, k;
+
+    if (!key || !*key)
+        return 1;
+    cur = enhance_cfg_env(key);
+    n = enhance_cfg_layered(key, NULL, hit, 4);
+    for (k = 0; k < n; k++) {
+        if (hit[k].row == ENHANCE_ROW_USER && !cur)
+            cur = follows_row(hit[k].file, hit[k].key, cb, sizeof cb);
+        else if (hit[k].row == ENHANCE_ROW_DEFAULTS && !def)
+            def = follows_row(hit[k].file, hit[k].key, db, sizeof db);
+    }
+    if (!cur)
+        return 0;
+    if (!def)
+        return 1;
+    follows_norm(cur, cn, sizeof cn);
+    follows_norm(def, dn, sizeof dn);
+    return strcmp(cn, dn) != 0;
+}
+
+/* The table indices the mods= token lists now: inited, on (a live toggle
+ * off takes a mod out, a restart-pending one counts as what it runs), its
+ * follows key set, and its own active state when it reports one. */
+static uint64_t token_mask(void)
+{
+    uint64_t m = 0;
+
+    for (int i = 0; i < s_count && i < MOD_MAX; i++) {
+        enum xbox_mod_state st;
+        if (!s_started[i] || !s_follows_on[i])
+            continue;
+        st = __atomic_load_n(&s_state[i], __ATOMIC_RELAXED);
+        if (st != XBOX_MOD_ON && !(st == XBOX_MOD_RESTART && s_mod[i].start == XBOX_MOD_ON))
+            continue;
+        if (__atomic_load_n(&s_active[i], __ATOMIC_RELAXED) == 0)
+            continue;
+        m |= (uint64_t)1 << i;
+    }
+    return m;
+}
+
+/* "[ENHANCE] mods=none", or the listed mods' names in table order. The
+ * golden reads it (the CLI's ENHANCE_STOCK): a stock run prints none. */
+static void token_print(uint64_t m)
+{
+    char line[512];
+    size_t len = 0;
+
+    line[0] = 0;
+    for (int i = 0; i < s_count && i < MOD_MAX; i++) {
+        const char *nm;
+        if (!(m & ((uint64_t)1 << i)))
+            continue;
+        nm = s_table[i]->name ? s_table[i]->name : "?";
+        len += (size_t)snprintf(line + len, len < sizeof line ? sizeof line - len : 0, "%s%s",
+                                len ? "," : "", nm);
+        if (len >= sizeof line)
+            break;
+    }
+    fprintf(stderr, "[ENHANCE] mods=%s\n", m ? line : "none");
+}
+
 static int mod_init(int describe)
 {
     int i;
@@ -906,12 +1107,22 @@ static int mod_init(int describe)
     memset(s_on_enable_user, 0, sizeof s_on_enable_user);
     memset(s_mod, 0, sizeof s_mod);
     memset(&s_api, 0, sizeof s_api);
+    for (i = 0; i < MOD_MAX; i++) {
+        s_active[i] = -1;
+        s_follows_on[i] = 0;
+    }
+    s_token = 0;
+    s_nhooks = 0;
+    recomp_hook_reset();
     enhance_actions_drop_mods();
     enhance_cfg_owner_add(NULL);
     if (!s_table || !s_table[0]) {
-        if (!describe)
+        if (!describe) {
             nv2a_batch_filter_set(NULL);
-        return 0;   /* no lines: a title without mods logs as before */
+            /* The one line a title without mods prints: the golden pins it. */
+            token_print(0);
+        }
+        return 0;
     }
 
     s_api.version = XBOX_MOD_API_VERSION;
@@ -938,6 +1149,8 @@ static int mod_init(int describe)
     s_api.on_setting = api_on_setting;
     s_api.control_action = api_control_action;
     s_api.control_value = api_control_value;
+    s_api.hook = api_hook;
+    s_api.active = api_active;
     s_menu_on = enhance_cfg_bool("menu.enabled", 0);
 
     for (i = 0; s_table[i]; i++) {
@@ -1036,6 +1249,7 @@ static int mod_init(int describe)
         }
         s_running[s_nrunning++] = m;
         s_started[i] = 1;
+        s_follows_on[i] = follows_on(m->follows);
         if (rule == 2) {
             r->outcome = "dormant";
             s_state[i] = r->start = XBOX_MOD_OFF;
@@ -1052,6 +1266,14 @@ static int mod_init(int describe)
 
     /* Installed last, so a filter a failed init asked for is never seen. */
     nv2a_batch_filter_set(s_nfilter ? filter_all : NULL);
+    /* The hooks likewise: a failed init's were dropped from the queue. */
+    {
+        int nh = recomp_hook_publish();
+        if (nh)
+            fprintf(stderr, LOGP "%d hooked function%s\n", nh, nh == 1 ? "" : "s");
+    }
+    s_token = token_mask();
+    token_print(s_token);
     if (s_nrunning && !s_exit_hooked) {
         s_exit_hooked = 1;
         atexit(at_exit);
@@ -1101,6 +1323,15 @@ void xbox_mod_frame(void)
                     s_mod[i].on_setting && s_started[i])
                     s_mod[i].on_setting(k, ld_val(&s_mod[i].set[k].cur),
                                         s_mod[i].on_setting_user);
+        }
+    }
+    /* The token again when a toggle or a mod's active state changed it:
+     * a few loads per frame, and only in a title with mods running. */
+    {
+        uint64_t m = token_mask();
+        if (m != s_token) {
+            s_token = m;
+            token_print(m);
         }
     }
     if (!s_nframe)
@@ -1412,6 +1643,8 @@ void xbox_mod_shutdown(void)
     /* The render thread may still be drawing: it stops asking first. The
      * tables stay, so a callback already running reads what it read. */
     nv2a_batch_filter_set(NULL);
+    /* The guest threads likewise: no hook runs into a shut-down mod. */
+    recomp_hook_unpublish();
     for (i = s_nrunning - 1; i >= 0; i--)
         if (s_running[i]->shutdown)
             s_running[i]->shutdown();

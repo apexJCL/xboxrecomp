@@ -30,6 +30,8 @@ set(KERNEL_SOURCES
     guest_vmem.c
     icall_feedback.c
     recomp_trace.c
+    recomp_hook.c
+    recomp_hook_run.c
     nv2a_pb_scan.c
     nv2a_pb_exec.c
     nv2a_flip_hold.c

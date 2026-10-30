@@ -34,8 +34,10 @@
  * from the guest's thread, and xbox_mod_input_captured from its pad read,
  * where a captured pad reads as released to the title.
  *
- * With no mods: no lines, no callbacks, and the draw paths' one branch
- * (nv2a_batch_skip) is never taken. Docs: docs/runtime/config.md, "Mods".
+ * With no mods: one line, "[ENHANCE] mods=none" (the mods that run and
+ * take effect, for the golden), no callbacks, and the draw paths' one
+ * branch (nv2a_batch_skip) is never taken. Docs: docs/runtime/config.md,
+ * "Mods".
  */
 #ifndef XBOX_ENHANCE_MOD_H
 #define XBOX_ENHANCE_MOD_H
@@ -48,12 +50,13 @@
 #include "host_pad.h"
 #include "nv2a_backend_common.h"
 #include "recomp_env.h"
+#include "recomp_hook_mod.h"        /* struct xbox_mod_call, xbox_mod_hook_fn */
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#define XBOX_MOD_API_VERSION 3u
+#define XBOX_MOD_API_VERSION 4u
 
 struct xbox_mod_api;
 struct xbox_mod_desc;
@@ -69,7 +72,31 @@ struct xbox_mod {
      * this is a source contract for mods linked into the game, not a plugin
      * ABI (struct xbox_mod has no size field). */
     const struct xbox_mod_desc *desc;
+    /* v4, appended for the same reason; tables written before are zeroed
+     * here.
+     *
+     * needs: what the mod uses (XBOX_MOD_NEED_*). A declaration only for
+     * now: nothing reads it until the enable gate (mod-connectivity-layer
+     * task 4.2) lands.
+     *
+     * follows: NULL, or a config key that turns the mod on ("camera.free"):
+     * while that key holds its config.default.toml value, the mod is not
+     * counted in the [ENHANCE] mods= token even if its init ran, since it
+     * does nothing then. The key is read once, at start; a value that does
+     * not parse counts as changed, so the mod is listed. It does not gate
+     * the init (4.2 again). A mod that reads its own key, or whose effect
+     * depends on more than one key, should report api->active() instead:
+     * that follows what it actually does, live. */
+    uint32_t needs;
+    const char *follows;
 };
+
+/* struct xbox_mod.needs. */
+#define XBOX_MOD_NEED_ASPECT 0x01u
+#define XBOX_MOD_NEED_STATE  0x02u
+#define XBOX_MOD_NEED_POKE   0x04u
+#define XBOX_MOD_NEED_HOOK   0x08u
+#define XBOX_MOD_NEED_PLACE  0x10u
 
 /* ---- the descriptor (v3; docs/runtime/config.md, "Mods") ----------------
  *
@@ -256,7 +283,38 @@ struct xbox_mod_api {
      * it reports not connected: out zeroed, 0. */
     int (*control_value)(const struct xbox_mod_desc *desc, uint32_t idx,
                          struct xbox_ctl_value *out);
+
+    /* ---- version 4 (check size before using these) --------------------- */
+
+    /* Init only. Run pre(c, user) before and post(c, user) after each call
+     * of the guest function at va, on the guest thread that calls it,
+     * inside the call; they must not block. Either may be NULL, not both.
+     * The game must give va a hook slot (game.toml [mods] hook_functions);
+     * without one, hook returns 0 with a line. Several mods may hook one
+     * VA: the pre callbacks run in table order and the post callbacks in
+     * reverse. With XBOX_MOD_HOOK_MAY_SKIP the pre may set c->skip to
+     * return c->eax/edx_ret (and c->st0, on a function that returns a
+     * float) without running the function; one such hook per VA, a second
+     * is refused, as is any other flag bit. A skip from a hook without the
+     * flag is ignored, logged once. The later pre callbacks and every post
+     * see the skip and may still change the return. c->st0_valid is
+     * read-only. Returns 1, or 0. See recomp_hook_mod.h.
+     *
+     * The hooks follow the mod's state: while it is off (inited dormant,
+     * or switched off live) its callbacks are not called and the function
+     * runs as if unhooked by it. From shutdown on, none is called. */
+    int (*hook)(uint32_t va, xbox_mod_hook_fn pre, xbox_mod_hook_fn post,
+                uint32_t flags, void *user);
+    /* The mod's own "doing something now" state, for the [ENHANCE] mods=
+     * token: a mod that calls this is listed only while it last said 1
+     * (a default-on mod that does nothing at 4:3 stays out). One that
+     * never calls it is listed while it runs and is on. Any thread. */
+    void (*active)(const struct xbox_mod *m, int on);
 };
+
+/* Stack argument n (0-based) of a hooked call, in a pre or a post. */
+#define XBOX_MOD_ARG32(api, c, n) XBOX_MOD_MEM32(api, (c)->esp + 4 + 4 * (n))
+#define XBOX_MOD_ARGF(api, c, n)  XBOX_MOD_MEMF(api, (c)->esp + 4 + 4 * (n))
 
 #define XBOX_MOD_MAX_FRAME   16
 #define XBOX_MOD_MAX_FILTER  8

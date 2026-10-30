@@ -1270,8 +1270,9 @@ meant to be read per frame. Tests: `tests/enhance_cfg` (ctest
 
 A mod is game code built into the title's executable that reads and steers
 the guest through one small API (`src/enhance/mod.h`). It exists only with
-`XBOXRECOMP_ENHANCE=ON`. A title with no mods logs and runs exactly as
-before. The draw paths then have one untaken branch.
+`XBOXRECOMP_ENHANCE=ON`. A title with no mods runs exactly as before and
+logs one line, `[ENHANCE] mods=none` ([The mods= line](#the-mods-line)).
+The draw paths then have one untaken branch.
 
 The title lists its mods in a NULL-terminated table and hands it over before
 `xbox_enhance_init`, which runs each `init` in table order as its last step:
@@ -1305,7 +1306,7 @@ The title's glue calls two entries:
 - `xbox_mod_input_captured()` from its pad read. While it returns true, the
   title must see a released pad.
 
-`struct xbox_mod_api` (version 3, `XBOX_MOD_API_VERSION`) holds:
+`struct xbox_mod_api` (version 4, `XBOX_MOD_API_VERSION`) holds:
 
 | Member | What it gives |
 | --- | --- |
@@ -1323,6 +1324,101 @@ The title's glue calls two entries:
 | `on_setting(desc, fn, user)` | v3. `fn(idx, value, user)` after the menu changes a setting, from the next `xbox_mod_frame` on the guest's thread, as `on_enable`. A `restart` setting only records the value and never calls back. Init only. |
 | `control_action(desc, idx)` | v3. The action id of an ACTION control, for `action_pressed` and `action_down`; -1 for another kind. |
 | `control_value(desc, idx, out)` | v3. A captured control's value. Until the recorded pad state lands it reports not connected (0, `out` zeroed). |
+| `hook(va, pre, post, flags, user)` | v4. Callbacks around each call of the guest function at `va` ([Hooks](#hooks-v4)). Init only. |
+| `active(mod, on)` | v4. The mod's own "doing something now" state, for the `mods=` line. Any thread. |
+
+`struct xbox_mod` gained two fields in v4, after `desc`:
+
+- `needs`: what the mod uses, `XBOX_MOD_NEED_ASPECT`, `_STATE`, `_POKE`,
+  `_HOOK` and `_PLACE` ORed. It is a declaration only: nothing reads it
+  until the enable gate (mod-connectivity-layer task 4.2) lands.
+- `follows`: NULL, or a config key that turns the mod on (`"camera.free"`).
+  While that key holds its default, the mod is left out of the `mods=`
+  line even when its init ran. The key is read once, at start, and a
+  value that does not parse counts as changed, so the mod is listed. It
+  does not gate the init yet (4.2 again). A mod that reads its own key,
+  or whose effect hangs on more than one key, should call `api->active()`
+  instead: that follows what it actually does, live.
+
+Tables written for v1 to v3 compile unchanged: the new fields are zero.
+`struct xbox_mod` has no size field, so it is a source contract for mods
+linked into the title, not a plugin ABI.
+
+### Hooks (v4)
+
+`api->hook(va, pre, post, flags, user)` runs `pre(c, user)` before each call
+of the guest function at `va`, and `post(c, user)` after it. They run on the
+guest thread that made the call, inside the call, and must not block. Either
+callback may be NULL, but not both.
+
+- **Slots.** The game declares the VAs a mod may hook in `game.toml`
+  (`[mods] hook_functions`). `xbr recomp` then gives each one a slot
+  (`src/kernel/recomp_hook.h`; the mods' side is
+  `src/kernel/recomp_hook_mod.h`). For a VA without a slot, `hook` logs
+  `[MOD <name>] hook 0x...: no hook slot` and returns 0. While nothing
+  hooks a slot, it costs one load and a predicted branch.
+- **`struct xbox_mod_call`.**
+  - `esp` is the guest esp at entry, so `[esp]` is the return address.
+    `XBOX_MOD_ARG32(api, c, n)` and `XBOX_MOD_ARGF(api, c, n)` read stack
+    argument `n`, counting from 0.
+  - `ecx` and `edx` hold their entry values, for thiscall and fastcall.
+  - `eax` and `edx_ret` hold the return value. A post callback may change
+    them. A function that returns on the x87 stack has `st0_valid` set
+    and its value in `st0`. A post's change to `st0` is written back.
+  - `st0_valid` is read-only. The slot decides every x87 push and
+    write-back, and `st0_valid` is reset before the post callbacks, so a
+    hook cannot unbalance the x87 stack by writing it.
+- **Order.** The pre callbacks run in table order. The post callbacks run in
+  reverse order, and see the same `esp` as the pres.
+- **Skip.** A pre hook registered with `XBOX_MOD_HOOK_MAY_SKIP` may set
+  `c->skip`. The function's body then does not run.
+  - The slot does what the body's `ret n` would do. It pops the return
+    address and the callee-cleaned bytes, then returns `eax`/`edx_ret`,
+    and pushes `st0` when the function returns a float.
+  - The later pre callbacks and every post callback still run. They see
+    `skip` set and the return the skipper wrote. A later one that writes
+    `eax`, `edx_ret` or `st0` changes what the call returns, and none can
+    clear the skip.
+  - Only one MAY_SKIP hook is allowed per VA. A second one is refused at
+    init.
+  - A skip from a hook without the flag is ignored and logged once.
+  - Any flag bit other than `XBOX_MOD_HOOK_MAY_SKIP` is refused at init.
+- **Mod state.** A mod's hooks run only while the mod is on. While it is
+  inited dormant, or after it is switched off live, its callbacks are not
+  called and the function runs as if that mod had not hooked it. From
+  `xbox_mod_shutdown` on, no hook runs.
+- **Failed init.** A failed init's hooks are dropped with the rest of what
+  it registered. The hooks take effect together, after every mod's init:
+  the log reads `[MOD] N hooked functions`.
+
+### The mods= line
+
+After the inits, the toolkit prints the mods that run and take effect:
+
+```
+[ENHANCE] mods=none
+[ENHANCE] mods=camera.free,hud
+```
+
+A mod is listed when all of these hold:
+
+- its init ran and returned 0;
+- it is on now (a descriptor mod's enable switch, or the Mods page);
+- its `follows` key, if any, differs from that key's default in
+  `config.default.toml`. Values are compared after normalising, so `"off"`
+  and `false` are equal, and so are `1` and `1.0`. A key that the defaults
+  file lacks counts as different once anything sets it;
+- the mod reports an active state and the last report was 1, or it never
+  reports one. A default-on mod that does nothing at 4:3, such as
+  hud-anchors' `hud`, calls `api->active(mod, 0)` in its init and stays
+  out until it is active.
+
+A live change (a Mods page toggle, an `active` call) prints the line again
+at the next `xbox_mod_frame`.
+
+A stock run prints `mods=none`. The golden check is meant to pin it,
+through the CLI's `ENHANCE_STOCK`, once every game's toolkit prints the
+line.
 
 `mods.<name> = false` leaves a mod's init out at start; the Mods page
 writes the key. The toolkit keeps each mod's state (`xbox_mod_state`:
@@ -1480,7 +1576,7 @@ Schema 1. Fields are only added; one removed or changed in meaning bumps
 `schema`. A field that does not apply is left out.
 
 ```json
-{"schema": 1, "api": 3, "mods": [
+{"schema": 1, "api": 4, "mods": [
   {"id": "fly", "title": "Free camera", "descriptor": true, "init": "no", "enable": "fly.enabled",
    "settings": [
       {"name": "speed", "key": "mods.fly.speed", "kind": "float", "label": "Speed",
@@ -1533,7 +1629,9 @@ then, and a frame or filter call may be in flight. So a mod's shutdown must
 not free anything its callbacks use.
 Hotkeys come from `xbox_FramebufferKeyDown` and the names in
 `src/input/input_names.h`. Tests: `tests/enhance_mod` (ctest `enhance_mod`)
-and `tests/mod_desc` (ctest `mod_desc`, the descriptor and the dump).
+`tests/mod_desc` (ctest `mod_desc`, the descriptor and the dump), and
+`tests/mod_hook` (ctest `mod_hook`, the v4 fields, the `mods=` line and the
+hooks).
 
 ## Design note: why the reader is our own
 
