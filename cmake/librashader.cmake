@@ -21,6 +21,10 @@
 # shaders/LICENSE-librashader.txt, and shaders/README.md has the source link.
 # Our zip also holds THIRDPARTY.txt, the licences of the crates and C/C++
 # libraries linked into the dll, staged as shaders/THIRDPARTY-librashader.txt.
+# Upstream's macOS zips carry no such file, so the same notices for its
+# dylib are generated once (third_party/librashader/notices-macos.sh),
+# committed as third_party/librashader/THIRDPARTY-macos.txt and staged under
+# the same name.
 #
 # Cache variables:
 #   XBOXRECOMP_LIBRASHADER          ON (default): download and stage the library
@@ -43,6 +47,11 @@ set(_lrs_zip_x86_64-windows
     "librashader-x86_64-windows-d3d11-v${XBOXRECOMP_LIBRASHADER_VERSION}-xbr1.zip"
     CACHE INTERNAL "")
 set(_lrs_notices_x86_64-windows THIRDPARTY.txt CACHE INTERNAL "")
+# The macOS notices, from the repository rather than the zip.
+get_filename_component(_lrs_macos_notices
+    "${CMAKE_CURRENT_LIST_DIR}/../third_party/librashader/THIRDPARTY-macos.txt" ABSOLUTE)
+set(_lrs_repo_notices_aarch64-macos "${_lrs_macos_notices}" CACHE INTERNAL "")
+set(_lrs_repo_notices_x86_64-macos "${_lrs_macos_notices}" CACHE INTERNAL "")
 # sha256 of each release zip: upstream's from the release's asset digests
 # (the Mac one checked against a downloaded copy), ours from
 # third_party/librashader/build-windows.sh with its pinned Rust, llvm-mingw
@@ -129,6 +138,8 @@ function(_xboxrecomp_librashader_fetch_plat plat out notices)
     if(DEFINED _lrs_notices_${plat})
         list(APPEND want "${_lrs_notices_${plat}}")
         set(note "${dir}/${_lrs_notices_${plat}}")
+    elseif(DEFINED _lrs_repo_notices_${plat})
+        set(note "${_lrs_repo_notices_${plat}}")
     endif()
     if(EXISTS "${lib}" AND EXISTS "${dir}/.sha256" AND (NOT note OR EXISTS "${note}"))
         file(READ "${dir}/.sha256" have)
@@ -175,6 +186,11 @@ function(_xboxrecomp_librashader_fetch_plat plat out notices)
             message(FATAL_ERROR "librashader: ${zip} has no ${f}")
         endif()
     endforeach()
+    # After the zip's own check, so a zip without THIRDPARTY.txt says so;
+    # this one catches a missing repo notice (THIRDPARTY-macos.txt).
+    if(note AND NOT EXISTS "${note}")
+        message(FATAL_ERROR "librashader: no third-party notices at ${note}")
+    endif()
     file(WRITE "${dir}/.sha256" "${sha}")
     set(${out} "${lib}" PARENT_SCOPE)
     set(${notices} "${note}" PARENT_SCOPE)

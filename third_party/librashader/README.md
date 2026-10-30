@@ -11,6 +11,12 @@ D3D11-only build of the same source that imports no D3DX9 or Visual C++
 runtime, made by `build-windows.sh` here (it sits outside `tools/` so it
 does not stale every game's generated code). `cmake/librashader.cmake` pins
 both by sha256. `about.toml` and `about.hbs` drive the cargo-about run that
-writes that zip's `THIRDPARTY.txt`, and `COPYING.MinGW-w64-runtime.txt` is the
-licence of the MinGW-w64 runtime it links (verbatim from mingw-w64 commit
-96f1cb7de334c47808377ada40d6819aca1b48a9).
+writes that zip's `THIRDPARTY.txt`; the licence of the MinGW-w64 runtime it
+links is `LICENSES/MinGW-w64-runtime.txt` at the top of the repository.
+
+Upstream's macOS zips carry no third-party notices, so `notices-macos.sh`
+writes them for its dylib from the same source, config and pinned tools
+(`about.toml`, `about-macos.hbs`), without building anything:
+`THIRDPARTY-macos.txt` is that output, committed because staging takes it
+from here (as `shaders/THIRDPARTY-librashader.txt`). Rerun the script on a
+librashader bump; two runs give the same bytes.

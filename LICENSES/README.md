@@ -46,3 +46,26 @@ time:
   into the dll; it is generated with each build, not kept here (about 800 KB,
   most of it per-file Mesa MIT notices). The top-level NOTICE lists them by
   licence.
+- Upstream's macOS zips have no such file. The same notices for its dylib
+  are `third_party/librashader/THIRDPARTY-macos.txt` (about 260 KB, written
+  by `notices-macos.sh` there), staged under the same name; they are kept
+  there, not here, since only macOS packages ship them.
+
+Every Windows executable (llvm-mingw) links part of the toolchain's runtime
+statically (see "the toolchain runtime in every Windows executable" in the
+top-level NOTICE):
+
+- `MinGW-w64-runtime.txt`: the MinGW-w64 runtime's licence and the notices
+  of the parts it took from elsewhere, verbatim `COPYING.MinGW-w64-runtime.txt`
+  from mingw-w64 commit 96f1cb7de334c47808377ada40d6819aca1b48a9 (the same
+  file llvm-mingw 20260922 installs). `third_party/librashader/build-windows.sh`
+  puts it in the Windows librashader zip's `THIRDPARTY.txt` too.
+- `LLVM-LICENSE.txt`: LLVM's libunwind and compiler-rt builtins, verbatim
+  `LICENSE.TXT` from llvm-mingw 20260922: Apache-2.0 with LLVM Exceptions,
+  and the Legacy LLVM (University of Illinois/NCSA) licence, which still
+  covers code not yet relicensed and requires its copyright notice in
+  binary redistributions. It is here, not only in the librashader zip, so a
+  package built without librashader carries it too.
+
+The packaging copies this whole directory into every game package, macOS
+ones included.

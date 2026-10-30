@@ -42,7 +42,7 @@ the upstream library, which needs the DirectX 9 and Visual C++ runtimes). It
 is MPL-2.0: the licence is `LICENSE-librashader.txt` in this directory, and
 the source is at
 https://github.com/SnowflakePowered/librashader/tree/librashader-v0.12.0.
-On x86-64 Windows, `THIRDPARTY-librashader.txt` here lists the licences of
-the libraries built into it.
+On macOS and x86-64 Windows, `THIRDPARTY-librashader.txt` here lists the
+licences and copyrights of the crates and C/C++ libraries built into it.
 If the library cannot load, the game names the reason in its log and
 presents without the shader.

@@ -46,8 +46,8 @@ commit=87e8a97b50516d997defeaa168173dcd185d4022
 rust=1.99.1
 target=x86_64-pc-windows-gnullvm
 # llvm-mingw 20260922 (ucrt): its clang, and the MinGW-w64 runtime linked
-# statically into the dll (COPYING.MinGW-w64-runtime.txt here is that
-# runtime's licence file).
+# statically into the dll (LICENSES/MinGW-w64-runtime.txt in this repository
+# is that runtime's licence file).
 llvm_mingw_release=20260922
 clang_version="clang version 23.1.2 (https://github.com/llvm/llvm-project.git 85ac560262434c9ccfc0c183ec22d4138ed647fb)"
 cargo_about=0.9.3
@@ -118,7 +118,7 @@ cp "$work/src/LICENSE.md" "$stage/LICENSE.md"
 (cd "$work/src" && cargo "+$rust" metadata --frozen --format-version 1 \
     --manifest-path librashader-capi/Cargo.toml) > "$work/meta.json"
 python3 -I - "$work/meta.json" "$work/crates.txt" "$llvm_mingw/LICENSE.TXT" \
-    "$here/COPYING.MinGW-w64-runtime.txt" \
+    "$here/../../LICENSES/MinGW-w64-runtime.txt" \
     "$(rustup "+$rust" which rustc | xargs dirname | xargs dirname)/share/doc/rust/licenses/Apache-2.0.txt" \
     "$rust" "$stage/THIRDPARTY.txt" <<'EOF'
 import json, os, sys
