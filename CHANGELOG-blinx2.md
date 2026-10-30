@@ -9,6 +9,40 @@ blinx2-v0.3.2; earlier tags are described by their commits.
 
 ## [Unreleased]
 
+## [blinx2-v0.9.0] - 2026-10-29
+
+### Added
+- A Shaders page in the in-game menu: the *Shader* row moves there from
+  the Render page, and the active slang preset's `#pragma parameter`s get
+  a range row each, applied at the next present on Metal and D3D11, with
+  *Reset to preset*. Save writes only the changed values, per preset, as
+  `present.shader_params.<preset>.<param>`. The page is left out where no
+  shader can run (no chain presenter, or a library that is missing or
+  does not load), and the log says why once. `RECOMP_MODS_DESCRIBE=json`
+  lists each preset's parameters under `shaders`.
+- `LICENSES/` carries the MinGW-w64 runtime and llvm-mingw (Apache-2.0
+  with LLVM exception, plus the Legacy NCSA text) notices of the code
+  linked into every Windows executable, and `NOTICE` names what each one
+  links. The macOS librashader's crate notices
+  (`third_party/librashader/THIRDPARTY-macos.txt`, reproducible with
+  `notices-macos.sh`) are staged into `shaders/`.
+
+### Changed
+- x86-64 Windows uses our D3D11-only build of the unmodified librashader
+  v0.12.0 source (`third_party/librashader/build-windows.sh`, llvm-mingw,
+  static libc++), pinned by sha256 and fetched from the fork's
+  `librashader-v0.12.0-xbr1` release with its MPL-2.0 text and notices.
+  It imports only system DLLs, so `present.shader` runs on a stock
+  Windows 11 without D3DX9 or the Visual C++ runtime. macOS and arm64
+  Windows keep upstream's builds. A load failure names the missing
+  import; `librashader_imports` checks the DLL's import table.
+- While a shader runs, the present surface is the output size rather
+  than the 640x480 frame, so gamescope no longer rescales the mask and
+  scanlines by a non-integer factor (colour fringes). Stock output is
+  unchanged.
+- The bundled `crt-lottes` and `crt-lottes-fast` wrappers set a gentler
+  curvature than upstream; the vendored files are untouched.
+
 ## [blinx2-v0.8.0] - 2026-10-29
 
 ### Added
