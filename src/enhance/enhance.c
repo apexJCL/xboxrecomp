@@ -12,6 +12,7 @@
 #include "enhance_cfg.h"
 #include "enhance_input.h"
 #include "enhance_menu.h"
+#include "hud_anchor.h"
 #include "kernel_pacing.h"
 #include "kernel_ramfs.h"
 #include "mod.h"
@@ -28,6 +29,40 @@ static int path_is_absolute(const char *p)
 {
     return p[0] == '/' || p[0] == '\\'
         || (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':');
+}
+
+/* display.hud_aspect and display.hud_margin (hud_anchor.h): the HUD
+ * layer's edge, read whether or not a mod registers a HUD table so they are
+ * never reported unused. hud_aspect "display" follows display.aspect; a
+ * W:H no wider than 4:3 keeps the HUD in the 4:3 columns. */
+static void read_hud_keys(char *txt, size_t len)
+{
+    const char *v = enhance_cfg_string("display.hud_aspect", "display");
+    long long margin = enhance_cfg_int("display.hud_margin", 0);
+    unsigned aw = 0, ah = 0;
+
+    if (strcmp(v, "display") != 0) {
+        int end = 0;
+        if (sscanf(v, "%u:%u%n", &aw, &ah, &end) != 2 || v[end] || !aw || !ah) {
+            fprintf(stderr, LOGP "display.hud_aspect=%s is not display or a W:H ratio;"
+                    " using display\n", v);
+            aw = ah = 0;
+            v = "display";
+        } else if ((unsigned long long)aw * 3u < (unsigned long long)ah * 4u) {
+            fprintf(stderr, LOGP "display.hud_aspect=%s is narrower than 4:3; using 4:3\n", v);
+            aw = 4;
+            ah = 3;
+            v = "4:3";
+        }
+    }
+    if (margin < 0 || margin > 64) {
+        long long c = margin < 0 ? 0 : 64;
+        fprintf(stderr, LOGP "display.hud_margin=%lld out of range 0..64; using %lld\n",
+                margin, c);
+        margin = c;
+    }
+    hud_layer_set_keys(aw, ah, (int)margin);
+    snprintf(txt, len, "display.hud_aspect=%s display.hud_margin=%lld", v, margin);
 }
 
 #define SHADER_PARAMS "present.shader_params."
@@ -117,7 +152,7 @@ int xbox_enhance_init(const char *root, const char *title)
     const char *aspect, *shader, *shader_lib;
     long long scale, aniso, overscan;
     int rc, pacing, surface;
-    char surface_txt[48], overscan_txt[64] = "";
+    char surface_txt[48], overscan_txt[64] = "", hud_txt[96] = "";
 
     rc = enhance_cfg_init(root, title) < 0 ? -1 : 0;
     memset(&o, 0, sizeof o);
@@ -198,6 +233,7 @@ int xbox_enhance_init(const char *root, const char *title)
         }
     }
     o.movie_mode = enhance_cfg_choice("display.movie", s_movie, NV2A_MOVIE_BLACK);
+    read_hud_keys(hud_txt, sizeof hud_txt);
     /* A TV's overscan: guest px cut from each side edge at present, the
      * top and bottom in proportion (nv2a_present_crop), for a title that
      * left a border its CRT hid. Under hor+ the 4:3 edges sit inside the
@@ -266,6 +302,12 @@ int xbox_enhance_init(const char *root, const char *title)
     /* Last: a mod's init reads its keys over every file and the [input]
      * keys already applied (mod.h). */
     xbox_mod_init();
+    /* The HUD keys only mean something once a mod registered a HUD table,
+     * so they are named only then: the stock line stays as it was. */
+    /* Only with a wide aspect (a pad): a HUD mod at 4:3 adds no line, so
+     * the goldens' startup log is the same with the mod loaded. */
+    if (hud_layer_has_table() && hud_layer_pad() > 0)
+        fprintf(stderr, LOGP "%s hud_pad=%d\n", hud_txt, hud_layer_pad_hud());
     /* [input.actions] once every action is registered (the key map of
      * rule 2 is the one enhance_input_init applied), then the hook line. */
     enhance_actions_start();

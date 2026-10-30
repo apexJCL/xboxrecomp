@@ -9,6 +9,8 @@
 #                  filter and the flip tick (enhance_actions.h)
 #   mod.c          the mods: the title's table, the mod API, the frame and
 #                  batch-filter dispatch, descriptors and their settings (mod.h)
+#   hud_anchor.c   the HUD layer: a mod's HUD table, elements moved to the
+#                  wide frame's edges (hud_anchor.h)
 #   mod_describe.c the descriptor dump (RECOMP_MODS_DESCRIBE=json)
 #   enhance_menu.c the in-game menu (menu.enabled): items, pages, Save
 #                  (enhance_menu.h)
@@ -18,7 +20,7 @@
 # the other way round: with the layer off the options stay zero (stock).
 
 add_library(xbox_enhance STATIC recomp_cfg.c enhance_cfg.c enhance.c enhance_input.c
-    enhance_actions.c mod.c mod_describe.c enhance_menu.c)
+    enhance_actions.c mod.c hud_anchor.c mod_describe.c enhance_menu.c)
 target_include_directories(xbox_enhance PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(xbox_enhance PUBLIC recomp_env xbox_kernel xbox_input)
 if(NOT MSVC)

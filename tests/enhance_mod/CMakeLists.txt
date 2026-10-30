@@ -21,6 +21,7 @@ add_executable(enhance_mod_test
     ${XR_SRC}/enhance/enhance_input.c
     ${XR_SRC}/enhance/enhance_actions.c
     ${XR_SRC}/enhance/mod.c
+    ${XR_SRC}/enhance/hud_anchor.c
     ${XR_SRC}/kernel/recomp_hook.c
     ${XR_SRC}/enhance/mod_describe.c
     ${XR_SRC}/input/input_core.c

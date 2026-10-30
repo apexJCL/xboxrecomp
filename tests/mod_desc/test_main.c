@@ -874,7 +874,7 @@ static void test_dump(void)
     xbox_mod_init_describe();
     CHECK(xbox_mod_describe_write("empty.json") == 0);
     got = read_all("empty.json");
-    CHECK(got && !strcmp(got, "{\"schema\": 1, \"api\": 4, \"mods\": [], \"shaders\": "
+    CHECK(got && !strcmp(got, "{\"schema\": 1, \"api\": 5, \"mods\": [], \"shaders\": "
                              "{\"active\": \"none\", \"presets\": []}}\n"));
     free(got);
 

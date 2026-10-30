@@ -1,7 +1,8 @@
 # mod_hook - the mod API v4 (mod-connectivity-layer 4.1, 4.9, 5.4): v1 to
 # v3 tables beside v4 ones, the [ENHANCE] mods= token (a stock run prints
 # none; follows, a live toggle and a mod's own active state), and the hook
-# slots (src/kernel/recomp_hook.c) as the generated code calls them: pre in
+# slots (src/kernel/recomp_hook.c) as the generated code calls them, and a
+# mod's HUD table (hud_anchor.c: the owner's listing, the keys' line): pre in
 # table order and post in reverse, the entry ecx, edx and esp, a skip on a
 # `ret 0x14` function and on one returning st0, and the refusals. Pure C,
 # no device:
@@ -22,6 +23,7 @@ add_executable(mod_hook_test
     ${XR_SRC}/enhance/enhance_input.c
     ${XR_SRC}/enhance/enhance_actions.c
     ${XR_SRC}/enhance/mod.c
+    ${XR_SRC}/enhance/hud_anchor.c
     ${XR_SRC}/kernel/recomp_hook.c
     ${XR_SRC}/kernel/recomp_hook_run.c
     ${XR_SRC}/enhance/mod_describe.c

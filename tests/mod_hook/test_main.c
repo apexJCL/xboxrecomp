@@ -33,6 +33,7 @@
 #include "input_backend.h"
 #include "input_names.h"
 #include "mod.h"
+#include "hud_anchor.h"
 #include "nv2a_backend_common.h"
 #include "nv2a_overlay.h"
 #include "nv2a_pb_state.h"
@@ -92,8 +93,9 @@ void nv2a_overlay_toast(const char *fmt, ...) { (void)fmt; }
 void enhance_menu_start(void);
 void enhance_menu_start(void) {}
 
-/* Guest 0x1000..0x103F: the hooked calls' stacks live here. */
-static uint8_t s_guest[64];
+/* Guest 0x1000..0x103F: the hooked calls' stacks live here; 0x1040 on,
+ * the HUD test's vertices. */
+static uint8_t s_guest[256];
 ptrdiff_t xbox_GetMemoryOffset(void);
 ptrdiff_t xbox_GetMemoryOffset(void) { return (ptrdiff_t)((uintptr_t)s_guest - 0x1000u); }
 static struct nv2a_pb_present s_present = { 0x00C00000u, 640, 480, 2560, 0 };
@@ -590,7 +592,7 @@ static int s_rc_second, s_rc_none, s_rc_nopre, s_rc_flags;
 static int ha_init(const struct xbox_mod_api *api)
 {
     s_hapi = api;
-    CHECK(api->version == 4u && api->size >= offsetof(struct xbox_mod_api, active));
+    CHECK(api->version >= 4u && api->size >= offsetof(struct xbox_mod_api, active));
     CHECK(api->hook(VA_PLAIN, a_pre, a_post, 0, NULL) == 1);
     CHECK(api->hook(VA_STD, NULL, a_post, 0, NULL) == 1);
     CHECK(api->hook(VA_REC, r_pre, r_post, 0, NULL) == 1);
@@ -785,6 +787,124 @@ static void test_hook_state(void)
     CHECK(strcmp(token_of(out, tok, sizeof tok), "none") == 0);
 }
 
+/* ---- 3. the HUD table (hud-anchors 1.1, 1.8) ----------------------- */
+
+static const char k_hud_toml[] =
+    "version = 1\n[canvas]\nw = 640\nh = 480\norigin = \"top-left\"\n"
+    "[layout]\nstride = 16\nx_off = 0\n"
+    "[[wrapper]]\nva = 0x00010000\n"
+    "[[site]]\nret_va = 0x2000\nelement = \"score\"\nkind = \"left\"\n";
+static int s_hud_rc, s_hud_rc2, s_hud_fail;
+static int s_hud_off_in_pre, s_hud_moved, s_hud_restored;
+static const struct xbox_mod_api *s_hud_api;
+
+/* The mod's hook on its vertex call (VA_STD): four 16-byte vertices at
+ * 0x1040, applied with RESTORE and put back at the post. */
+static void hudt_pre(struct xbox_mod_call *c, void *u)
+{
+    struct xbox_hud_call d = { 0x1040u, 4, XBOX_HUD_RESTORE, 0, 0 };
+    uint8_t before[64];
+    (void)u;
+    memcpy(before, s_guest + 0x40, sizeof before);
+    s_hud_api->hud_apply(c, &d);
+    s_hud_moved = memcmp(before, s_guest + 0x40, sizeof before) != 0;
+    if (s_hud_off_in_pre)       /* the Mods page, between the pre and the post */
+        CHECK(xbox_mod_set_enabled(index_of("hudt"), 0) == XBOX_MOD_OFF);
+}
+static void hudt_post(struct xbox_mod_call *c, void *u)
+{
+    (void)u;
+    s_hud_restored++;
+    s_hud_api->hud_restore(c);
+}
+
+static int hudt_init(const struct xbox_mod_api *api)
+{
+    CHECK(api->size >= offsetof(struct xbox_mod_api, hud_restore) + sizeof api->hud_restore);
+    s_hud_api = api;
+    s_hud_rc = api->hud_table(k_hud_toml, sizeof k_hud_toml - 1);
+    CHECK(api->hook(VA_STD, hudt_pre, hudt_post, 0, NULL) == 1);
+    api->on_enable(hud_enable, NULL);     /* switched live */
+    return s_hud_fail;
+}
+static int hudt2_init(const struct xbox_mod_api *api)
+{
+    s_hud_rc2 = api->hud_table(k_hud_toml, sizeof k_hud_toml - 1);
+    return 0;
+}
+static const struct xbox_mod k_hudt = { "hudt", hudt_init, NULL, NULL, 0, NULL };
+static const struct xbox_mod k_hudt2 = { "hudt2", hudt2_init, NULL, NULL, 0, NULL };
+
+static void test_hud_table(void)
+{
+    static const struct xbox_mod *const one[] = { &k_hudt, &k_v1, NULL };
+    static const struct xbox_mod *const two[] = { &k_hudt, &k_hudt2, NULL };
+    const char *out;
+    char tok[256];
+
+    /* 4:3: registered, the keys named, the owner not listed. */
+    out = start(NULL, NULL, one);
+    CHECK(s_hud_rc == 1 && hud_layer_has_table() && !hud_layer_active());
+    CHECK(strstr(out, "[hud] table: 1 sites, 1 groups, 1 wrappers\n") != NULL);
+    CHECK(strstr(out, "[ENHANCE] display.hud_aspect") == NULL);     /* no pad: no line */
+    CHECK(strcmp(token_of(out, tok, sizeof tok), "v1") == 0);
+
+    /* 16:9: listed from the start line, with no call to active. */
+    out = start("[display]\naspect = \"16:9\"\nhud_margin = 7\nhud_aspect = \"3:4\"\n", NULL,
+                one);
+    CHECK(hud_layer_active() && hud_layer_pad() == 107 && hud_layer_pad_hud() == 0);
+    CHECK(strstr(out, "display.hud_aspect=3:4 is narrower than 4:3; using 4:3\n") != NULL);
+    CHECK(strstr(out, "[ENHANCE] display.hud_aspect=4:3 display.hud_margin=7 hud_pad=0\n"));
+    CHECK(strcmp(token_of(out, tok, sizeof tok), "hudt,v1") == 0);
+    out = start("[display]\naspect = \"16:9\"\nhud_margin = 99\n", NULL, one);
+    CHECK(strstr(out, "display.hud_margin=99 out of range 0..64; using 64\n") != NULL);
+    CHECK(hud_layer_pad_hud() == 107 - 64);
+    /* The owner switched off live: out at the next frame, the lift off. */
+    CHECK(xbox_mod_set_enabled(index_of("hudt"), 0) == XBOX_MOD_OFF);
+    out = frame_out();
+    CHECK(!hud_layer_active());
+    CHECK(strcmp(token_of(out, tok, sizeof tok), "v1") == 0);
+    CHECK(xbox_mod_set_enabled(index_of("hudt"), 1) == XBOX_MOD_ON);
+    out = frame_out();
+    CHECK(hud_layer_active());
+    CHECK(strcmp(token_of(out, tok, sizeof tok), "hudt,v1") == 0);
+
+    /* RESTORE through the hook: the bytes come back whole, whether the
+     * mod's post runs or the owner is switched off before it. */
+    {
+        static const float q[16] = { 600, 10, 0, 0, 700, 10, 1, 0,
+                                     700, 30, 1, 1, 600, 30, 0, 1 };
+        const uint32_t args[5] = { 1, 2, 3, 4, 5 };
+        uint8_t want[64];
+        memcpy(s_guest + 0x40, q, sizeof q);
+        memcpy(want, s_guest + 0x40, sizeof want);
+        s_hud_restored = 0;
+        guest_call(sub_std, args, 5);
+        CHECK(s_hud_moved && s_hud_restored == 1);
+        CHECK(memcmp(want, s_guest + 0x40, sizeof want) == 0);
+        s_hud_off_in_pre = 1;
+        s_hud_restored = 0;
+        guest_call(sub_std, args, 5);
+        s_hud_off_in_pre = 0;
+        CHECK(s_hud_moved && s_hud_restored == 0);
+        CHECK(memcmp(want, s_guest + 0x40, sizeof want) == 0);
+        CHECK(xbox_mod_set_enabled(index_of("hudt"), 1) == XBOX_MOD_ON);
+        frame_out();
+    }
+
+    /* One table per run: a second mod's is refused. */
+    out = start(NULL, NULL, two);
+    CHECK(s_hud_rc == 1 && s_hud_rc2 < 0);
+    CHECK(strstr(out, "[hud] table: a table is already registered\n") != NULL);
+
+    /* An owner whose init fails takes its table with it. */
+    s_hud_fail = 3;
+    out = start("[display]\naspect = \"16:9\"\n", NULL, one);
+    CHECK(s_hud_rc == 1 && !hud_layer_has_table() && !hud_layer_active());
+    CHECK(strstr(out, "[ENHANCE] display.hud_aspect") == NULL);
+    s_hud_fail = 0;
+}
+
 int main(void)
 {
     MKDIR("config");
@@ -793,6 +913,7 @@ int main(void)
     test_token_live();
     test_hooks();
     test_hook_state();
+    test_hud_table();
     xbox_mod_shutdown();
     remove("config/config.toml");
     printf("mod_hook: %d checks, %d failed\n", s_checks, s_fail);

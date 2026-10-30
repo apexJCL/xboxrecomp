@@ -52,6 +52,11 @@ struct recomp_cfg {
     size_t cap_tab_at;
     char **dotted;    /* tables made by dotted keys (a.b = 1 makes a) */
     size_t n_dotted, cap_dotted;
+    /* [[name]] arrays of tables (recomp_cfg_load_string_aot only): each
+     * name and how many of its tables were opened. */
+    char **aot;
+    size_t *aot_n;
+    size_t n_aot, cap_aot;
     char *name;
 };
 
@@ -62,6 +67,7 @@ typedef struct {
     char *err;
     size_t errlen;
     int failed;
+    int aot;          /* [[name]] allowed (recomp_cfg_load_string_aot) */
 } P;
 
 /* ── small helpers ─────────────────────────────────────────────────── */
@@ -631,18 +637,98 @@ static size_t line_start(const P *ps, const char *p)
     return (size_t)(p - ps->base);
 }
 
+/* The index of `name` among the [[name]] arrays, or -1. */
+static long aot_find(const recomp_cfg *c, const char *name, size_t len)
+{
+    size_t i;
+    for (i = 0; i < c->n_aot; i++)
+        if (strlen(c->aot[i]) == len && !strncmp(c->aot[i], name, len))
+            return (long)i;
+    return -1;
+}
+
+/* [[name]]: the next table of the array, held as [name.N] (N from 0), so
+ * its keys read as "name.N.key". Only one level: no [[a.b]] under [[a]]. */
+static int parse_aot_header(P *ps, Buf *table, size_t at)
+{
+    recomp_cfg *c = ps->cfg;
+    char num[24];
+    long k;
+    size_t i;
+
+    ps->p++;   /* the second '[' */
+    table->n = 0;
+    if (!buf_put(table, "", 0) || !parse_key(ps, table))
+        return 0;
+    if (ps->end - ps->p < 2 || ps->p[0] != ']' || ps->p[1] != ']')
+        return fail(ps, "expected ']]' after array of tables name");
+    ps->p += 2;
+    if (aot_find(c, table->b, table->n) < 0)
+        for (i = 0; i < c->n_tables; i++)
+            if (is_prefix(table->b, c->tables[i]) || is_prefix(c->tables[i], table->b))
+                return fail(ps, "[[%s]]: [%s] is a table", table->b, c->tables[i]);
+    if (list_has(c->dotted, c->n_dotted, table->b, table->n))
+        return fail(ps, "[[%s]]: already defined by a dotted key", table->b);
+    for (i = 0; i < c->n; i++)
+        if (is_prefix(c->e[i].key, table->b) || !strcmp(c->e[i].key, table->b))
+            return fail(ps, "'%s' is a value (line %d), not an array of tables",
+                        c->e[i].key, c->e[i].line);
+    k = aot_find(c, table->b, table->n);
+    if (k < 0) {
+        if (c->n_aot == c->cap_aot) {
+            size_t nc = c->cap_aot ? c->cap_aot * 2 : 4;
+            size_t *nn = (size_t *)realloc(c->aot_n, nc * sizeof *nn);
+            char **na;
+            if (!nn)
+                return fail(ps, "out of memory");
+            c->aot_n = nn;
+            na = (char **)realloc(c->aot, nc * sizeof *na);
+            if (!na)
+                return fail(ps, "out of memory");
+            c->aot = na;
+            c->cap_aot = nc;
+        }
+        if (!(c->aot[c->n_aot] = dup_n(table->b, table->n)))
+            return fail(ps, "out of memory");
+        c->aot_n[c->n_aot] = 0;
+        k = (long)c->n_aot++;
+    }
+    snprintf(num, sizeof num, ".%zu", c->aot_n[k]++);
+    if (!buf_put(table, num, strlen(num)))
+        return fail(ps, "out of memory");
+    if (c->n_tables == c->cap_tab_at) {
+        size_t nc = c->cap_tab_at ? c->cap_tab_at * 2 : 8;
+        size_t *na = (size_t *)realloc(c->tab_at, nc * sizeof *na);
+        if (!na)
+            return fail(ps, "out of memory");
+        c->tab_at = na;
+        c->cap_tab_at = nc;
+    }
+    c->tab_at[c->n_tables] = at;
+    if (!list_add(&c->tables, &c->n_tables, &c->cap_tables, table->b, table->n))
+        return fail(ps, "out of memory");
+    return expect_eol(ps);
+}
+
 static int parse_table_header(P *ps, Buf *table)
 {
     size_t i, at = line_start(ps, ps->p);
     ps->p++;   /* '[' */
-    if (ps->p < ps->end && *ps->p == '[')
-        return fail(ps, "arrays of tables are not supported");
+    if (ps->p < ps->end && *ps->p == '[') {
+        if (!ps->aot)
+            return fail(ps, "arrays of tables are not supported");
+        return parse_aot_header(ps, table, at);
+    }
     table->n = 0;
     if (!buf_put(table, "", 0) || !parse_key(ps, table))
         return 0;
     if (ps->p >= ps->end || *ps->p != ']')
         return fail(ps, "expected ']' after table name");
     ps->p++;
+    for (i = 0; i < ps->cfg->n_aot; i++)
+        if (is_prefix(ps->cfg->aot[i], table->b))
+            return fail(ps, "table [%s] is inside the array of tables [[%s]]", table->b,
+                        ps->cfg->aot[i]);
     for (i = 0; i < ps->cfg->n_tables; i++)
         if (!strcmp(ps->cfg->tables[i], table->b))
             return fail(ps, "table [%s] defined twice", table->b);
@@ -757,8 +843,8 @@ static const char *utf8_invalid(const char *s, const char *end)
 
 /* ── loading ───────────────────────────────────────────────────────── */
 
-recomp_cfg *recomp_cfg_load_string(const char *text, const char *name,
-                                   char *err, size_t errlen)
+static recomp_cfg *load_string(const char *text, const char *name, char *err, size_t errlen,
+                               int aot)
 {
     recomp_cfg *cfg = (recomp_cfg *)calloc(1, sizeof *cfg);
     Buf table = {0};
@@ -779,6 +865,7 @@ recomp_cfg *recomp_cfg_load_string(const char *text, const char *name,
     ps.cfg = cfg;
     ps.err = err;
     ps.errlen = errlen;
+    ps.aot = aot;
     if (ps.end - ps.p >= 3 && !memcmp(ps.p, "\xEF\xBB\xBF", 3))
         ps.p += 3;   /* UTF-8 byte-order mark */
     {
@@ -808,6 +895,24 @@ recomp_cfg *recomp_cfg_load_string(const char *text, const char *name,
         return NULL;
     }
     return cfg;
+}
+
+recomp_cfg *recomp_cfg_load_string(const char *text, const char *name,
+                                   char *err, size_t errlen)
+{
+    return load_string(text, name, err, errlen, 0);
+}
+
+recomp_cfg *recomp_cfg_load_string_aot(const char *text, const char *name,
+                                       char *err, size_t errlen)
+{
+    return load_string(text, name, err, errlen, 1);
+}
+
+size_t recomp_cfg_table_count(const recomp_cfg *cfg, const char *name)
+{
+    long k = cfg && name ? aot_find(cfg, name, strlen(name)) : -1;
+    return k < 0 ? 0 : cfg->aot_n[k];
 }
 
 recomp_cfg *recomp_cfg_load_file(const char *path, char *err, size_t errlen)
@@ -863,6 +968,10 @@ void recomp_cfg_free(recomp_cfg *cfg)
     for (i = 0; i < cfg->n_dotted; i++)
         free(cfg->dotted[i]);
     free(cfg->dotted);
+    for (i = 0; i < cfg->n_aot; i++)
+        free(cfg->aot[i]);
+    free(cfg->aot);
+    free(cfg->aot_n);
     free(cfg->e);
     free(cfg->name);
     free(cfg);

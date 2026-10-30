@@ -17,6 +17,7 @@
 
 #include "enhance_actions.h"
 #include "enhance_cfg.h"
+#include "hud_anchor.h"
 #ifdef XBOXRECOMP_ENHANCE
 #include "nv2a_overlay.h"
 #endif
@@ -134,6 +135,9 @@ static struct xbox_mod_api s_api;
  * follows key differs from that key's default, read once at init.
  * s_token: the listed table indices as last printed. */
 static int s_active[MOD_MAX];
+/* The mod that registered the HUD table (api->hud_table), or -1: the layer
+ * sets its s_active each frame, so it is listed only while the layer is. */
+static int s_hud_owner = -1;
 static int s_follows_on[MOD_MAX];
 static uint64_t s_token;
 
@@ -233,6 +237,16 @@ static int api_on_enable(void (*fn)(int on, void *user), void *user)
 }
 
 static void mod_mem(void);
+static int hook_owner_on(int i);
+
+/* The HUD layer's frame: its owner's listing follows the layer (mod.h,
+ * hud_table). Without a table, one load. */
+static void hud_frame(void)
+{
+    int o = s_hud_owner;
+    if (o >= 0)
+        __atomic_store_n(&s_active[o], hud_layer_frame(hook_owner_on(o)), __ATOMIC_RELAXED);
+}
 
 /* A hook runs while its mod does: on, or on until a restart. Inited
  * dormant or switched off live, it is left out of the call. */
@@ -256,8 +270,13 @@ static void hook_pre(struct xbox_mod_call *c, void *user)
 static void hook_post(struct xbox_mod_call *c, void *user)
 {
     const struct mod_hook *h = user;
-    if (!hook_owner_on(h->owner))
+    if (!hook_owner_on(h->owner)) {
+        /* Switched off between the pre and this post: the HUD layer still
+         * undoes what the pre began (a RESTORE shift, a wrapper's entry). */
+        if (h->owner == s_hud_owner)
+            hud_layer_post_off(c);
         return;
+    }
     mod_mem();
     h->post(c, h->user);
 }
@@ -289,6 +308,20 @@ static int api_hook(uint32_t va, xbox_mod_hook_fn pre, xbox_mod_hook_fn post,
         return 0;
     s_nhooks++;
     return 1;
+}
+
+static int api_hud_table(const char *toml, size_t len)
+{
+    int rc;
+
+    if (s_init_owner < 0 || s_init_owner >= MOD_MAX) {
+        fprintf(stderr, LOGP "hud_table: tables are registered only during init\n");
+        return -1;
+    }
+    rc = hud_layer_table(toml, len, api_hook);
+    if (rc >= 0)
+        s_hud_owner = s_init_owner;
+    return rc;
 }
 
 static void api_active(const struct xbox_mod *m, int on)
@@ -1113,6 +1146,8 @@ static int mod_init(int describe)
     }
     s_token = 0;
     s_nhooks = 0;
+    s_hud_owner = -1;
+    hud_layer_reset();
     recomp_hook_reset();
     enhance_actions_drop_mods();
     enhance_cfg_owner_add(NULL);
@@ -1151,6 +1186,10 @@ static int mod_init(int describe)
     s_api.control_value = api_control_value;
     s_api.hook = api_hook;
     s_api.active = api_active;
+    s_api.hud_table = api_hud_table;
+    s_api.hud_apply = hud_layer_apply;
+    s_api.hud_restore = hud_layer_restore;
+    hud_layer_set_mem(&s_api.mem);
     s_menu_on = enhance_cfg_bool("menu.enabled", 0);
 
     for (i = 0; s_table[i]; i++) {
@@ -1239,6 +1278,11 @@ static int mod_init(int describe)
         s_init_owner = -1;
         if (rc) {
             drop_owner(i);
+            /* Its table goes with it: its wrappers were dropped above. */
+            if (s_hud_owner == i) {
+                s_hud_owner = -1;
+                hud_layer_reset();
+            }
             /* Back to what the earlier mods left, either way. */
             enhance_input_capture(held);
             fprintf(stderr, LOGP "%s: init returned %d; left out\n", name, rc);
@@ -1272,6 +1316,7 @@ static int mod_init(int describe)
         if (nh)
             fprintf(stderr, LOGP "%d hooked function%s\n", nh, nh == 1 ? "" : "s");
     }
+    hud_frame();
     s_token = token_mask();
     token_print(s_token);
     if (s_nrunning && !s_exit_hooked) {
@@ -1325,6 +1370,7 @@ void xbox_mod_frame(void)
                                         s_mod[i].on_setting_user);
         }
     }
+    hud_frame();
     /* The token again when a toggle or a mod's active state changed it:
      * a few loads per frame, and only in a title with mods running. */
     {

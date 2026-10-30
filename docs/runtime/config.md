@@ -160,6 +160,8 @@ the stock settings, `present.pacing = "spin"` included.
 | `display.aspect` | string | `"W:H"`: `"4:3"` (stock) or a wider ratio such as `"16:9"`, `"16:10"`, `"21:9"`: Hor+ on Metal and D3D11 ([Hor+](#hor-widescreen-displayaspect)); the CPU rasteriser ignores it with a log line | `"4:3"` | `RECOMP_DISPLAY_ASPECT` |
 | `display.movie` | string | `"black"`, `"fit"`, `"fill"`: with a wide aspect, a full-screen movie or still is pillarboxed, stretched to the width, or scaled to cover it (top and bottom cropped) | `"black"` | `RECOMP_DISPLAY_MOVIE` |
 | `display.overscan` | int | guest pixels cropped from each left and right edge at present, top and bottom in proportion: `0` (stock) to `64` ([Overscan](#display-overscan-displayoverscan)); ignored with a wide `display.aspect` and by the CPU rasteriser, each with a log line | `0` | `RECOMP_DISPLAY_OVERSCAN` |
+| `display.hud_aspect` | string | how far a HUD mod moves the HUD ([HUD table](#hud-table-v5)): `"display"` (the frame's edges, as wide as `display.aspect`) or `"W:H"` from 4:3 up, capped at `display.aspect`. Narrower than 4:3 reads as 4:3 and an invalid value as `"display"`, each with a log line. Without a HUD mod, or at 4:3, nothing reads it | `"display"` | `RECOMP_DISPLAY_HUD_ASPECT` |
+| `display.hud_margin` | int | guest pixels a HUD mod's edge elements are pulled in from the HUD's edge: `0` to `64`; out of range is clamped with a line | `0` | `RECOMP_DISPLAY_HUD_MARGIN` |
 | `present.filter` | string | `"nearest"`, `"linear"`, `"integer"` | `"nearest"` | `RECOMP_PRESENT_FILTER` |
 | `present.fullscreen` | bool | borderless fullscreen at start | `false` | `RECOMP_PRESENT_FULLSCREEN` |
 | `present.pacing` | string | `"sleep"`, `"spin"` (stock, the console-original timing): how a lowered guest busy-wait waits | `"sleep"` | `RECOMP_PRESENT_PACING` |
@@ -216,11 +218,14 @@ and its title movie at 100:
 - 3D: centered; a clip box at the frame's edges reaches the target's edges.
 - 2D, not full width (HUD, menus, text): centered and scissored to the 4:3
   frame, so pieces the title parks off-screen never show in the pads. The
-  HUD keeps the title's 4:3 layout; there is no option to move or scale
-  it. A 2D batch's triangles say nothing of which HUD element they belong
-  to, so moving pieces by their position split groups the title draws as
-  one (BLiNX 2's item counter from its items, a dialogue face from its
-  box).
+  HUD keeps the title's 4:3 layout unless a HUD mod moves it: a 2D batch's
+  triangles say nothing of which HUD element they belong to, so moving
+  pieces by their position would split groups the title draws as one
+  (BLiNX 2's item counter from its items, a dialogue face from its box).
+  A HUD mod moves them in guest memory instead, per element, where the
+  title hands their vertices over ([HUD table](#hud-table-v5)); while one
+  is active such batches on the frame get the 3D box (the lift), so the
+  moved elements show in the pads.
 - 2D, full width, sampling only render targets, nothing, or a guest
   texture no wider than a quarter of the frame (fades, post passes):
   stretched over the whole target. On a square target that is the ratio's
@@ -1155,7 +1160,7 @@ points, its live class; the footer names the selected row's:
 
 | Class | Takes effect | Items |
 |---|---|---|
-| live | at the next flip | `render.aniso`, `render.snap_2d`, `present.filter`, `present.shader`, `present.pacing`, `display.overscan`, `display.movie`, `overlay.stats`, `input.mouse_capture`, every action binding, a mod with `on_enable` |
+| live | at the next flip | `render.aniso`, `render.snap_2d`, `present.filter`, `present.shader`, `present.pacing`, `display.overscan`, `display.movie`, `display.hud_margin` (listed while a HUD mod has registered a table), `overlay.stats`, `input.mouse_capture`, every action binding, a mod with `on_enable` |
 | at the flip | at the next flip, rebuilding the targets or the texture cache | `render.scale`, `present.fullscreen`, `textures.pack`, `textures.font`, `textures.text` |
 | next stage | at a later game point (a title's item) | none of the toolkit's |
 | next activation | when the mod next turns its feature on | a mod setting the descriptor marks so (the free camera's HUD choice) |
@@ -1188,6 +1193,8 @@ exist only when the layer is built (`RECOMP_ENV_HAVE_ENHANCE_KEYS`):
 | `RECOMP_DISPLAY_ASPECT` | overrides `display.aspect` |
 | `RECOMP_DISPLAY_MOVIE` | overrides `display.movie` |
 | `RECOMP_DISPLAY_OVERSCAN` | overrides `display.overscan` |
+| `RECOMP_DISPLAY_HUD_ASPECT` | overrides `display.hud_aspect` |
+| `RECOMP_DISPLAY_HUD_MARGIN` | overrides `display.hud_margin` |
 | `RECOMP_PRESENT_FILTER` | overrides `present.filter` |
 | `RECOMP_PRESENT_FULLSCREEN` | overrides `present.fullscreen` |
 | `RECOMP_PRESENT_PACING` | overrides `present.pacing` |
@@ -1306,7 +1313,7 @@ The title's glue calls two entries:
 - `xbox_mod_input_captured()` from its pad read. While it returns true, the
   title must see a released pad.
 
-`struct xbox_mod_api` (version 4, `XBOX_MOD_API_VERSION`) holds:
+`struct xbox_mod_api` (version 5, `XBOX_MOD_API_VERSION`) holds:
 
 | Member | What it gives |
 | --- | --- |
@@ -1326,6 +1333,9 @@ The title's glue calls two entries:
 | `control_value(desc, idx, out)` | v3. A captured control's value. Until the recorded pad state lands it reports not connected (0, `out` zeroed). |
 | `hook(va, pre, post, flags, user)` | v4. Callbacks around each call of the guest function at `va` ([Hooks](#hooks-v4)). Init only. |
 | `active(mod, on)` | v4. The mod's own "doing something now" state, for the `mods=` line. Any thread. |
+| `hud_table(toml, len)` | v5. Registers the game's HUD table ([HUD table](#hud-table-v5)). Init only; one mod per run. |
+| `hud_apply(c, d)` | v5. From a hook's pre on the call that takes a HUD element's vertices: moves, clips or stretches them for this frame. Guest threads. |
+| `hud_restore(c)` | v5. From the same hook's post: puts back what an `XBOX_HUD_RESTORE` apply changed. |
 
 `struct xbox_mod` gained two fields in v4, after `desc`:
 
@@ -1340,7 +1350,7 @@ The title's glue calls two entries:
   or whose effect hangs on more than one key, should call `api->active()`
   instead: that follows what it actually does, live.
 
-Tables written for v1 to v3 compile unchanged: the new fields are zero.
+Tables written for v1 to v4 compile unchanged: the new fields are zero.
 `struct xbox_mod` has no size field, so it is a source contract for mods
 linked into the title, not a plugin ABI.
 
@@ -1390,6 +1400,147 @@ callback may be NULL, but not both.
 - **Failed init.** A failed init's hooks are dropped with the rest of what
   it registered. The hooks take effect together, after every mod's init:
   the log reads `[MOD] N hooked functions`.
+
+### HUD table (v5)
+
+With a wide `display.aspect`, Hor+ keeps the HUD in the 4:3 columns. A HUD
+mod moves the game's HUD elements to the wide frame's edges. It does so in
+guest memory, at the call where the game hands an element's vertices over.
+The toolkit's HUD layer (`src/enhance/hud_anchor.h`) does the work and is
+game-agnostic: every address, size and kind comes from the game's table.
+
+**The mod's part:**
+
+1. At init, `api->hud_table(text, len)` registers the table, TOML text the
+   mod embeds (one `config/hud.toml` per game).
+2. It hooks the game's vertex call (`api->hook`, in the game's
+   `hook_functions`).
+3. From that hook's pre, it fills `struct xbox_hud_call` (`vtx_va`, `n`,
+   `flags`, and `queue` and `tex` for a later capture, else 0) and calls
+   `api->hud_apply(c, &d)`.
+4. With `XBOX_HUD_RESTORE` (the game keeps the buffer and draws it again),
+   it calls `api->hud_restore(c)` from the post, so a shift never
+   accumulates. The call must copy the vertices before it returns.
+   RESTORE calls may nest up to 3 deep per guest thread, each restored by
+   its own post (matched by `esp`); a fourth is left untouched with
+   `[hud.skip] ... restore calls nested too deep`. The saves are
+   thread-local, about 24 KB per host thread (3 levels of 1024 x and u
+   values). If the owner is switched
+   off between a pre and its post, the mod's post is not called and the
+   toolkit restores in its place.
+
+**Active.** The layer is active while all of these hold:
+
+- its owner mod is on;
+- the table is registered;
+- the canvas's target has a Hor+ pad, so `display.aspect` is wider than 4:3.
+
+It is recomputed in every `xbox_mod_frame`. While it is not active, every
+entry returns at its first test, no vertex changes and the backends see no
+lift, so stock and 4:3 are unchanged. The owner's `mods=` state follows the
+same flag. A second mod's `hud_table` is refused, and a failed init drops
+the table.
+
+**The schema.** An unknown key or table, a duplicate `ret_va`, or a wrapper
+without a hook slot refuses the whole table with one `[hud]` line:
+
+```toml
+version = 1                  # required
+
+[canvas]                     # where the game's HUD coordinates live
+w = 640                      # canvas units (fixed and memory sources)
+h = 480
+origin = "centre"            # or "top-left": where x = 0 is
+y = "down"                   # or "up"; the x rules never read it
+view = [0, 0, 640, 480]      # the target rectangle, guest px, the units map onto
+target = "frame"             # the back buffer's guest size, or [w, h]
+source = "fixed"             # "fixed", "memory" or "target"
+# source = "memory": w_va, h_va (required), view_va (4 values),
+# type = "f32" or "u32", mem_scale (a u32 value divided by it)
+
+[layout]
+stride = 28                  # bytes per vertex, 4..256
+x_off = 0                    # byte offset of the f32 x
+u_off = 16                   # optional: f32 u, for the clip
+prim = 4                     # vertices per primitive, 1..64 (default 4)
+
+[[wrapper]]                  # a function whose callers name the element
+va = 0x0006B1F0
+name = "draw_panel"
+
+[[group]]                    # sprites that share one transform
+name = "panel"
+kind = "left"
+# ref_x = -200               # proportional: the reference x, canvas units
+# park = 360                 # world: primitives beyond it are parked
+
+[[site]]                     # one call site, by return address
+ret_va = 0x0006B25A
+element = "portrait"
+group = "panel"              # or kind = "...": its own group
+note = "free text"
+
+[capture]                    # reserved for the mapping capture: only draws
+                             # (read, unused); any other key is refused
+```
+
+The canvas maps units to guest pixels by `s = view_w / w`. All rules run in
+guest pixels of the target and are converted back before the write. An
+offset is a whole guest pixel. A `memory` source is read once per guest
+frame. A value that is not finite, not positive or over 4096 falls back to
+the declared one, with a `[hud.canvas] ... fallback` line. A `target` source
+takes `w`, `h` and `view` from the frame's guest size.
+
+**Elements.** `hud_apply` finds the element from the call chain. Each
+wrapper's pre pushes its `[esp]` per guest thread. Sites are matched from
+the outermost wrapper inward, then by the hooked call's own `[esp]`. A call
+that matches no site is unlisted: its vertices are only clipped to the 4:3
+columns.
+
+**Kinds**, per primitive (`pad` is the target's Hor+ pad; `hud_pad` is
+`max(0, min(pad, pad at display.hud_aspect) - display.hud_margin)`):
+
+| Kind | Move |
+|---|---|
+| `left`, `right` | by `-hud_pad` or `+hud_pad` |
+| `centre` | none |
+| `proportional` | by `cx / (w/2) * hud_pad`, clamped to `±hud_pad`. `cx` is the group's `ref_x`, or else the first member drawn this frame (a group of one: each primitive) |
+| `world` | none and no clip, since the game projected it; a `park` bound hides parked sprites |
+| `stretch` | mapped across the wide frame by the full `pad`, as Hor+ stretches a fade |
+
+Each non-stretch primitive is clipped to the 4:3 columns moved by its
+offset, with `u` clipped in step when `u_off` is set. A primitive wholly
+outside them, one the game parked off-screen, is moved past the wide
+frame's edge so it stays hidden. A full-width primitive (a fade) is left
+for Hor+. A call whose vertex count is not a multiple of `prim`, or that
+has more than 1024 vertices under `XBOX_HUD_RESTORE`, is left untouched,
+with one `[hud.skip]` trace line per site.
+
+**The backends.** While the layer is active, Metal and D3D11 give a 2D
+batch drawn on the canvas's target the 3D box (the lift), so moved sprites
+show in the pads. Full-width batches (movies, fades) keep their box. On that
+target, a batch whose triangles reach past `[-8, w + 8]` is not counted as
+full width (`nv2a_aspect_full_tris_in`), so stretched sprites are not
+stretched a second time. The CPU rasteriser has no lift: moved elements are
+clipped there.
+
+**Logs.**
+
+- Always:
+  - `[hud] table: N sites, G groups, W wrappers` at registration;
+  - after the inits, with a table and a pad (`hud_pad` > 0), `[ENHANCE] display.hud_aspect=... display.hud_margin=... hud_pad=N`; none at 4:3, so the goldens' logs do not change.
+- With `RECOMP_TRACE=hud`, once per site or change:
+  - `[hud.site]`: an element's group, kind and offset;
+  - `[hud.canvas]`: the canvas, view, target and source;
+  - `[hud] lift on|off pad P hud_pad H`;
+  - `[hud.unlisted]`: an unlisted site drawn past the 4:3 columns;
+  - `[hud.skew]`: a site with a primitive the window cuts that is not axis-aligned, left unclipped;
+  - `[hud.skip]`.
+
+**Arrays of tables.** The toolkit's TOML reader takes `[[name]]` only
+through `recomp_cfg_load_string_aot`, which the HUD table uses. Its rows
+read as `name.<i>.<key>`, counted by `recomp_cfg_table_count`. `config.toml` still refuses
+them.
 
 ### The mods= line
 
@@ -1576,7 +1727,7 @@ Schema 1. Fields are only added; one removed or changed in meaning bumps
 `schema`. A field that does not apply is left out.
 
 ```json
-{"schema": 1, "api": 4, "mods": [
+{"schema": 1, "api": 5, "mods": [
   {"id": "fly", "title": "Free camera", "descriptor": true, "init": "no", "enable": "fly.enabled",
    "settings": [
       {"name": "speed", "key": "mods.fly.speed", "kind": "float", "label": "Speed",
@@ -1630,8 +1781,9 @@ not free anything its callbacks use.
 Hotkeys come from `xbox_FramebufferKeyDown` and the names in
 `src/input/input_names.h`. Tests: `tests/enhance_mod` (ctest `enhance_mod`)
 `tests/mod_desc` (ctest `mod_desc`, the descriptor and the dump), and
-`tests/mod_hook` (ctest `mod_hook`, the v4 fields, the `mods=` line and the
-hooks).
+`tests/mod_hook` (ctest `mod_hook`, the v4 fields, the `mods=` line, the
+hooks and the HUD table's registration), and `tests/hud_anchor` (ctest
+`hud_anchor`, the HUD layer's table, kinds, clip, chain and canvas).
 
 ## Design note: why the reader is our own
 

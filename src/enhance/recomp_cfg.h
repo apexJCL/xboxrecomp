@@ -13,7 +13,8 @@
  *   a.b = 1                  dotted key: the same as [a] b = 1
  *
  * Not supported, and reported as errors with a line number: multi-line
- * strings, inline tables, arrays of tables, nested arrays, dates and times.
+ * strings, inline tables, arrays of tables (but recomp_cfg_load_string_aot),
+ * nested arrays, dates and times.
  * Every file this reader accepts is valid TOML 1.0 (and must be UTF-8).
  *
  * Keys are looked up by their full dotted name ("render.scale"). A getter
@@ -48,6 +49,16 @@ recomp_cfg *recomp_cfg_load_file(const char *path, char *err, size_t errlen);
 recomp_cfg *recomp_cfg_load_string(const char *text, const char *name,
                                    char *err, size_t errlen);
 void recomp_cfg_free(recomp_cfg *cfg);
+
+/* As recomp_cfg_load_string, and [[name]] arrays of tables are taken: the
+ * Nth [[name]] (from 0) is the table "name.N", so its keys read as
+ * "name.N.key", and recomp_cfg_table_count gives how many there are. One
+ * level only, and only for embedded data (a HUD table, hud_anchor.h): the
+ * user's config files and the menu's Save keep refusing them. */
+recomp_cfg *recomp_cfg_load_string_aot(const char *text, const char *name,
+                                       char *err, size_t errlen);
+/* The number of [[name]] tables, 0 when there are none. */
+size_t recomp_cfg_table_count(const recomp_cfg *cfg, const char *name);
 
 /* Parse a C-locale number ("0.5", "-1e3", "inf", "nan"; no hex floats or
  * spaces) whatever the process locale is. 1 and *out on success. */

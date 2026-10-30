@@ -112,6 +112,42 @@ int nv2a_aspect_full_tris(const float (*xy)[2], const uint32_t *idx, uint32_t nt
     return 0;
 }
 
+int nv2a_aspect_full_tris_in(const float (*xy)[2], const uint32_t *idx, uint32_t ntri,
+                             uint32_t w, float lo, float hi)
+{
+    uint32_t t;
+
+    for (t = 0; t < ntri; t++) {
+        float a = xy[idx[3 * t]][0], b = xy[idx[3 * t + 1]][0], c = xy[idx[3 * t + 2]][0];
+        float mn = fminf(a, fminf(b, c)), mx = fmaxf(a, fmaxf(b, c));
+        if (nv2a_aspect_full_width(mn, mx, w) && mn >= lo && mx <= hi)
+            return 1;
+    }
+    return 0;
+}
+
+int nv2a_aspect_full(float lo_x, float hi_x, const float (*xy)[2], const uint32_t *idx,
+                     uint32_t ntri, uint32_t w, uint32_t h, int *wide)
+{
+    int full, bound;
+
+    if (wide)
+        *wide = 0;
+    if (!nv2a_aspect_full_width(lo_x, hi_x, w))
+        return 0;
+    full = !xy || !idx || nv2a_aspect_full_tris(xy, idx, ntri, w);
+    if (!full || !nv2a_aspect_hud_on(w, h))
+        return full;
+    if (xy && idx)
+        bound = nv2a_aspect_full_tris_in(xy, idx, ntri, w, -NV2A_HUD_WIDE_BAND,
+                                         (float)w + NV2A_HUD_WIDE_BAND);
+    else
+        bound = lo_x >= -NV2A_HUD_WIDE_BAND && hi_x <= (float)w + NV2A_HUD_WIDE_BAND;
+    if (wide)
+        *wide = !bound;
+    return bound;
+}
+
 /* The finite bounds of xy[0..n), or 0 when n is 0 or a value is not
  * finite (fminf and fmaxf would skip a NaN). */
 static int quad_box(const float (*xy)[2], uint32_t n, float *lo_x, float *hi_x, float *lo_y,

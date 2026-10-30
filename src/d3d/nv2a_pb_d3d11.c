@@ -1182,7 +1182,7 @@ static void clear_region(RenderTarget *rt, const struct nv2a_pb_gpu *g, const fl
      * edge at 0 or w reaching the hor+ pads (nv2a_aspect_box). */
     {
         uint32_t hb[4];
-        nv2a_aspect_box(b, rt->w, rt->h, rt->pad, rt->n, NV2A_PLACE_CENTRE, 0, hb);
+        nv2a_aspect_box(b, rt->w, rt->h, rt->pad, rt->n, NV2A_PLACE_CENTRE, 0, 0, hb);
         r.left = (LONG)hb[0];
         r.top = (LONG)hb[1];
         r.right = (LONG)hb[2];
@@ -3309,7 +3309,7 @@ static int aspect_trace(void)
 /* RECOMP_ASPECT_TRACE: each 2D batch's placement, once per program,
  * stage-0 texture and placement (Metal's aspect_log, same line). */
 static void aspect_log(uint32_t hash, uint32_t count, uint32_t ntri, float lo_x,
-                       float hi_x, const RenderTarget *rt, int place)
+                       float hi_x, const RenderTarget *rt, int place, int lift, int wide)
 {
     static const char *const names[] = { "centre", "stretch", "cover" };
     enum { SET = 4096 };
@@ -3317,7 +3317,7 @@ static void aspect_log(uint32_t hash, uint32_t count, uint32_t ntri, float lo_x,
     static unsigned used;
     const Stage *t0 = &s_stage[0];
     uint64_t key = ((uint64_t)hash << 32 | (t0->mode ? t0->offset : 0)) * 0x9E3779B97F4A7C15ull
-                   + (uint64_t)place + 1u;
+                   + (uint64_t)(place | lift << 4 | wide << 5) + 1u;
     unsigned h = (unsigned)(key >> 52) & (SET - 1u);
     while (set[h] && set[h] != key)
         h = (h + 1u) & (SET - 1u);
@@ -3326,11 +3326,12 @@ static void aspect_log(uint32_t hash, uint32_t count, uint32_t ntri, float lo_x,
     set[h] = key;
     used++;
     fprintf(stderr, "[aspect.program] %08X flip %llu: %u vertices %u tris x %g..%g on %ux%u"
-            " pad %u at 0x%08X pitch %u, stage 0 %s 0x%08X fmt %X %ux%u pitch %u -> %s\n", hash,
+            " pad %u at 0x%08X pitch %u, stage 0 %s 0x%08X fmt %X %ux%u pitch %u -> %s%s%s\n", hash,
             (unsigned long long)s_presents, count, ntri, lo_x, hi_x, rt->w, rt->h, rt->pad,
             rt->addr, rt->pitch,
             !t0->mode || t0->mode == 4 ? "none" : s_stage_rt[0] ? "rt" : "tex", t0->offset,
-            t0->color, t0->width, t0->height, t0->pitch, names[place]);
+            t0->color, t0->width, t0->height, t0->pitch, names[place], lift ? " lift" : "",
+            wide ? " wide" : "");
 }
 
 /* RECOMP_ASPECT_TRACE: each program and w the first time a flat near
@@ -3396,7 +3397,8 @@ static int aspect_flat(const struct nv2a_pb_draw *d, const struct nv2a_pb_vsh *v
  * (nv2a_aspect_map, nv2a_aspect_box; with pad 0 both are stock). cb is
  * the surface clip (nv2a_draw_box). */
 static void set_vp(const struct nv2a_pb_vsh *v, const struct nv2a_pb_gpu *g,
-                   const RenderTarget *rt, int place, int two_d, const uint32_t cb[4])
+                   const RenderTarget *rt, int place, int two_d, int lift,
+                   const uint32_t cb[4])
 {
     static uint8_t vp_shadow[80];
     static int vp_ok;
@@ -3419,7 +3421,7 @@ static void set_vp(const struct nv2a_pb_vsh *v, const struct nv2a_pb_gpu *g,
         memcpy(vp_shadow, vp, sizeof vp);
         vp_ok = 1;
     }
-    nv2a_aspect_box(cb, rt->w, rt->h, rt->pad, rt->n, place, two_d, hb);
+    nv2a_aspect_box(cb, rt->w, rt->h, rt->pad, rt->n, place, two_d, lift, hb);
     sr.left = (LONG)hb[0];
     sr.top = (LONG)hb[1];
     sr.right = (LONG)hb[2];
@@ -3443,7 +3445,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
     const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
     struct aspect_batch hp = {0, 0, NV2A_PLACE_CENTRE, 0, NULL};
-    int have_x = 0, tris = 0, flat = 0, scan;
+    int have_x = 0, tris = 0, flat = 0, lift = 0, wide = 0, scan;
     float lo_x = 0, hi_x = 0;      /* hor+: a 2D batch's x range, surface pixels */
     D3D11_PRIMITIVE_TOPOLOGY topo;
     ID3D11Buffer *vbs[NV2A_VS_MAX_INPUTS];
@@ -3665,9 +3667,8 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         nv2a_aspect_scan(&vs->hp, NULL, 0, NULL, NULL, 0, NULL, 0, NULL, &lo_x, &hi_x);
     }
     if (have_x)
-        hp.full_w = nv2a_aspect_full_width(lo_x, hi_x, rt->w)
-                    && (!tris || nv2a_aspect_full_tris((const float (*)[2])hxy, idx,
-                                                       nidx / 3u, rt->w));
+        hp.full_w = nv2a_aspect_full(lo_x, hi_x, tris ? (const float (*)[2])hxy : NULL,
+                                     tris ? idx : NULL, nidx / 3u, rt->w, rt->h, &wide);
     else if (rt->pad && d->program && topo == D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST
              && count <= NV2A_ASPECT_QUAD_MAX) {
         hp.d = d;
@@ -3814,14 +3815,19 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             lo_x = hp.lo_x;     /* a screen quad (aspect_quad) */
             hi_x = hp.hi_x;
         }
-        if (hp.two_d && rt->pad && aspect_trace())
-            aspect_log(vs->hash, count, nidx / 3u, lo_x, hi_x, rt, hp.place);
         /* A flat near layer drawn without depth keeps its place but is
          * clipped to the guest columns like the 2D (nv2a_aspect_flat), as
          * in metal_on_draw. */
         flat = rt->pad && d->program && !hp.two_d && !v->depth_enable
                && aspect_flat(d, v, vs, rt, lo, count);
-        set_vp(v, g, rt, hp.place, hp.two_d || flat, cb);
+        /* A HUD mod clipped its elements in guest memory: lift the 4:3
+         * clip of the 2D it moved (nv2a_aspect_hud_lift). */
+        lift = rt->pad && nv2a_aspect_hud_lift(rt->w, rt->h, hp.two_d, flat, hp.full_w,
+                                               have_x ? lo_x : 0.0f,
+                                               have_x ? hi_x : (float)rt->w);
+        if (hp.two_d && rt->pad && aspect_trace())
+            aspect_log(vs->hash, count, nidx / 3u, lo_x, hi_x, rt, hp.place, lift, wide);
+        set_vp(v, g, rt, hp.place, hp.two_d || flat, lift, cb);
         if (px_on()) {
             uint32_t before[4];
             int n;
@@ -4893,6 +4899,9 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
         nv2a_occ_poll(&s_occ, 0);
     present_resize();
     s_drawn = present_target(surface_offset);
+    /* The frame's target size, for a HUD canvas on "frame". */
+    if (s_drawn)
+        nv2a_aspect_frame_publish(s_drawn->w, s_drawn->h);
     s_dump_rt = 0;
 #ifdef XBOXRECOMP_ENHANCE
     s_ovl_place.w = s_ovl_place.h = 0;     /* no frame: the whole back buffer */

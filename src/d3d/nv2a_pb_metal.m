@@ -956,7 +956,7 @@ static void metal_on_clear(uint32_t param)
             MTLScissorRect sr;
             uint32_t hb[4];
             /* As a 3D draw's clip: an edge at 0 or w reaches the pads. */
-            nv2a_aspect_box(b, rt->w, rt->h, rt->pad, rt->n, NV2A_PLACE_CENTRE, 0, hb);
+            nv2a_aspect_box(b, rt->w, rt->h, rt->pad, rt->n, NV2A_PLACE_CENTRE, 0, 0, hb);
             sr.x = hb[0];
             sr.y = hb[1];
             sr.width = hb[2] - hb[0];
@@ -2064,7 +2064,7 @@ static int aspect_trace(void)
 }
 
 static void aspect_log(uint32_t hash, uint32_t count, uint32_t ntri, float lo_x,
-                       float hi_x, const RenderTarget *rt, int place)
+                       float hi_x, const RenderTarget *rt, int place, int lift, int wide)
 {
     static const char *const names[] = { "centre", "stretch", "cover" };
     /* Said once per program, stage-0 texture and placement: the XDK's
@@ -2076,7 +2076,7 @@ static void aspect_log(uint32_t hash, uint32_t count, uint32_t ntri, float lo_x,
     const Stage *t0 = &s_stage[0];
     RenderTarget *src;
     uint64_t key = ((uint64_t)hash << 32 | (t0->mode ? t0->offset : 0)) * 0x9E3779B97F4A7C15ull
-                   + (uint64_t)place + 1u;
+                   + (uint64_t)(place | lift << 4 | wide << 5) + 1u;
     unsigned h = (unsigned)(key >> 52) & (SET - 1u);
     while (set[h] && set[h] != key)
         h = (h + 1u) & (SET - 1u);
@@ -2086,11 +2086,12 @@ static void aspect_log(uint32_t hash, uint32_t count, uint32_t ntri, float lo_x,
     used++;
     src = !t0->mode || t0->mode == 4 ? NULL : rt_texture(t0, (RenderTarget *)rt);
     fprintf(stderr, "[aspect.program] %08X flip %llu: %u vertices %u tris x %g..%g on %ux%u"
-            " pad %u at 0x%08X pitch %u, stage 0 %s 0x%08X fmt %X %ux%u pitch %u -> %s\n", hash,
+            " pad %u at 0x%08X pitch %u, stage 0 %s 0x%08X fmt %X %ux%u pitch %u -> %s%s%s\n", hash,
             (unsigned long long)s_presents, count, ntri, lo_x, hi_x, rt->w, rt->h, rt->pad,
             rt->addr, rt->pitch,
             !t0->mode || t0->mode == 4 ? "none" : src ? "rt" : "tex", t0->offset,
-            t0->color, t0->width, t0->height, t0->pitch, names[place]);
+            t0->color, t0->width, t0->height, t0->pitch, names[place], lift ? " lift" : "",
+            wide ? " wide" : "");
 }
 
 /* RECOMP_TRACE=aspect: one line per program and w the first time a flat
@@ -2140,6 +2141,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
     int cull = 0, cull_all = 0;
     unsigned bump_src;
     int full_w = 0, guest_tex = 0, flat_rt = 0, two_d = 0, have_x = 0, tris = 0, flat = 0;
+    int lift = 0, wide = 0;
     int vary_z = 0;     /* a program's 2D batch off one oPos.z (nv2a_aspect_gate) */
     int scan;
     int place = NV2A_PLACE_CENTRE;
@@ -2320,9 +2322,8 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                                  &lo_x, &hi_x);
         }
         if (have_x)
-            full_w = nv2a_aspect_full_width(lo_x, hi_x, rt->w)
-                     && (!tris || nv2a_aspect_full_tris((const float (*)[2])hxy, idx,
-                                                        nidx / 3u, rt->w));
+            full_w = nv2a_aspect_full(lo_x, hi_x, tris ? (const float (*)[2])hxy : NULL,
+                                      tris ? idx : NULL, nidx / 3u, rt->w, rt->h, &wide);
 
         /* Depth: the zeta surface's buffer, attached to this target's
          * passes from now on (a new pass if the open one lacks it). */
@@ -2418,8 +2419,13 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         }
         if (place != NV2A_PLACE_CENTRE)
             s_draws_stretch++;
+        /* A HUD mod clipped its elements in guest memory: lift the 4:3
+         * clip of the 2D it moved (nv2a_aspect_hud_lift). */
+        lift = rt->pad && nv2a_aspect_hud_lift(rt->w, rt->h, two_d, flat, full_w,
+                                               have_x ? lo_x : 0.0f,
+                                               have_x ? hi_x : (float)rt->w);
         if (two_d && rt->pad && aspect_trace())
-            aspect_log(ve ? ve->hash : 0, count, nidx / 3u, lo_x, hi_x, rt, place);
+            aspect_log(ve ? ve->hash : 0, count, nidx / 3u, lo_x, hi_x, rt, place, lift, wide);
         /* A batch sampling a padded target the stock way reads it whole,
          * pads and all, which is what a stretched pass wants, short of a
          * square's overscan (nv2a_rt_stretch_read). Any other reads its
@@ -2468,7 +2474,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 s_draws_skipped++;
                 return;
             }
-            nv2a_aspect_box(b, rt->w, rt->h, rt->pad, rt->n, place, two_d || flat, hb);
+            nv2a_aspect_box(b, rt->w, rt->h, rt->pad, rt->n, place, two_d || flat, lift, hb);
             sr.x = hb[0];
             sr.y = hb[1];
             sr.width = hb[2] - hb[0];
@@ -3418,6 +3424,8 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
             id<MTLTexture> slot = nil;
             rt = present_target(surface_offset);
             if (rt) {
+                /* The frame's target size, for a HUD canvas on "frame". */
+                nv2a_aspect_frame_publish(rt->w, rt->h);
                 present_extent(rt, &cw, &ch);
                 hcw = (cw + 2u * rt->pad) * rt->n;
                 hch = ch * rt->n;

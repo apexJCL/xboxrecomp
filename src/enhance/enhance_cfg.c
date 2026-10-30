@@ -53,6 +53,8 @@ static void bind_builtins(void)
     enhance_cfg_bind_env("render.snap_2d", RENV_RENDER_SNAP_2D);
     enhance_cfg_bind_env("display.aspect", RENV_DISPLAY_ASPECT);
     enhance_cfg_bind_env("display.movie", RENV_DISPLAY_MOVIE);
+    enhance_cfg_bind_env("display.hud_aspect", RENV_DISPLAY_HUD_ASPECT);
+    enhance_cfg_bind_env("display.hud_margin", RENV_DISPLAY_HUD_MARGIN);
     enhance_cfg_bind_env("display.overscan", RENV_DISPLAY_OVERSCAN);
     enhance_cfg_bind_env("present.filter", RENV_PRESENT_FILTER);
     enhance_cfg_bind_env("present.fullscreen", RENV_PRESENT_FULLSCREEN);

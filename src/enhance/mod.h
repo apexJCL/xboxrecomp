@@ -56,9 +56,29 @@
 extern "C" {
 #endif
 
-#define XBOX_MOD_API_VERSION 4u
+#define XBOX_MOD_API_VERSION 5u
 
 struct xbox_mod_api;
+
+/* The HUD layer's kinds (api->hud_table's groups, hud_anchor.h). */
+enum {
+    XBOX_HUD_CENTRE = 0,        /* stays put, clipped to the 4:3 columns */
+    XBOX_HUD_LEFT,              /* moved to the HUD's left edge */
+    XBOX_HUD_RIGHT,             /* moved to the HUD's right edge */
+    XBOX_HUD_PROPORTIONAL,      /* moved by its distance from the centre */
+    XBOX_HUD_WORLD,             /* projected by the game: not moved or clipped */
+    XBOX_HUD_STRETCH            /* mapped across the wide frame, as H5's stretch */
+};
+
+/* One call that hands a HUD element's vertices over (api->hud_apply). */
+struct xbox_hud_call {
+    uint32_t vtx_va;            /* guest address of the first vertex */
+    uint32_t n;                 /* vertex count */
+    uint32_t flags;             /* XBOX_HUD_RESTORE */
+    uint32_t queue;             /* the game's queue or layer, for capture; 0 */
+    uint64_t tex;               /* the pack's texel hash of its texture, or 0 */
+};
+#define XBOX_HUD_RESTORE 1u
 struct xbox_mod_desc;
 struct enhance_item;            /* enhance_menu.h */
 
@@ -310,6 +330,28 @@ struct xbox_mod_api {
      * (a default-on mod that does nothing at 4:3 stays out). One that
      * never calls it is listed while it runs and is on. Any thread. */
     void (*active)(const struct xbox_mod *m, int on);
+
+    /* ---- version 5 (check size before using these) --------------------- */
+
+    /* The HUD layer (hud_anchor.h; openspec change hud-anchors). Init
+     * only: parse and register the game's HUD table, TOML text the mod
+     * embeds (schema: docs/runtime/config.md, "HUD table"). Every
+     * [[wrapper]] must have a hook slot; the layer hooks it for the mod. A
+     * duplicate site, an unknown group or kind, a wrapper with no slot or a
+     * bad canvas fails with one line and returns < 0. One table per run.
+     * Returns the number of sites. The mod that registers it is listed in
+     * mods= only while the layer is active (the mod on, the table, a wide
+     * display.aspect); it need not call active itself. */
+    int (*hud_table)(const char *toml, size_t len);
+    /* From a hook's pre on the call that takes a HUD element's vertices:
+     * find the element by return address (the wrappers' call chain, then
+     * the call's own) and shift, clip or stretch its vertices for the wide
+     * frame. With XBOX_HUD_RESTORE the x and u it changes are saved and
+     * put back by hud_restore at that hook's post (the call must copy the
+     * vertices). The kind applied, or -1 when the call is left as it is
+     * (the layer inactive, or the call skipped). Guest thread. */
+    int (*hud_apply)(const struct xbox_mod_call *c, const struct xbox_hud_call *d);
+    void (*hud_restore)(const struct xbox_mod_call *c);
 };
 
 /* Stack argument n (0-based) of a hooked call, in a pre or a post. */

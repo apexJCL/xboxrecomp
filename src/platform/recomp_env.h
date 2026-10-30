@@ -78,6 +78,8 @@ extern "C" {
     X(RENDER_SNAP_2D,    CONFIG, "RECOMP_RENDER_SNAP_2D",    NULL, "enhancements: render.snap_2d, above render.scale 1 2D batches sample textures on the guest grid, as at 1x (no seams between tiles, blockier 2D art) (1/0, default 0)") \
     X(DISPLAY_ASPECT,    CONFIG, "RECOMP_DISPLAY_ASPECT",    NULL, "enhancements: display.aspect, 4:3 (stock), 16:9, 16:10, 21:9") \
     X(DISPLAY_MOVIE,     CONFIG, "RECOMP_DISPLAY_MOVIE",     NULL, "enhancements: display.movie, the sides of a 4:3 movie or still on a wide display.aspect: black (default, pillarbox), fit (stretched to the width), fill (scaled to cover, top and bottom cropped)") \
+    X(DISPLAY_HUD_ASPECT, CONFIG, "RECOMP_DISPLAY_HUD_ASPECT", NULL, "enhancements: display.hud_aspect, how wide the HUD reaches under a HUD mod on a wide display.aspect: display (default, the frame's edges) or W:H from 4:3 up") \
+    X(DISPLAY_HUD_MARGIN, CONFIG, "RECOMP_DISPLAY_HUD_MARGIN", NULL, "enhancements: display.hud_margin, guest px a HUD mod's edge elements are pulled in from the HUD's edge, 0 (default) to 64") \
     X(DISPLAY_OVERSCAN,  CONFIG, "RECOMP_DISPLAY_OVERSCAN",  NULL, "enhancements: display.overscan, guest px cropped from each side edge at present (top and bottom in proportion), 0 (stock) to 64; ignored with a wide display.aspect") \
     X(PRESENT_FILTER,    CONFIG, "RECOMP_PRESENT_FILTER",    NULL, "enhancements: present.filter, nearest (stock), linear, integer") \
     X(PRESENT_FULLSCREEN, CONFIG, "RECOMP_PRESENT_FULLSCREEN", NULL, "enhancements: present.fullscreen, borderless desktop fullscreen at start (1/0)") \
@@ -158,6 +160,7 @@ extern "C" {
     X(METAL_SHADERS,     TRACE, "metal_shaders",   NULL,                       "Metal shader and pipeline builds: each MSL library and pipeline state with its ms, and a [metal] build line for every flip that built one or uploaded textures for 5 ms or more") \
     X(VSH_TRACE,         TRACE, "vsh",             "RECOMP_VSH_TRACE",         "vertex programs and their batches") \
     X(ASPECT_TRACE,      TRACE, "aspect",          NULL,                       "display.aspect: the 2D batches of each vertex program, texture and placement, once each ([aspect.program]), and the padded target per flip") \
+    X(HUD_TRACE,         TRACE, "hud",             NULL,                       "the HUD layer (hud_anchor.h): each site's element, group, kind and shift ([hud.site]), unlisted sites drawn past the 4:3 columns, skewed and skipped calls, the canvas and the lift") \
     X(VSH_ZLOG,          TRACE, "zlog",            "RECOMP_VSH_ZLOG",          "depth clears and z-buffer use") \
     X(TEX_LOG,           TRACE, "tex",             "RECOMP_TEX_LOG",           "texture format survey; =2 also every texture") \
     X(TEX_STATE,         TRACE, "tex_state",       "RECOMP_TEX_STATE",         "texture-state methods seen, in the report") \

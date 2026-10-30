@@ -158,6 +158,56 @@ static const char *capture_end(void)
 
 /* ── the subset ────────────────────────────────────────────────────── */
 
+/* [[name]] arrays of tables: refused by the config loader, taken by
+ * recomp_cfg_load_string_aot (embedded data: a HUD table, hud_anchor.h). */
+static void test_aot(void)
+{
+    static const char text[] =
+        "version = 1\n"
+        "[canvas]\nw = 640\n"
+        "[[site]]\nret_va = 0x2000\nelement = \"score\"\n"
+        "[[group]]\nname = \"g\"\n"
+        "[[site]]\nret_va = 0x2010\nnote.x = 3\n";
+    static const char *const bad[] = {
+        "[a]\nx = 1\n[[a]]\ny = 2\n",          /* a table, then an array */
+        "[[a]]\nx = 1\n[a]\ny = 2\n",          /* the other way round */
+        "[[a]]\nx = 1\n[a.b]\ny = 2\n",        /* a table inside one */
+        "a = 1\n[[a]]\nx = 1\n",                /* a value */
+        "b.c = 1\n[[b]]\nx = 1\n",              /* a dotted key's table */
+        "[[a]\nx = 1\n",                         /* unclosed */
+    };
+    char err[256];
+    recomp_cfg *c = recomp_cfg_load_string(text, "aot", err, sizeof err);
+
+    CHECK(c == NULL && strstr(err, "arrays of tables are not supported"));
+    c = recomp_cfg_load_string_aot(text, "aot", err, sizeof err);
+    CHECK(c != NULL);
+    if (!c) {
+        fprintf(stderr, "aot: %s\n", err);
+        return;
+    }
+    CHECK(recomp_cfg_table_count(c, "site") == 2);
+    CHECK(recomp_cfg_table_count(c, "group") == 1);
+    CHECK(recomp_cfg_table_count(c, "canvas") == 0);
+    CHECK(recomp_cfg_table_count(c, "none") == 0);
+    CHECK(recomp_cfg_int(c, "site.0.ret_va", 0) == 0x2000);
+    CHECK(!strcmp(recomp_cfg_string(c, "site.0.element", ""), "score"));
+    CHECK(recomp_cfg_int(c, "site.1.ret_va", 0) == 0x2010);
+    CHECK(recomp_cfg_int(c, "site.1.note.x", 0) == 3);
+    CHECK(!strcmp(recomp_cfg_string(c, "group.0.name", ""), "g"));
+    CHECK(recomp_cfg_int(c, "canvas.w", 0) == 640);
+    CHECK(recomp_cfg_type_of(c, "site.0.note") == RCFG_NONE);
+    recomp_cfg_free(c);
+    for (size_t i = 0; i < sizeof bad / sizeof bad[0]; i++) {
+        c = recomp_cfg_load_string_aot(bad[i], "aot", err, sizeof err);
+        if (c)
+            fprintf(stderr, "aot: bad text %zu accepted\n", i);
+        CHECK(c == NULL);
+        recomp_cfg_free(c);
+    }
+    CHECK(recomp_cfg_table_count(NULL, "site") == 0);
+}
+
 static void test_subset(void)
 {
     static const char text[] =
@@ -1956,6 +2006,7 @@ static void test_owners(void)
 int main(void)
 {
     test_subset();
+    test_aot();
     test_errors();
     test_quoted_dots();
     test_strict_valid();

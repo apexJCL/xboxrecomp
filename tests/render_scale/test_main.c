@@ -251,9 +251,9 @@ int main(void)
             nv2a_aspect_map(&c, 640, 480, 0, p);
             CHECK(memcmp(&c, &c0, sizeof c) == 0);
             nv2a_host_box(part, 640, 480, 1280, 960, ref);
-            nv2a_aspect_box(part, 640, 480, 0, 2, p, 1, out);
+            nv2a_aspect_box(part, 640, 480, 0, 2, p, 1, 0, out);
             CHECK(memcmp(out, ref, sizeof out) == 0);
-            nv2a_aspect_box(part, 640, 480, 0, 2, p, 0, out);
+            nv2a_aspect_box(part, 640, 480, 0, 2, p, 0, 0, out);
             CHECK(memcmp(out, ref, sizeof out) == 0);
         }
 
@@ -273,16 +273,41 @@ int main(void)
         CHECK(fabsf(c.c[5] - 854.0f / 640.0f) < 1e-6f);
 
         /* Scissors at 16:9, n 2 (host 1708 x 960). */
-        nv2a_aspect_box(box, 640, 480, 107, 2, NV2A_PLACE_CENTRE, 1, out);
+        nv2a_aspect_box(box, 640, 480, 107, 2, NV2A_PLACE_CENTRE, 1, 0, out);
         CHECK(out[0] == 214 && out[2] == 1494 && out[1] == 0 && out[3] == 960);
-        nv2a_aspect_box(box, 640, 480, 107, 2, NV2A_PLACE_CENTRE, 0, out);
+        nv2a_aspect_box(box, 640, 480, 107, 2, NV2A_PLACE_CENTRE, 0, 0, out);
         CHECK(out[0] == 0 && out[2] == 1708);                             /* 3D fills the pads */
-        nv2a_aspect_box(part, 640, 480, 107, 2, NV2A_PLACE_CENTRE, 0, out);
+        nv2a_aspect_box(part, 640, 480, 107, 2, NV2A_PLACE_CENTRE, 0, 0, out);
         CHECK(out[0] == 246 && out[2] == 854);                            /* a 3D sub-box does not */
-        nv2a_aspect_box(box, 640, 480, 107, 2, NV2A_PLACE_STRETCH, 1, out);
+        nv2a_aspect_box(box, 640, 480, 107, 2, NV2A_PLACE_STRETCH, 1, 0, out);
         CHECK(out[0] == 0 && out[2] == 1708);
-        nv2a_aspect_box(box, 640, 480, 107, 2, NV2A_PLACE_COVER, 1, out);
+        nv2a_aspect_box(box, 640, 480, 107, 2, NV2A_PLACE_COVER, 1, 0, out);
         CHECK(out[0] == 0 && out[2] == 1708 && out[3] == 960);
+
+        /* The HUD layer (hud-anchors 1.6): a lifted 2D batch is boxed like
+         * the world; a sub-box keeps its place. Only on the canvas target,
+         * only 2D that is not flat, not full width and not wholly inside. */
+        nv2a_aspect_box(box, 640, 480, 107, 2, NV2A_PLACE_CENTRE, 1, 1, out);
+        CHECK(out[0] == 0 && out[2] == 1708);
+        nv2a_aspect_box(part, 640, 480, 107, 2, NV2A_PLACE_CENTRE, 1, 1, out);
+        CHECK(out[0] == 246 && out[2] == 854);
+        CHECK(!nv2a_aspect_hud_lift(640, 480, 1, 0, 0, -50.0f, 100.0f));     /* flag clear */
+        nv2a_aspect_hud_set(1, 640, 480);
+        CHECK(nv2a_aspect_hud_on(640, 480) && !nv2a_aspect_hud_on(512, 512));
+        CHECK(nv2a_aspect_hud_lift(640, 480, 1, 0, 0, -50.0f, 100.0f));
+        CHECK(nv2a_aspect_hud_lift(640, 480, 1, 0, 0, 600.0f, 700.0f));
+        CHECK(!nv2a_aspect_hud_lift(640, 480, 1, 0, 0, 10.0f, 630.0f));      /* wholly inside */
+        CHECK(!nv2a_aspect_hud_lift(640, 480, 0, 0, 0, -50.0f, 100.0f));     /* 3D */
+        CHECK(!nv2a_aspect_hud_lift(640, 480, 1, 1, 0, -50.0f, 100.0f));     /* flat */
+        CHECK(!nv2a_aspect_hud_lift(640, 480, 1, 0, 1, -50.0f, 100.0f));     /* full width */
+        CHECK(!nv2a_aspect_hud_lift(512, 512, 1, 0, 0, -50.0f, 100.0f));     /* other target */
+        nv2a_aspect_hud_set(0, 640, 480);
+        CHECK(!nv2a_aspect_hud_on(640, 480));
+        {
+            uint32_t fw = 0, fh = 0;
+            nv2a_aspect_frame_publish(640, 480);
+            CHECK(nv2a_aspect_frame(&fw, &fh) && fw == 640 && fh == 480);
+        }
 
         /* A stretch on a padded square spans the ratio's pad only (85 of
          * 149 at 16:9, 810 wide): a full-width copy of the frame into it,
@@ -302,7 +327,7 @@ int main(void)
             nv2a_aspect_map(&c, 512, 512, 149, NV2A_PLACE_STRETCH);
             CHECK(fabsf(c.c[4] - (128.0f / 810.0f - 1.0f)) < 1e-6f);          /* x 0 at column 64 */
             CHECK(fabsf(512.0f * c.c[0] + c.c[4] - (1.0f - 128.0f / 810.0f)) < 1e-6f);
-            nv2a_aspect_box(sbox, 512, 512, 149, 2, NV2A_PLACE_STRETCH, 1, out);
+            nv2a_aspect_box(sbox, 512, 512, 149, 2, NV2A_PLACE_STRETCH, 1, 0, out);
             CHECK(out[0] == 128 && out[2] == 1492 && out[3] == 1024);
             /* The frame's left pad edge, read the guest way, is that column. */
             nv2a_rt_guest_read(512, 149, &sc, &off);
@@ -431,6 +456,29 @@ int main(void)
         for (t = 0; t < 12; t++)
             idx[t] = t;
         CHECK(!nv2a_aspect_full_tris((const float (*)[2])xy, idx, 4, 640));
+        /* The already-wide rule (hud-anchors 1.6): with the HUD layer on
+         * this target a triangle spanning the frame counts only within
+         * 8 px of its edges, so the layer's stretched sprites are not
+         * stretched again; off, or on another target, stock. */
+        {
+            static float wx[3][2] = { { -100, 0 }, { 740, 0 }, { -100, 40 } };
+            static const uint32_t wi[3] = { 0, 1, 2 };
+            int wide = -1;
+            CHECK(nv2a_aspect_full(-100, 740, (const float (*)[2])wx, wi, 1, 640, 480, &wide)
+                  && wide == 0);
+            nv2a_aspect_hud_set(1, 640, 480);
+            CHECK(!nv2a_aspect_full(-100, 740, (const float (*)[2])wx, wi, 1, 640, 480, &wide)
+                  && wide == 1);
+            CHECK(nv2a_aspect_full(-100, 740, (const float (*)[2])wx, wi, 1, 640, 464, &wide));
+            CHECK(!nv2a_aspect_full(-100, 740, NULL, NULL, 0, 640, 480, &wide) && wide == 1);
+            wx[0][0] = wx[2][0] = -8;
+            wx[1][0] = 648;
+            CHECK(nv2a_aspect_full(-8, 648, (const float (*)[2])wx, wi, 1, 640, 480, &wide)
+                  && wide == 0);
+            CHECK(nv2a_aspect_full(-8, 648, NULL, NULL, 0, 640, 480, &wide));
+            CHECK(!nv2a_aspect_full(3, 640, NULL, NULL, 0, 640, 480, &wide) && wide == 0);
+            nv2a_aspect_hud_set(0, 0, 0);
+        }
         /* so it is a centred 2D batch: the HUD keeps its 4:3 layout */
         CHECK(nv2a_aspect_place(1, 0, 0, 0, NV2A_MOVIE_BLACK) == NV2A_PLACE_CENTRE);
     }
@@ -688,9 +736,9 @@ int main(void)
              * columns at 16:9, n 2; as 3D it reached the pads. */
             {
                 uint32_t full[4] = { 0, 0, 640, 480 }, hb[4];
-                nv2a_aspect_box(full, 640, 480, 107, 2, NV2A_PLACE_CENTRE, 1, hb);
+                nv2a_aspect_box(full, 640, 480, 107, 2, NV2A_PLACE_CENTRE, 1, 0, hb);
                 CHECK(hb[0] == 214 && hb[2] == 1494);
-                nv2a_aspect_box(full, 640, 480, 107, 2, NV2A_PLACE_CENTRE, 0, hb);
+                nv2a_aspect_box(full, 640, 480, 107, 2, NV2A_PLACE_CENTRE, 0, 0, hb);
                 CHECK(hb[0] == 0 && hb[2] == 1708);
             }
             /* A layer's w is a literal reciprocal (rhw 2..1024); a race

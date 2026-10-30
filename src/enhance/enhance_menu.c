@@ -28,6 +28,7 @@
 #include "enhance.h"
 #include "enhance_actions.h"
 #include "enhance_cfg.h"
+#include "hud_anchor.h"
 #include "input_map.h"
 #include "input_names.h"
 #include "kernel_pacing.h"
@@ -265,7 +266,29 @@ static const char *get_capture(const struct enhance_item *it, char *b, size_t n)
     return b;
 }
 
+/* display.hud_margin: a plain store the HUD layer reads per call. */
+static void set_hud_margin(const struct enhance_item *it, const char *v)
+{
+    (void)it;
+    hud_layer_set_margin(atoi(v));
+}
+
+static const char *get_hud_margin(const struct enhance_item *it, char *b, size_t n)
+{
+    (void)it;
+    snprintf(b, n, "%d", hud_layer_margin());
+    return b;
+}
+
 #define ITEM(k, l, p, kd) .key = k, .label = l, .page = p, .kind = kd
+
+/* Listed only when a mod registered a HUD table (build_slots): without
+ * one the key changes nothing. */
+static const struct enhance_item k_hud_margin = {
+    ITEM("display.hud_margin", "HUD margin", "Render", ENHANCE_ITEM_RANGE), .lo = 0, .hi = 64,
+    .step = 4, .note = "wide aspect", .set = set_hud_margin, .get = get_hud_margin,
+    .live = ENHANCE_LIVE, .def = "0"
+};
 
 static const struct enhance_item k_items[] = {
     { ITEM("render.scale", "Render scale", "Render", ENHANCE_ITEM_RANGE), .lo = 1, .hi = 4,
@@ -568,6 +591,8 @@ static void build_slots(void)
     s_pack_off = nv2a_host_opts()->pack_off;
     for (int i = 0; i < N_ITEMS; i++)
         slot_add(&k_items[i], page_by_name(k_items[i].page, PAGE_RENDER), -1);
+    if (hud_layer_has_table())
+        slot_add(&k_hud_margin, PAGE_RENDER, -1);
     for (int i = 0; i < s_ntitle; i++)
         slot_add(s_title[i], page_by_name(s_title[i]->page, PAGE_GAME), -1);
     for (int m = 0; m < xbox_mod_count() && m < MODS_MAX; m++) {

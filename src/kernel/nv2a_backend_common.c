@@ -1239,8 +1239,55 @@ void nv2a_aspect_map(struct nv2a_vp_consts *o, uint32_t w, uint32_t h, uint32_t 
     }
 }
 
+/* The HUD layer's state (hud_anchor.h), for the backends: 0 while the
+ * layer's active flag is clear, else bit 32 and the canvas's target size,
+ * w << 16 | h. One word, so a backend never sees the flag with another
+ * target's size. */
+static uint64_t s_hud_state;
+/* The last frame's guest size, w << 16 | h, as a backend presented it. */
+static uint32_t s_frame_wh;
+
+void nv2a_aspect_hud_set(int on, uint32_t tw, uint32_t th)
+{
+    uint64_t v = on && tw && th && tw < 65536u && th < 65536u
+                 ? (uint64_t)1 << 32 | (uint64_t)tw << 16 | th : 0;
+    __atomic_store_n(&s_hud_state, v, __ATOMIC_RELAXED);
+}
+
+int nv2a_aspect_hud_on(uint32_t w, uint32_t h)
+{
+    uint64_t v = __atomic_load_n(&s_hud_state, __ATOMIC_RELAXED);
+    return v && (uint32_t)(v >> 16 & 0xFFFFu) == w && (uint32_t)(v & 0xFFFFu) == h;
+}
+
+int nv2a_aspect_hud_lift(uint32_t rt_w, uint32_t rt_h, int two_d, int flat, int full_w,
+                         float x_lo, float x_hi)
+{
+    if (!two_d || flat || full_w || !nv2a_aspect_hud_on(rt_w, rt_h))
+        return 0;
+    /* Wholly inside the columns: the 4:3 box clips nothing, so the batch
+     * keeps it and its trace line reads as without the layer. */
+    return !(x_lo >= 0.0f && x_hi <= (float)rt_w);
+}
+
+void nv2a_aspect_frame_publish(uint32_t w, uint32_t h)
+{
+    if (w && h && w < 65536u && h < 65536u)
+        __atomic_store_n(&s_frame_wh, w << 16 | h, __ATOMIC_RELAXED);
+}
+
+int nv2a_aspect_frame(uint32_t *w, uint32_t *h)
+{
+    uint32_t v = __atomic_load_n(&s_frame_wh, __ATOMIC_RELAXED);
+    if (!v)
+        return 0;
+    *w = v >> 16;
+    *h = v & 0xFFFFu;
+    return 1;
+}
+
 void nv2a_aspect_box(const uint32_t box[4], uint32_t w, uint32_t h, uint32_t pad,
-                     unsigned n, int place, int two_d, uint32_t out[4])
+                     unsigned n, int place, int two_d, int lift, uint32_t out[4])
 {
     uint32_t pw = w + 2u * pad;
 
@@ -1265,7 +1312,10 @@ void nv2a_aspect_box(const uint32_t box[4], uint32_t w, uint32_t h, uint32_t pad
     default:
         out[0] = (box[0] + pad) * n;
         out[2] = (box[2] + pad) * n;
-        if (!two_d) {
+        /* Lifted 2D (nv2a_aspect_hud_lift) is boxed like the world: the
+         * HUD layer clipped it in guest memory, and its moved elements
+         * must reach the pads. */
+        if (!two_d || lift) {
             if (box[0] == 0)
                 out[0] = 0;
             if (box[2] >= w)

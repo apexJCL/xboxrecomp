@@ -1876,9 +1876,49 @@ void nv2a_aspect_map(struct nv2a_vp_consts *o, uint32_t w, uint32_t h, uint32_t 
  * the pads. A centred 3D batch's clip edges at 0 and w reach out to the
  * target's edges, so the world fills the pads. A stretched or covering one
  * scales with the mapping (a stretch over the ratio's pad only,
- * nv2a_host_pad_ratio). pad 0 gives nv2a_host_box's result. */
+ * nv2a_host_pad_ratio). pad 0 gives nv2a_host_box's result. lift
+ * (nv2a_aspect_hud_lift) boxes a centred 2D batch like a 3D one. */
 void nv2a_aspect_box(const uint32_t box[4], uint32_t w, uint32_t h, uint32_t pad,
-                     unsigned n, int place, int two_d, uint32_t out[4]);
+                     unsigned n, int place, int two_d, int lift, uint32_t out[4]);
+
+/* ---- The HUD layer (src/enhance/hud_anchor.h) as the backends see it ----
+ * While a HUD mod is active (its table registered, the mod on, the pad
+ * above 0) the layer shifts and clips its elements in guest memory, so on
+ * the canvas's target the backends lift the 4:3 clip of centred 2D and
+ * bound the full-width test. With the flag clear everything is as stock. */
+
+/* The layer sets its flag and its canvas's target size (guest pixels). */
+void nv2a_aspect_hud_set(int on, uint32_t tw, uint32_t th);
+/* 1 while the flag is set and a w x h target is the canvas's target. */
+int nv2a_aspect_hud_on(uint32_t w, uint32_t h);
+/* The lift input of nv2a_aspect_box for one batch on a rt_w x rt_h
+ * target: 1 only while the layer is on that target, for a 2D batch that
+ * is not a flat near layer (Burnout 3's menus stay clipped), not full width
+ * (fades, backings and movies keep their H5 box) and not wholly inside the
+ * guest columns x_lo..x_hi in [0, rt_w] (no clip to lift). Pass 0..rt_w
+ * when the batch's x range is not known. */
+int nv2a_aspect_hud_lift(uint32_t rt_w, uint32_t rt_h, int two_d, int flat, int full_w,
+                         float x_lo, float x_hi);
+/* The full-width input of the placement (nv2a_aspect_place): the batch's
+ * bounds lo_x..hi_x span the w-wide frame (nv2a_aspect_full_width) and,
+ * for a triangle list (xy and idx not NULL, ntri triangles), one triangle
+ * does (nv2a_aspect_full_tris). While the layer is on this w x h target a
+ * triangle, or the batch without a list, counts only within
+ * [-NV2A_HUD_WIDE_BAND, w + NV2A_HUD_WIDE_BAND] guest pixels: the layer's
+ * stretch map puts its sprites past that on purpose, and H5 must not
+ * stretch them again. *wide (may be NULL) is 1 when that bound alone
+ * cleared the batch's full width. */
+#define NV2A_HUD_WIDE_BAND 8.0f
+int nv2a_aspect_full(float lo_x, float hi_x, const float (*xy)[2], const uint32_t *idx,
+                     uint32_t ntri, uint32_t w, uint32_t h, int *wide);
+/* nv2a_aspect_full_tris with each triangle also within [lo, hi]. */
+int nv2a_aspect_full_tris_in(const float (*xy)[2], const uint32_t *idx, uint32_t ntri,
+                             uint32_t w, float lo, float hi);
+/* The presented frame's guest size: a backend publishes it at each flip,
+ * the layer reads it for a canvas whose target is the frame. 0 before the
+ * first flip. */
+void nv2a_aspect_frame_publish(uint32_t w, uint32_t h);
+int nv2a_aspect_frame(uint32_t *w, uint32_t *h);
 
 /* Host size of a guest w x h target at `scale`: w*N x h*N, N lowered for
  * this target until both fit max_dim. Returns the N used (>= 1). */
