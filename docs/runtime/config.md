@@ -455,14 +455,17 @@ same requests at given flips, to check a switch without the menu.
   `.slangp` is a preset path, relative to the executable's directory; a
   bundled name or path that is not there says so once and the present
   stays stock. The library is loaded on first use, never linked:
-  `cmake/librashader.cmake` stages the upstream release (pinned by
-  sha256) beside the executable when a game calls
+  `cmake/librashader.cmake` stages a prebuilt release (pinned by
+  sha256; upstream's on macOS, our D3D11-only build of the same source on
+  x86-64 Windows, which needs no DirectX 9 or Visual C++ runtime) beside
+  the executable when a game calls
   `xboxrecomp_present_shaders(<target>)`; a configure that cannot
   download it warns and builds without it. `present.shader_lib` points at
   another copy, loaded as given with no hash check: it runs code from the
   path the player names, as any library they put there would. A missing
-  library, one with another ABI, or (Windows) a missing Visual C++
-  Redistributable gives one `[SHADER]` line and the stock present. The menu's *Shader* row
+  library, one with another ABI, or (Windows) a library whose import is
+  missing (named in the line, error 126) gives one `[SHADER]` line and
+  the stock present. The menu's *Shader* row
   (Shaders page) switches it live: the next present builds the new chain,
   and a preset that fails to build is not retried until the next change.
   The menu leaves the Shaders page out where no shader can run: no chain

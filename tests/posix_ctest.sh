@@ -103,7 +103,11 @@ for d in "$here"/*/; do
     [ -f "$d/CMakeLists.txt" ] || echo "n/a   $(basename "$d"): no CMakeLists.txt, not a ctest"
 done >>"$built"
 
+# The root build also reads the pinned x86-64 Windows librashader.dll's
+# imports (librashader_imports), from a zip cached once per BUILD_DIR.
 if cmake -S "$root" -B "$B/_root" ${gen[@]+"${gen[@]}"} -DCMAKE_BUILD_TYPE=Release \
+        -DXBOXRECOMP_LIBRASHADER_TEST_WIN64=ON \
+        "-DXBOXRECOMP_LIBRASHADER_CACHE=$B/_deps/librashader" \
         >"$B/_root.cfg.log" 2>&1 &&
     cmake --build "$B/_root" >"$B/_root.build.log" 2>&1; then
     root_ok=1

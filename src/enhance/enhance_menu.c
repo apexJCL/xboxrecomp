@@ -788,7 +788,7 @@ static int s_page;
 static int s_sel[PAGE_COUNT];
 /* The Shaders page is left out where no shader can run (the user,
  * 2026-10-29): no chain presenter, or librashader missing or failing to
- * load (a stock Windows lacks the D3DX9 runtime it imports). Decided at
+ * load (a dll it imports is absent; the log names it). Decided at
  * each open; the reason is said once. A supported build shows it with
  * present.shader none, since the picker lives there. */
 static int s_shaders_off;

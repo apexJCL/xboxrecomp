@@ -166,10 +166,89 @@ static int lib_candidates(char paths[][1024], int max)
     return n;
 }
 
+#ifdef _WIN32
+/* The first dll that <w>'s import table names and the loader cannot find,
+ * into <name>, or 0. Error 126 alone does not say which import is missing;
+ * the hint names the package that brings it. Each import is looked for
+ * beside <w> first, as LOAD_WITH_ALTERED_SEARCH_PATH does when open_lib
+ * loads it, then through the standard search. Only direct imports: a
+ * missing dll further down the chain leaves the plain error. */
+static int missing_import(const wchar_t *w, char *name, size_t cap)
+{
+    HMODULE img = LoadLibraryExW(w, NULL, DONT_RESOLVE_DLL_REFERENCES);
+    const unsigned char *base = (const unsigned char *)img;
+    const IMAGE_DOS_HEADER *dos = (const IMAGE_DOS_HEADER *)base;
+    const IMAGE_NT_HEADERS64 *nt;
+    const IMAGE_DATA_DIRECTORY *dir;
+    const IMAGE_IMPORT_DESCRIPTOR *imp;
+    wchar_t beside[1024];
+    size_t dirlen = 0, i;
+    DWORD size;
+    int found = 0;
+
+    if (!img)
+        return 0;
+    for (i = 0; w[i]; i++)
+        if (w[i] == L'\\' || w[i] == L'/')
+            dirlen = i + 1;
+    /* A file that is not a PE32+ image (the loader maps what it can) has
+     * no import table to trust: leave the plain error. */
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew <= 0)
+        goto done;
+    nt = (const IMAGE_NT_HEADERS64 *)(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC)
+        goto done;
+    size = nt->OptionalHeader.SizeOfImage;
+    if (nt->OptionalHeader.NumberOfRvaAndSizes <= IMAGE_DIRECTORY_ENTRY_IMPORT)
+        goto done;
+    dir = &nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT];
+    if (!dir->VirtualAddress || dir->VirtualAddress >= size)
+        goto done;
+    for (imp = (const IMAGE_IMPORT_DESCRIPTOR *)(base + dir->VirtualAddress);
+         (const unsigned char *)(imp + 1) <= base + size && imp->Name && !found; imp++) {
+        const char *dll;
+        HMODULE h;
+        if (imp->Name >= size || !memchr(base + imp->Name, 0, size - imp->Name))
+            break;
+        dll = (const char *)(base + imp->Name);
+        if (dirlen && dirlen + strlen(dll) < 1024) {
+            memcpy(beside, w, dirlen * sizeof *w);
+            if (MultiByteToWideChar(CP_ACP, 0, dll, -1, beside + dirlen,
+                                    (int)(1024 - dirlen)) &&
+                GetFileAttributesW(beside) != INVALID_FILE_ATTRIBUTES)
+                continue;
+        }
+        h = LoadLibraryA(dll);
+        if (h) {
+            FreeLibrary(h);
+        } else {
+            snprintf(name, cap, "%s", dll);
+            found = 1;
+        }
+    }
+done:
+    FreeLibrary(img);
+    return found;
+}
+
+static const char *import_hint(const char *dll)
+{
+    if (!_strnicmp(dll, "d3dx9_", 6))
+        return ": it comes with the DirectX End-User Runtime,"
+               " https://www.microsoft.com/download/details.aspx?id=35";
+    if (!_strnicmp(dll, "msvcp140", 8) || !_strnicmp(dll, "vcruntime140", 12))
+        return ": it comes with the Microsoft Visual C++ Redistributable (x64),"
+               " https://aka.ms/vs/17/release/vc_redist.x64.exe";
+    return "";
+}
+#endif
+
 static int open_lib(const char *path, char *why, size_t cap)
 {
 #ifdef _WIN32
     wchar_t w[1024];
+    char dll[128];
     DWORD err;
     if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, w, 1024)) {
         snprintf(why, cap, "bad path");
@@ -183,23 +262,17 @@ static int open_lib(const char *path, char *why, size_t cap)
     err = GetLastError();
     if (!file_exists(path)) {
         snprintf(why, cap, "not found");
+    } else if (missing_import(w, dll, sizeof dll)) {
+        /* The toolkit's own x86-64 build imports only system dlls; an
+         * upstream or user-supplied build may need D3DX9 or the VC++
+         * runtime, which a stock Windows lacks. */
+        snprintf(why, cap, "needs %s, which is not installed%s (LoadLibrary error %lu)",
+                 dll, import_hint(dll), (unsigned long)err);
+    } else if (err == ERROR_MOD_NOT_FOUND) {
+        snprintf(why, cap, "needs a DLL that is missing (LoadLibrary error %lu)",
+                 (unsigned long)err);
     } else {
-        /* The file is there, so an import is missing. The upstream dll is
-         * built with MSVC and needs the VC++ runtime, which a clean
-         * Windows may lack; the game does not ship it. */
-        HMODULE vc = LoadLibraryA("vcruntime140.dll");
-        HMODULE vc1 = LoadLibraryA("vcruntime140_1.dll");
-        if (!vc || !vc1)
-            snprintf(why, cap, "it needs the Microsoft Visual C++ Redistributable"
-                     " (x64), which is not installed: get it from"
-                     " https://aka.ms/vs/17/release/vc_redist.x64.exe (error %lu)",
-                     (unsigned long)err);
-        else
-            snprintf(why, cap, "LoadLibrary error %lu", (unsigned long)err);
-        if (vc)
-            FreeLibrary(vc);
-        if (vc1)
-            FreeLibrary(vc1);
+        snprintf(why, cap, "failed to load (LoadLibrary error %lu)", (unsigned long)err);
     }
     return 0;
 #else
@@ -208,7 +281,10 @@ static int open_lib(const char *path, char *why, size_t cap)
     if (s_mod)
         return 1;
     e = dlerror();
-    snprintf(why, cap, "%s", file_exists(path) ? (e ? e : "dlopen failed") : "not found");
+    if (!file_exists(path))
+        snprintf(why, cap, "not found");
+    else
+        snprintf(why, cap, "failed to load: %s", e ? e : "dlopen failed");
     return 0;
 #endif
 }

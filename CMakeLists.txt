@@ -58,6 +58,15 @@ endif()
 # xboxrecomp_present_shaders(<target>). Always defined, so a game can call it
 # unconditionally; it does nothing without XBOXRECOMP_ENHANCE.
 include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/librashader.cmake)
+# The staged Windows library must load on a stock Windows (an objdump reads
+# its import table). Other hosts check the same pinned zip on request: it is
+# a 12 MB download no macOS or Linux game needs.
+option(XBOXRECOMP_LIBRASHADER_TEST_WIN64
+    "Check the x86-64 Windows librashader.dll's imports from a non-Windows build" OFF)
+if(CMAKE_OBJDUMP AND XBOXRECOMP_LIBRASHADER AND
+   ((WIN32 AND XBOXRECOMP_ENHANCE) OR (NOT WIN32 AND XBOXRECOMP_LIBRASHADER_TEST_WIN64)))
+    add_subdirectory(tests/librashader_imports)
+endif()
 
 # MCPX APU DSP emulation: the GP and EP run the title's DSP56300 programs on
 # the MIT dsp56300 JIT (cmake/dsp56300.cmake, a pinned prebuilt archive per

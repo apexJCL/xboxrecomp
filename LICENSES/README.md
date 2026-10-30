@@ -38,3 +38,11 @@ time:
 - `MPL-2.0-librashader.txt`: librashader's `LICENSE.md`, verbatim from the
   `librashader-v0.12.0` tag. It ships as `shaders/LICENSE-librashader.txt`
   beside the library; the source is at https://github.com/SnowflakePowered/librashader/tree/librashader-v0.12.0.
+  The x86-64 Windows library is built from that source, unmodified, by
+  `third_party/librashader/build-windows.sh`; its zip carries the same licence
+  and a `SOURCE.txt` with the link.
+- That zip's `THIRDPARTY.txt` (staged as `shaders/THIRDPARTY-librashader.txt`)
+  holds the licence and copyright of every crate and C/C++ library linked
+  into the dll; it is generated with each build, not kept here (about 800 KB,
+  most of it per-file Mesa MIT notices). The top-level NOTICE lists them by
+  licence.

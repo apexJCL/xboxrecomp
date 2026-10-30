@@ -34,9 +34,15 @@ LUT images carry no licence. Point `present.shader` at your own copy to use it.
 ## librashader
 
 The presets run in [librashader](https://github.com/SnowflakePowered/librashader)
-v0.12.0, the upstream prebuilt `librashader.dll` / `librashader.dylib` beside
-the executable, unmodified. It is MPL-2.0: the licence is
-`LICENSE-librashader.txt` in this directory, and the source is at
+v0.12.0, `librashader.dll` / `librashader.dylib` beside the executable: on
+macOS the upstream prebuilt library, on x86-64 Windows a build of the
+unmodified source with only the D3D11 runtime and a static C++ runtime, so
+it needs nothing beyond a stock Windows 10 or 11 (arm64 Windows still takes
+the upstream library, which needs the DirectX 9 and Visual C++ runtimes). It
+is MPL-2.0: the licence is `LICENSE-librashader.txt` in this directory, and
+the source is at
 https://github.com/SnowflakePowered/librashader/tree/librashader-v0.12.0.
-On Windows it needs the Microsoft Visual C++ Redistributable (x64); without
-it the game says so in its log and presents without the shader.
+On x86-64 Windows, `THIRDPARTY-librashader.txt` here lists the licences of
+the libraries built into it.
+If the library cannot load, the game names the reason in its log and
+presents without the shader.
