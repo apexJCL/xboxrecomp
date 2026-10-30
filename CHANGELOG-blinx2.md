@@ -9,6 +9,16 @@ blinx2-v0.3.2; earlier tags are described by their commits.
 
 ## [Unreleased]
 
+### Changed
+- `storage.ram_cache` (`RECOMP_STORAGE_RAM_CACHE`) is on by default: every
+  title's cache partition (`Z:`, `Partition3`-`5`) lives in memory, capped
+  at the stock 750 MB and never written back, so the host disk no longer
+  takes the title's cache churn. `ram_cache = false` or
+  `RECOMP_STORAGE_RAM_CACHE=0` (also `false`, `no`, `off`, now read the
+  same with and without the enhancements layer) keeps it on disk. The
+  `[MEM] exit` line adds `ramcache_mib` and `ramcache_peak_mib` when the
+  store was used.
+
 ## [blinx2-v0.9.0] - 2026-10-29
 
 ### Added

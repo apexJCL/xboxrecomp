@@ -307,6 +307,9 @@ int main(int argc, char **argv)
     /* argv[1]: write the report there (Proton drops a console exe's stdout) */
     if (argc > 1 && !freopen(argv[1], "w", stdout)) return 2;
     setvbuf(stdout, NULL, _IONBF, 0);
+    /* These checks read the host files under <hdd>/Cache; the in-memory
+     * store, on by default, has its own (kernel_ram_cache). */
+    recomp_env_set(RENV_STORAGE_RAM_CACHE, "0");
 #if defined(_WIN32)
     {
         char tmp[MAX_PATH];

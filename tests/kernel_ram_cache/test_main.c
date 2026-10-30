@@ -6,7 +6,12 @@
  * store on, z: and Partition3-5 live in memory: capped at the stock 750 MB,
  * seeded read-only from <hdd>/Cache, never written back.
  *
- * Covered: off until asked; seed reads; create, rewrite, seek and size; the
+ * Covered: on by default; off when the variable says 0 or false
+ * (the RAMCACHE_OFF_VALUE builds) or when xbox_RamCacheEnable(0) runs with
+ * the variable unset (RAMCACHE_OFF_ENABLE, the `ram_cache = false` case);
+ * on, with a warning, when the variable is not a bool (RAMCACHE_BAD_VALUE).
+ * One way per process, since the store fixes on or off at its first use.
+ * Then seed reads; create, rewrite, seek and size; the
  * FATX overwrite semantics the disk backends keep; the cap (STATUS_DISK_FULL)
  * and the volume size; delete and delete-on-close; directories and patterns;
  * rename; Partition3 reaching the same files; the volume and file index
@@ -14,12 +19,15 @@
  * Then the review's cases: a GENERIC_WRITE handle writing at its offset (on
  * the store and on the host backend), duplicates, a double close, shrink and
  * regrow, a deleted seed staying deleted, seeds listed unopened, a restarted
- * scan and a listing buffer too small for its entry.
+ * scan and a listing buffer too small for its entry. Last, the directory
+ * searches abandoned after one result (kernel_fatx_overwrite's case, e5d407ea)
+ * on the store.
  *
  * Cross-platform: it calls the xbox_Nt* file functions directly.
  */
 #include "kernel.h"
 #include "kernel_ramfs.h"
+#include "mem_stats.h"
 #include "recomp_env.h"
 
 #include <stdio.h>
@@ -298,21 +306,65 @@ static NTSTATUS list_dir(const char *dir, const char *mask, char *out, size_t n)
     return st;
 }
 
-static void test_off_by_default(void)
+static void test_on_by_default(void)
 {
     HANDLE h;
-    printf("\nOff by default\n");
-    check(!xbox_ramfs_active(), "unset: the store is off", NULL);
-    /* The first file call fixed it off; turning it on is still allowed until
-     * the store starts, which is what the enhance layer does at boot. */
+    struct mem_stats m;
+    printf("\nOn by default\n");
+    check(xbox_ramfs_active(), "unset: the store is on", NULL);
     xbox_RamCacheSetCap(CAP);
-    xbox_RamCacheEnable(1);
-    check(xbox_ramfs_active(), "xbox_RamCacheEnable(1) before first use", NULL);
     check(open_file("z:\\seed.bin", XBOX_FILE_OPEN, &h) == 0, "seed.bin opens", NULL);
     xbox_NtClose(h);
     xbox_RamCacheEnable(0);
     check(xbox_ramfs_active(), "turning it off after use is ignored", NULL);
+    mem_stats_read(&m);
+    /* seed.bin, sub, sub/s2.txt and sub/never.dat: a cluster each. */
+    check(m.ramcache == CLUSTER * 4 && m.ramcache_peak == CLUSTER * 4,
+          "the [MEM] line has the charge: the seed's four entries", NULL);
 }
+
+#if defined(RAMCACHE_OFF_VALUE) || defined(RAMCACHE_OFF_ENABLE)
+/* Off by the variable (RECOMP_STORAGE_RAM_CACHE=RAMCACHE_OFF_VALUE) or, with
+ * the variable unset, by xbox_RamCacheEnable(0) before the first use, which
+ * is what enhance.c does for `ram_cache = false`: the store stays off and a
+ * write on z: lands in <hdd>/Cache, as stock. */
+static void test_explicit_off(void)
+{
+    HANDLE h;
+    struct mem_stats m;
+#ifdef RAMCACHE_OFF_VALUE
+    printf("\nOff by the variable (%s)\n", RAMCACHE_OFF_VALUE);
+    recomp_env_set(RENV_STORAGE_RAM_CACHE, RAMCACHE_OFF_VALUE);
+#else
+    printf("\nOff by xbox_RamCacheEnable(0), the variable unset\n");
+    check(!recomp_env(RENV_STORAGE_RAM_CACHE), "the variable is unset", NULL);
+    xbox_RamCacheEnable(0);
+#endif
+    check(!xbox_ramfs_active(), "the store is off", NULL);
+    check(open_file("z:\\new.bin", XBOX_FILE_CREATE, &h) == 0, "z:\\new.bin made", NULL);
+    check(write_at(h, "four", 4, 0) == 0, "and written", NULL);
+    xbox_NtClose(h);
+    check(host_size("new.bin") == 4, "on the host disk under Cache", NULL);
+    mem_stats_read(&m);
+    check(m.ramcache == MEM_STATS_NA, "no RAM cache fields in the [MEM] line", NULL);
+}
+#endif
+
+#ifdef RAMCACHE_BAD_VALUE
+/* RECOMP_STORAGE_RAM_CACHE=RAMCACHE_BAD_VALUE: not a bool, so it is warned
+ * about and ignored; the store stays on and the host Cache gets nothing. */
+static void test_bad_value(void)
+{
+    HANDLE h;
+    printf("\nA variable that is not a bool (%s)\n", RAMCACHE_BAD_VALUE);
+    recomp_env_set(RENV_STORAGE_RAM_CACHE, RAMCACHE_BAD_VALUE);
+    check(xbox_ramfs_active(), "the store is on", NULL);
+    check(open_file("z:\\new.bin", XBOX_FILE_CREATE, &h) == 0, "z:\\new.bin made", NULL);
+    check(write_at(h, "four", 4, 0) == 0, "and written", NULL);
+    xbox_NtClose(h);
+    check(host_size("new.bin") < 0, "not on the host disk", NULL);
+}
+#endif
 
 static void test_seed(const unsigned char *buf)
 {
@@ -780,6 +832,77 @@ static void test_seed_listing(void)
     check(host_size("sub" SEP_S "never.dat") == 4, "the host seed is untouched", NULL);
 }
 
+/* kernel_fatx_overwrite's directory-search case (e5d407ea) on the store: a
+ * search abandoned after one result (FindFirstFile then FindClose) must not
+ * carry on into the next directory opened, whatever handle value it gets. */
+#define SEARCH_DIRS 4
+#define SEARCHES 200
+static void test_dir_search(void)
+{
+    static ULONG info[128];
+    PXBOX_FILE_DIRECTORY_INFORMATION e = (PXBOX_FILE_DIRECTORY_INFORMATION)info;
+    char guest[32], want[8], pat[8], d[160], first_bad[96] = "";
+    unsigned i, k, fresh = 0, reused = 0;
+    HANDLE h, prev = NULL;
+    NTSTATUS st;
+
+    printf("\nDirectory searches closed after one result\n");
+    for (k = 0; k < SEARCH_DIRS; k++) {
+        HANDLE dir;
+        snprintf(guest, sizeof guest, "z:\\q%u", k);
+        st = open_at(NULL, guest, XBOX_FILE_CREATE, XBOX_FILE_DIRECTORY_FILE | 0x20, &dir, NULL);
+        if (st) {
+            snprintf(d, sizeof d, "%s: 0x%08X", guest, (unsigned)st);
+            check(0, "make the search directories", d);
+            return;
+        }
+        xbox_NtClose(dir);
+        for (i = 0; i < 2; i++) {   /* two entries: one result leaves it open */
+            snprintf(guest, sizeof guest, "z:\\q%u\\e%u%c.txt", k, k, 'a' + i);
+            if (open_file(guest, XBOX_FILE_CREATE, &h) == 0) xbox_NtClose(h);
+        }
+    }
+
+    for (i = 0; i < SEARCHES; i++) {
+        XBOX_ANSI_STRING mask;
+        XBOX_ANSI_STRING name;
+        XBOX_OBJECT_ATTRIBUTES oa;
+        XBOX_IO_STATUS_BLOCK ios;
+        int ok;
+
+        k = i % SEARCH_DIRS;
+        snprintf(guest, sizeof guest, "z:\\q%u", k);
+        snprintf(want, sizeof want, "e%u", k);
+        snprintf(pat, sizeof pat, "e%u*", k);
+        set_name(&name, &oa, guest, NULL);
+        /* what XAPI's FindFirstFile asks for: list, synchronous, shared */
+        st = xbox_NtCreateFile(&h, 0x00100001u, &oa, &ios, NULL, 0, 3, XBOX_FILE_OPEN, 0x21);
+        if (st || !h) {
+            snprintf(first_bad, sizeof first_bad, "search %u: open %s failed", i, guest);
+            break;
+        }
+        if (h == prev) reused++;
+        prev = h;
+        mask.Length = (USHORT)strlen(pat);
+        mask.MaximumLength = (USHORT)(mask.Length + 1);
+        mask.Buffer = pat;
+        memset(info, 0, sizeof info);
+        st = xbox_NtQueryDirectoryFile(h, NULL, NULL, NULL, &ios, e, sizeof info,
+                                       XboxFileDirectoryInformation, &mask, FALSE);
+        ok = st == 0 && e->FileNameLength >= 2 && memcmp(e->FileName, want, 2) == 0;
+        if (ok) fresh++;
+        else if (!first_bad[0])
+            snprintf(first_bad, sizeof first_bad, "search %u in q%u: status 0x%08X, \"%.*s\"",
+                     i, k, (unsigned)st, (int)(e->FileNameLength < 16 ? e->FileNameLength : 16),
+                     e->FileName);
+        xbox_NtClose(h);
+    }
+    snprintf(d, sizeof d, "%u/%u fresh, handle reused %u times; first stale: %s",
+             fresh, SEARCHES, reused, first_bad[0] ? first_bad : "none");
+    printf("  (%s)\n", d);
+    check(fresh == SEARCHES, "each new search starts in its own directory", d);
+}
+
 int main(int argc, char **argv)
 {
     static unsigned char buf[65536];
@@ -816,7 +939,12 @@ int main(int argc, char **argv)
     make_dir(p);
     xbox_path_init(root, root);
 
-    test_off_by_default();
+#if defined(RAMCACHE_OFF_VALUE) || defined(RAMCACHE_OFF_ENABLE)
+    test_explicit_off();
+#elif defined(RAMCACHE_BAD_VALUE)
+    test_bad_value();
+#else
+    test_on_by_default();
     test_seed(buf);
     test_file_io(buf);
     test_fatx_overwrite(buf);
@@ -827,10 +955,12 @@ int main(int argc, char **argv)
     test_append("\\Device\\Harddisk0\\Partition1\\UDATA\\gw.bin");
     test_handles();
     test_seed_listing();
+    test_dir_search();
 
     printf("\nHost Cache\n");
     check(host_entries() == 2, "only the two seeded entries on disk", NULL);
     check(host_size("seed.bin") == 3000, "seed.bin unchanged in size", NULL);
+#endif
 
     {
         char cmd[700];

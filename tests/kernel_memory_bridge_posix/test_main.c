@@ -32,6 +32,7 @@
  */
 #include "kernel.h"
 #include "xbox_memory_layout.h"
+#include "recomp_env.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -708,6 +709,9 @@ int main(int argc, char **argv)
     unsigned i;
 
     setvbuf(stdout, NULL, _IONBF, 0);
+    /* The z: checks read the host files under Cache; the in-memory store,
+     * on by default, has its own (kernel_ram_cache). */
+    recomp_env_set(RENV_STORAGE_RAM_CACHE, "0");
     if (!mkdtemp(tmpl)) return 2;
     setenv("XDG_DATA_HOME", tmpl, 1);
     snprintf(cache, sizeof cache, "%s/xboxrecomp/Cache", tmpl);

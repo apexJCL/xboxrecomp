@@ -23,6 +23,7 @@
  */
 #include "kernel.h"
 #include "kernel_ramfs.h"
+#include "mem_stats.h"
 #include "recomp_env.h"
 #include <ctype.h>
 #include <stdio.h>
@@ -112,6 +113,14 @@ static ram_handle  *s_handles;
 static size_t       s_handle_count, s_handle_cap;
 static int          s_full_warned;
 
+/* Every change of the charge goes through here, so the [MEM] exit line
+ * (mem_stats.h) can say what the store held at the end and at its peak. */
+static void set_used(uint64_t v)
+{
+    s_used = v;
+    mem_stats_ramcache_note(v);
+}
+
 /* ------------------------------------------------------------------------ */
 
 void xbox_RamCacheEnable(int on)
@@ -139,11 +148,49 @@ uint64_t xbox_RamCacheUsed(void)
     return used;
 }
 
+static int word_is(const char *v, const char *w)
+{
+    while (*v && *w && tolower((unsigned char)*v) == *w) {
+        v++;
+        w++;
+    }
+    return !*v && !*w;
+}
+
+/* RECOMP_STORAGE_RAM_CACHE without the enhance layer: on unless the
+ * variable says off, in the words enhance_cfg_bool takes, so a build with
+ * and one without the layer read the same value the same way. A value that
+ * is neither gets the layer's warning too; the layer then falls back to
+ * config.toml, and here there is no file, so the default (on) holds. */
+static int env_says_on(void)
+{
+    static const char *const off[] = { "0", "false", "no", "off" };
+    static const char *const on[] = { "1", "true", "yes", "on" };
+    static int warned;
+    const char *v = recomp_env(RENV_STORAGE_RAM_CACHE);
+    size_t i;
+    if (!v || !*v)
+        return 1;
+    for (i = 0; i < sizeof off / sizeof off[0]; i++) {
+        if (word_is(v, off[i]))
+            return 0;
+        if (word_is(v, on[i]))
+            return 1;
+    }
+    if (!warned) {
+        warned = 1;
+        fprintf(stderr, "[FILE] %s=%s is not a bool (1/0, true/false, yes/no, on/off); "
+                "ignored, the RAM cache stays on\n",
+                recomp_env_name(RENV_STORAGE_RAM_CACHE), v);
+    }
+    return 1;
+}
+
 int xbox_ramfs_active(void)
 {
     int on = s_enabled;
     if (on < 0) {
-        on = recomp_env_on(RENV_STORAGE_RAM_CACHE) ? 1 : 0;
+        on = env_says_on();
         AcquireSRWLockExclusive(&s_lock);
         if (s_enabled < 0)
             s_enabled = on;
@@ -300,13 +347,13 @@ static ram_node *new_node(const char *path, int is_dir)
     now_filetime(&n->ctime);
     n->mtime = n->ctime;
     s_nodes[s_node_count++] = n;
-    s_used += node_charge(n);
+    set_used(s_used + node_charge(n));
     return n;
 }
 
 static void free_node(ram_node *n)
 {
-    s_used -= node_charge(n);
+    set_used(s_used - node_charge(n));
     free(n->buf);
     free(n->seed);
     free(n->path);
@@ -355,7 +402,7 @@ static NTSTATUS set_size(ram_node *n, uint64_t size)
     if (size < n->size) {
         memset(n->buf + size, 0, (size_t)(n->size - size));
         n->size = size;
-        s_used = s_used - old_charge + node_charge(n);
+        set_used(s_used - old_charge + node_charge(n));
         return STATUS_SUCCESS;
     }
     new_charge = clusters(size);
@@ -388,7 +435,7 @@ static NTSTATUS set_size(ram_node *n, uint64_t size)
         n->buf_cap = cap;
     }
     n->size = size;
-    s_used = s_used - old_charge + new_charge;
+    set_used(s_used - old_charge + new_charge);
     return STATUS_SUCCESS;
 }
 
@@ -442,9 +489,9 @@ static void seed_file(const char *rel, uint64_t size, LONGLONG ctime,
     n->seed = (xbox_host_char *)malloc(len);
     if (n->seed)
         memcpy(n->seed, host, len);
-    s_used -= node_charge(n);
+    set_used(s_used - node_charge(n));
     n->size = size;
-    s_used += node_charge(n);
+    set_used(s_used + node_charge(n));
     n->ctime.QuadPart = ctime;
     n->mtime.QuadPart = mtime;
     s_seed_files++;
@@ -592,7 +639,7 @@ static void seed_fill(ram_node *n)
     if (size) {
         uint64_t charge = node_charge(n);
         /* set_size from 0: the charge is already counted. */
-        s_used -= charge;
+        set_used(s_used - charge);
         n->size = 0;
         if (set_size(n, size) != STATUS_SUCCESS || seed_load(n) != 0) {
             fprintf(stderr, "  [FILE] ram cache: could not read the seed for "

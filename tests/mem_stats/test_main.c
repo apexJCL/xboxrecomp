@@ -40,6 +40,7 @@ static void test_round_trip(void)
     m.gpu_peak = 350 * MIB + MIB / 5;
     m.gpu_nl = 0;
     m.gpu_nl_peak = MEM_STATS_NA;
+    m.ramcache = m.ramcache_peak = MEM_STATS_NA;
     m.ram_src = "phys_footprint";
     m.gpu_src = "metal";
     mem_stats_format(line, sizeof line, "exit", -1, &m, "atexit");
@@ -55,6 +56,19 @@ static void test_round_trip(void)
     check(r.ram / (MIB / 10) == 8124 && r.gpu == 301 * MIB, "parse: values to 0.1 MiB");
     check(r.commit == MEM_STATS_NA && r.gpu_nl_peak == MEM_STATS_NA, "parse: n/a stays n/a");
     check(r.gpu_nl == 0, "parse: zero is not n/a");
+    check(r.ramcache == MEM_STATS_NA, "parse: no RAM cache fields, n/a");
+
+    /* The RAM cache in use: its two fields after the GPU's. */
+    m.ramcache = 312 * MIB;
+    m.ramcache_peak = 640 * MIB;
+    mem_stats_format(line, sizeof line, "exit", -1, &m, "atexit");
+    check(strstr(line, " gpu_nl_peak_mib=n/a ramcache_mib=312.0 ramcache_peak_mib=640.0"
+                       " ram_src=") != NULL,
+          "format: the RAM cache fields");
+    check(mem_stats_parse(line, kind, sizeof kind, &r) == 7 && r.ramcache == 312 * MIB
+              && r.ramcache_peak == 640 * MIB,
+          "parse: the RAM cache fields");
+    m.ramcache = m.ramcache_peak = MEM_STATS_NA;
 
     mem_stats_format(line, sizeof line, "sample", 12345, &m, NULL);
     check(!strncmp(line, "sample t=12.3 ram_mib=", 22) && !strstr(line, "why="),
@@ -95,6 +109,11 @@ static void test_live(void)
     check(m.gpu == 100 * MIB && m.gpu_peak == 200 * MIB, "note: last and largest");
     check(m.gpu_nl == 5 * MIB && m.gpu_nl_peak == 5 * MIB, "note: non-local");
     check(!strcmp(m.gpu_src, "test"), "note: source");
+    check(m.ramcache == MEM_STATS_NA, "read: no RAM cache before a note");
+    mem_stats_ramcache_note(64 * MIB);
+    mem_stats_ramcache_note(16 * MIB);
+    mem_stats_read(&m);
+    check(m.ramcache == 16 * MIB && m.ramcache_peak == 64 * MIB, "ramcache note: last and largest");
 }
 
 #ifndef _WIN32

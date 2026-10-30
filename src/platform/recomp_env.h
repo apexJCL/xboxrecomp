@@ -134,7 +134,7 @@ extern "C" {
     X(HEAP_QUARANTINE,   CONFIG, "RECOMP_HEAP_QUARANTINE",   NULL, "=KiB: freed heap blocks held back from reuse, oldest first, up to that much; a larger block is freed at once (8192 suggested); 0 or empty: off") \
     X(XBE_PAGING,        CONFIG, "RECOMP_XBE_PAGING",        NULL, "1: XBE sections not flagged preload load on the title's XeLoadSection, as on the console, and the mapping grows so the heap sits above the image; 0: every section at boot; default: the title's choice (xbox_SetSectionPaging), else off") \
     X(EXT_VMA,           CONFIG, "RECOMP_EXT_VMA",           NULL, "set: honour reservations at fixed addresses above the RAM mirrors (upstream, default off)") \
-    X(STORAGE_RAM_CACHE, CONFIG, "RECOMP_STORAGE_RAM_CACHE", NULL, "1: the cache partition (Z:, Partition3-5) lives in memory, capped at the stock 750 MB, seeded read-only from <hdd>/Cache and never written back; config storage.ram_cache (default off)") \
+    X(STORAGE_RAM_CACHE, CONFIG, "RECOMP_STORAGE_RAM_CACHE", NULL, "the cache partition (Z:, Partition3-5) lives in memory, capped at the stock 750 MB, seeded read-only from <hdd>/Cache and never written back; on by default, 0/false/no/off keeps it on disk at <hdd>/Cache; config storage.ram_cache (default true)") \
     X(KEYBOARD,          CONFIG, "RECOMP_KEYBOARD",          NULL, "1: keyboard drives pad 1") \
     X(MOUSE,             CONFIG, "RECOMP_MOUSE",             NULL, "1: the mouse drives pad 1 (a stick and buttons); 0: off") \
     X(PAD_DEADZONE,      CONFIG, "RECOMP_PAD_DEADZONE",      NULL, "stick deadzone, 0..32767 (default 0); input.pad_deadzone_left/_right (percent) win over it") \

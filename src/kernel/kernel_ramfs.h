@@ -1,7 +1,8 @@
 /*
  * kernel_ramfs.h - the title's cache partition held in host memory
  *
- * Opt-in (RECOMP_STORAGE_RAM_CACHE, config storage.ram_cache; default off).
+ * On by default (RECOMP_STORAGE_RAM_CACHE, config storage.ram_cache; 0 or
+ * false turns it off).
  * With it on, the paths kernel_path.c sends to <hdd>/Cache -- Z:, and
  * Partition3-5 below the device -- are served from memory instead, capped at
  * the stock 750 MB partition and seeded read-only from <hdd>/Cache when it
@@ -30,7 +31,8 @@ extern "C" {
 
 /* On or off; called before the guest starts (the enhance layer does, from
  * storage.ram_cache). Without a call, the first file call reads
- * RECOMP_STORAGE_RAM_CACHE. Turning it off after use is ignored. */
+ * RECOMP_STORAGE_RAM_CACHE: unset or empty is on, 0/false/no/off is off.
+ * Turning it off after use is ignored. */
 void xbox_RamCacheEnable(int on);
 /* The cap in bytes; 0 is the stock 750 MB. Before first use (tests). */
 void xbox_RamCacheSetCap(uint64_t bytes);

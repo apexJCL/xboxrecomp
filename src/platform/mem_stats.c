@@ -33,6 +33,7 @@
 static uint64_t s_gpu = MEM_STATS_NA, s_gpu_peak = MEM_STATS_NA;
 static uint64_t s_gpu_nl = MEM_STATS_NA, s_gpu_nl_peak = MEM_STATS_NA;
 static const char *s_gpu_src;
+static uint64_t s_ramcache = MEM_STATS_NA, s_ramcache_peak = MEM_STATS_NA;
 
 static void note_one(uint64_t *cur, uint64_t *peak, uint64_t v)
 {
@@ -51,6 +52,11 @@ void mem_stats_gpu_note(const char *src, uint64_t local, uint64_t nonlocal)
     note_one(&s_gpu, &s_gpu_peak, local);
     note_one(&s_gpu_nl, &s_gpu_nl_peak, nonlocal);
     __atomic_store_n(&s_gpu_src, src, __ATOMIC_RELEASE);
+}
+
+void mem_stats_ramcache_note(uint64_t used)
+{
+    note_one(&s_ramcache, &s_ramcache_peak, used);
 }
 
 /* ---- the process's RAM ------------------------------------------------------ */
@@ -138,6 +144,8 @@ int mem_stats_read(struct mem_stats *m)
     m->gpu_peak = __atomic_load_n(&s_gpu_peak, __ATOMIC_RELAXED);
     m->gpu_nl = __atomic_load_n(&s_gpu_nl, __ATOMIC_RELAXED);
     m->gpu_nl_peak = __atomic_load_n(&s_gpu_nl_peak, __ATOMIC_RELAXED);
+    m->ramcache = __atomic_load_n(&s_ramcache, __ATOMIC_RELAXED);
+    m->ramcache_peak = __atomic_load_n(&s_ramcache_peak, __ATOMIC_RELAXED);
     m->gpu_src = __atomic_load_n(&s_gpu_src, __ATOMIC_ACQUIRE);
     if (!m->gpu_src)
         m->gpu_src = "none";
@@ -218,6 +226,10 @@ size_t mem_stats_format(char *buf, size_t n, const char *kind, int64_t t_ms,
     put_mib(&o, "gpu_peak_mib", m->gpu_peak);
     put_mib(&o, "gpu_nl_mib", m->gpu_nl);
     put_mib(&o, "gpu_nl_peak_mib", m->gpu_nl_peak);
+    if (m->ramcache != MEM_STATS_NA) {
+        put_mib(&o, "ramcache_mib", m->ramcache);
+        put_mib(&o, "ramcache_peak_mib", m->ramcache_peak);
+    }
     put(&o, " ram_src=");
     put(&o, m->ram_src ? m->ram_src : "none");
     put(&o, " gpu_src=");
@@ -243,6 +255,8 @@ int mem_stats_parse(const char *line, char *kind, size_t kind_n, struct mem_stat
         {"gpu_peak_mib", offsetof(struct mem_stats, gpu_peak)},
         {"gpu_nl_mib", offsetof(struct mem_stats, gpu_nl)},
         {"gpu_nl_peak_mib", offsetof(struct mem_stats, gpu_nl_peak)},
+        {"ramcache_mib", offsetof(struct mem_stats, ramcache)},
+        {"ramcache_peak_mib", offsetof(struct mem_stats, ramcache_peak)},
     };
     const char *p = line;
     int got = 0;

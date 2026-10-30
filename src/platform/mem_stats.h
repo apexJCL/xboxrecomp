@@ -7,6 +7,9 @@
  *
  *   [MEM] exit ram_mib=812.4 ram_peak_mib=905.1 commit_mib=n/a ... why=atexit
  *
+ * With the RAM cache in use the line also has ramcache_mib and
+ * ramcache_peak_mib, after gpu_nl_peak_mib.
+ *
  * key=value pairs, MiB with one decimal, n/a for what the host cannot give
  * (the CLI's benchdb parses it; mem_stats_parse is the reference reading).
  * RECOMP_TRACE=mem=S adds a "[MEM] sample t=..." line every S seconds.
@@ -48,6 +51,10 @@ struct mem_stats {
     uint64_t commit, commit_peak;
     uint64_t gpu, gpu_peak;
     uint64_t gpu_nl, gpu_nl_peak;
+    /* The cache partition in memory (kernel_ramfs.h), charged in 16 KB
+     * clusters, seed included: part of ram, not on top of it. n/a while
+     * the store is off or unused, and then the line leaves both out. */
+    uint64_t ramcache, ramcache_peak;
     const char *ram_src;   /* "phys_footprint", "working_set", "rss", "none" */
     const char *gpu_src;   /* "metal", "d3d11", "none" */
 };
@@ -60,6 +67,10 @@ void mem_stats_start_from_env(void);
  * give); src names the API ("metal", "d3d11"). Cheap: a few atomic
  * stores. Any thread. */
 void mem_stats_gpu_note(const char *src, uint64_t local, uint64_t nonlocal);
+
+/* The RAM cache's charge in bytes, each time it changes. Cheap: two
+ * atomic stores. Any thread. */
+void mem_stats_ramcache_note(uint64_t used);
 
 /* The process's figures now, plus the GPU's last note. Returns 0 when the
  * host gives no RAM figures (ram fields n/a). Async-signal-safe on POSIX
