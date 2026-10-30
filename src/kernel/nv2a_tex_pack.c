@@ -8,13 +8,20 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
+/* The 64-bit stat on Windows: the default one's st_size is 32 bits, and a
+ * pack with an art tier is past 2 GB. */
 #ifdef _WIN32
 #define pack_seek(f, off) _fseeki64((f), (long long)(off), SEEK_SET)
 #define pack_tell(f)      _ftelli64(f)
+typedef struct __stat64 pack_stat_t;
+#define pack_fstat(f, st) _fstat64(_fileno(f), (st))
 #else
 #define pack_seek(f, off) fseeko((f), (off_t)(off), SEEK_SET)
 #define pack_tell(f)      ftello(f)
+typedef struct stat pack_stat_t;
+#define pack_fstat(f, st) fstat(fileno(f), (st))
 #endif
 
 static struct nv2a_tex_pack_entry *s_entries;
@@ -22,6 +29,18 @@ static unsigned  s_count, s_scale, s_text_scale;
 static unsigned  s_kind_count[XRTP_KIND_COUNT], s_bc3_count;
 static char     *s_path;
 static uint64_t  s_hits;
+
+/* Read entries, most recently used at the head, and their payload bytes. */
+static struct nv2a_tex_pack_entry *s_lru_head, *s_lru_tail;
+static size_t s_resident, s_resident_max = NV2A_TEX_PACK_RESIDENT_MAX;
+static uint64_t s_freed;   /* payloads freed for the budget, for the trace */
+/* The file as loaded. A payload is read later, at offsets checked against
+ * this file; a pack rebuilt in place since then (a new `enhance hud` while
+ * the game runs) would give other bytes there, so a read from a file of
+ * another size or mtime is refused and the guest texels go up instead. */
+static uint64_t s_file_size;
+static long long s_file_mtime;
+static int s_file_changed;
 
 /* What find matches: bit k for kind k, PACK_ON for the whole pack.
  * Kept across unload and load, since the toggles belong to the player,
@@ -110,6 +129,12 @@ void nv2a_tex_pack_unload(void)
     free(s_path);
     s_entries = NULL;
     s_path = NULL;
+    s_lru_head = s_lru_tail = NULL;
+    s_resident = 0;
+    s_freed = 0;
+    s_file_size = 0;
+    s_file_mtime = 0;
+    s_file_changed = 0;
     s_count = 0;
     s_scale = 0;
     s_text_scale = 0;
@@ -195,6 +220,10 @@ int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
             return -1;
         }
     }
+    {
+        pack_stat_t st;
+        s_file_mtime = pack_fstat(f, &st) == 0 ? (long long)st.st_mtime : -1;
+    }
     fclose(f);
     for (i = 0; i < count && !why; i++) {
         const uint8_t *p = index + (size_t)i * NV2A_TEX_PACK_ENTRY;
@@ -249,6 +278,7 @@ int nv2a_tex_pack_load(const char *path, char *err, size_t errlen)
     strcpy(s_path, path);
     s_entries = entries;
     s_count = count;
+    s_file_size = (uint64_t)size;
     s_scale = scale;
     s_text_scale = text_scale ? text_scale : scale;
     memcpy(s_kind_count, kinds, sizeof kinds);
@@ -348,28 +378,101 @@ struct nv2a_tex_pack_entry *nv2a_tex_pack_find(uint64_t hash, uint32_t guest_w,
     return e;
 }
 
+static void lru_unlink(struct nv2a_tex_pack_entry *e)
+{
+    if (e->lru_prev)
+        e->lru_prev->lru_next = e->lru_next;
+    else
+        s_lru_head = e->lru_next;
+    if (e->lru_next)
+        e->lru_next->lru_prev = e->lru_prev;
+    else
+        s_lru_tail = e->lru_prev;
+    e->lru_prev = e->lru_next = NULL;
+}
+
+static void lru_push(struct nv2a_tex_pack_entry *e)
+{
+    e->lru_prev = NULL;
+    e->lru_next = s_lru_head;
+    if (s_lru_head)
+        s_lru_head->lru_prev = e;
+    else
+        s_lru_tail = e;
+    s_lru_head = e;
+}
+
+size_t nv2a_tex_pack_resident_bytes(void)
+{
+    return s_resident;
+}
+
+void nv2a_tex_pack_set_resident_max(size_t bytes)
+{
+    s_resident_max = bytes;
+}
+
+/* Said for the first four failures only: the guest texels are uploaded
+ * instead, and the next upload tries again. */
+static void read_failed(const struct nv2a_tex_pack_entry *e)
+{
+    static unsigned said;
+    if (said++ < 4)
+        fprintf(stderr, "[ENHANCE] textures.pack: cannot read entry %016llX from %s\n",
+                (unsigned long long)e->hash, s_path ? s_path : "?");
+}
+
 const uint32_t *nv2a_tex_pack_texels(struct nv2a_tex_pack_entry *e)
 {
     FILE *f;
     uint32_t *data;
     if (!e)
         return NULL;
-    if (e->data)
+    if (e->data) {
+        if (s_lru_head != e) {
+            lru_unlink(e);
+            lru_push(e);
+        }
         return e->data;
+    }
+    if (s_file_changed)
+        return NULL;
+    /* Opened before anything is freed: a pack that cannot be read keeps
+     * what is held. */
+    f = s_path ? fopen(s_path, "rb") : NULL;
+    if (!f) {
+        read_failed(e);
+        return NULL;
+    }
+    {
+        pack_stat_t st;
+        long long size = fseek(f, 0, SEEK_END) == 0 ? (long long)pack_tell(f) : -1;
+        long long mtime = pack_fstat(f, &st) == 0 ? (long long)st.st_mtime : -1;
+        if (size < 0 || (uint64_t)size != s_file_size || mtime != s_file_mtime) {
+            fprintf(stderr, "[ENHANCE] textures.pack: %s changed since it was loaded; "
+                            "entries not held go up from the guest until it is loaded again\n",
+                    s_path);
+            s_file_changed = 1;
+            fclose(f);
+            return NULL;
+        }
+    }
+    /* Freed before the read, so the peak stays at the budget. A freed
+     * entry's GPU copy stays in the backend's cache; this one is read again
+     * only when that cache uploads it again. */
+    while (s_lru_tail && s_resident + e->bytes > s_resident_max) {
+        struct nv2a_tex_pack_entry *old = s_lru_tail;
+        lru_unlink(old);
+        s_resident -= old->bytes;
+        free(old->data);
+        old->data = NULL;
+        s_freed++;
+    }
     /* bytes is a multiple of 4 either way: texels * 4, or 16 per block. */
     data = (uint32_t *)malloc(e->bytes);
-    if (!data)
-        return NULL;
-    f = s_path ? fopen(s_path, "rb") : NULL;
-    if (!f || pack_seek(f, e->offset) != 0 || fread(data, 1u, e->bytes, f) != e->bytes) {
-        /* Said for the first four failures only: the guest texels are
-         * uploaded instead, and the next upload tries again. */
-        static unsigned said;
-        if (said++ < 4)
-            fprintf(stderr, "[ENHANCE] textures.pack: cannot read entry %016llX from %s\n",
-                    (unsigned long long)e->hash, s_path ? s_path : "?");
-        if (f)
-            fclose(f);
+    if (!data || pack_seek(f, e->offset) != 0 || fread(data, 1u, e->bytes, f) != e->bytes) {
+        read_failed(e);
+        fclose(f);
         free(data);
         return NULL;
     }
@@ -384,6 +487,8 @@ const uint32_t *nv2a_tex_pack_texels(struct nv2a_tex_pack_entry *e)
     }
 #endif
     e->data = data;
+    s_resident += e->bytes;
+    lru_push(e);
     return data;
 }
 
@@ -533,6 +638,10 @@ void nv2a_tex_pack_print_misses(void)
     struct nv2a_tex_pack_miss m[NV2A_TEX_PACK_MISSES];
     unsigned n = nv2a_tex_pack_misses(m, NV2A_TEX_PACK_MISSES), i;
     char buf[16];
+    /* Not a miss: the budget's state rides on the miss trace, the one
+     * tex_pack report the backends print (every 600 flips). */
+    fprintf(stderr, "[TEXPACK] resident %zu KB of %zu KB, %llu freed\n", s_resident >> 10,
+            s_resident_max >> 10, (unsigned long long)s_freed);
     for (i = 0; i < n; i++)
         fprintf(stderr, "[TEXPACK] miss %016llX %ux%u %s x%u %s%s\n",
                 (unsigned long long)m[i].hash, m[i].width, m[i].height,

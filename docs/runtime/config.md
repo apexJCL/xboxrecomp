@@ -581,7 +581,8 @@ same requests at given flips, to check a switch without the menu.
   rasteriser samples guest memory and ignores the key with one line
   (`[ENHANCE] textures.pack ignored: ...`). Every 600 flips a backend
   with a pack logs its hit count; under `RECOMP_TRACE=tex_pack` it also
-  prints the uploads the pack did not replace, one
+  prints `[TEXPACK] resident <n> KB of <budget> KB, <n> freed` (the CPU
+  copies held under the 512 MB budget) and the uploads the pack did not replace, one
   `[TEXPACK] miss <hash> <w>x<h> <format> x<count> candidate|linear/mip`
   line each (texture-pack.md, "Misses"), which says what a pack still
   lacks. A texture the pack holds but did not use carries a tag:

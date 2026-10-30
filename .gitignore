@@ -37,3 +37,7 @@ bin/
 *.exe
 tools/split/output/
 .venv
+
+# tests/tex_pack fixtures, written to the working directory when the test
+# runs outside its build dir
+/*.pack

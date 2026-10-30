@@ -25,7 +25,8 @@
  * art at 4x share one pack.
  *
  * The index is read at load; an entry's texels are read on first use and
- * kept. Lives in the kernel library like nv2a_host_opts, so the backends
+ * kept while the read entries fit NV2A_TEX_PACK_RESIDENT_MAX, the least
+ * recently used freed past it. Lives in the kernel library like nv2a_host_opts, so the backends
  * never link the enhancements layer: without a pack nv2a_tex_pack_count()
  * is 0 and nothing else runs. Not thread-safe: load at startup, use from
  * the thread that uploads textures.
@@ -46,6 +47,11 @@ extern "C" {
 #define NV2A_TEX_PACK_ENTRY   32u
 #define NV2A_TEX_PACK_MAX_DIM 16384u   /* D3D11 and Metal texture limit */
 #define NV2A_TEX_PACK_MAX_ENTRIES (1u << 20)
+/* CPU bytes of read payloads kept at most. The CPU copy is needed only to
+ * upload (each backend's texture cache holds the GPU copy), and a pack with
+ * an art tier (KUF's, 2.5 GB) would otherwise end up whole in memory over
+ * a long session. A small pack (BLiNX 2's) never reaches it. */
+#define NV2A_TEX_PACK_RESIDENT_MAX ((size_t)512u << 20)
 
 /* v2 entry flags. */
 #define XRTP_KIND_MASK  0x3u
@@ -64,7 +70,9 @@ struct nv2a_tex_pack_entry {
     size_t    bytes;          /* of the payload: texels * 4, or the BC3 blocks */
     uint32_t  kind;           /* XRTP_KIND_* */
     int       bc3;            /* payload is BC3 blocks */
-    uint32_t *data;           /* read on first use; NULL until then */
+    uint32_t *data;           /* read on use; NULL until then or once freed */
+    /* Read entries, most recently used first (the resident budget). */
+    struct nv2a_tex_pack_entry *lru_prev, *lru_next;
 };
 
 /* Load `path`: validates the header, the index bounds against the file
@@ -105,10 +113,22 @@ struct nv2a_tex_pack_entry *nv2a_tex_pack_find(uint64_t hash, uint32_t guest_w,
                                                uint32_t guest_h);
 
 /* The entry's payload (e->bytes of it, level 0 first), read from the
- * file on the first call: e->texels A8R8G8B8 texels, or BC3 blocks when
+ * file when it is not held: e->texels A8R8G8B8 texels, or BC3 blocks when
  * e->bc3. NULL if the read failed (the caller then uploads the guest
- * texels as if there were no entry). */
+ * texels as if there were no entry). A read that takes the held bytes past
+ * the budget frees the least recently used other entries first, so the
+ * pointer is good until the next call: upload from it, never keep it. An
+ * entry larger than the budget is still read, and is then the only one
+ * held. The file is opened before anything is freed, so a pack that cannot
+ * be opened keeps what is held; one whose size or mtime differs from the
+ * load's (rebuilt in place) is never read again, said once, until the next
+ * load. */
 const uint32_t *nv2a_tex_pack_texels(struct nv2a_tex_pack_entry *e);
+/* Payload bytes held now, for the tests and the stats. */
+size_t nv2a_tex_pack_resident_bytes(void);
+/* Tests only: the budget in bytes (NV2A_TEX_PACK_RESIDENT_MAX by default),
+ * applied at the next read. Kept across unload and load. */
+void nv2a_tex_pack_set_resident_max(size_t bytes);
 
 /* ---- Misses: guest textures uploaded while a pack is loaded that it did
  * not replace, so an owner can see what a pack could still hold. A ring
@@ -152,8 +172,9 @@ void nv2a_tex_pack_snapshot_want(int on);
 void nv2a_tex_pack_snapshot(void);
 unsigned nv2a_tex_pack_misses_snapshot(struct nv2a_tex_pack_miss *out, unsigned n);
 
-/* Print the misses (RECOMP_TRACE=tex_pack), one "[TEXPACK] miss" line
- * each, to stderr, tagged " (text off)", " (pack off)" or " (entry
+/* Print the resident bytes, the budget and the payloads freed for it
+ * ("[TEXPACK] resident"), then the misses (RECOMP_TRACE=tex_pack), one
+ * "[TEXPACK] miss" line each, to stderr, tagged " (text off)", " (pack off)" or " (entry
  * refused)" when the pack holds the texture. The backends call it every
  * 600 flips. */
 void nv2a_tex_pack_print_misses(void);

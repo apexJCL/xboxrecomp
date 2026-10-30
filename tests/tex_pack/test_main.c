@@ -27,6 +27,14 @@
  *   misses    the ring keeps distinct (hash, size, format) with counts,
  *             sorted by count; candidates are swizzled or DXT one-level
  *             uploads; 64 at most, the oldest giving way; unload clears it
+ *   resident  with a budget that holds one entry, reading the other frees
+ *             the least recently used; a freed entry reads back the same
+ *             texels; a use moves an entry to the front; an entry over the
+ *             budget is still read and held alone; the default budget
+ *             frees nothing; unload clears the count; a pack that cannot
+ *             be opened, or was rewritten since the load (another size, or
+ *             the same size with another mtime), is not read and keeps the
+ *             held entries
  *
  * The cases before v2 build version 1 packs, which the reader still takes.
  */
@@ -34,6 +42,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <sys/utime.h>
+#define utime _utime
+#define utimbuf _utimbuf
+#else
+#include <utime.h>
+#endif
 
 #include "nv2a_backend_common.h"
 #include "nv2a_tex_pack.h"
@@ -459,6 +475,152 @@ static void test_misses(void)
     CHECK(nv2a_tex_pack_misses(m, NV2A_TEX_PACK_MISSES) == 0, "unload kept the misses");
 }
 
+static void test_resident(void)
+{
+    uint8_t buf[512];
+    char err[128] = "";
+    size_t n = build_pack(buf, HASH_A, HASH_B, 1);
+    struct nv2a_tex_pack_entry *a, *b;
+    const uint32_t *px;
+
+    write_file("resident.pack", buf, n);
+    CHECK(nv2a_tex_pack_load("resident.pack", err, sizeof err) == 2, "load: %s", err);
+    a = nv2a_tex_pack_find(HASH_A, 1, 1);
+    b = nv2a_tex_pack_find(HASH_B, 2, 1);
+    if (!a || !b) {
+        fails++;
+        printf("FAIL resident: entries not found\n");
+        nv2a_tex_pack_unload();
+        return;
+    }
+
+    /* The default budget holds both: nothing is freed. */
+    CHECK(nv2a_tex_pack_texels(a) && nv2a_tex_pack_texels(b), "default: read");
+    CHECK(a->data && b->data, "default budget freed an entry");
+    CHECK(nv2a_tex_pack_resident_bytes() == (TEXELS_A + TEXELS_B) * 4,
+          "default: %zu bytes held", nv2a_tex_pack_resident_bytes());
+    nv2a_tex_pack_unload();
+    CHECK(nv2a_tex_pack_resident_bytes() == 0, "unload kept %zu bytes",
+          nv2a_tex_pack_resident_bytes());
+
+    /* Room for B (the larger) alone: each read frees the other. */
+    nv2a_tex_pack_set_resident_max(TEXELS_B * 4);
+    CHECK(nv2a_tex_pack_load("resident.pack", err, sizeof err) == 2, "reload: %s", err);
+    a = nv2a_tex_pack_find(HASH_A, 1, 1);
+    b = nv2a_tex_pack_find(HASH_B, 2, 1);
+    CHECK(nv2a_tex_pack_texels(a) != NULL, "A read");
+    px = nv2a_tex_pack_texels(b);
+    CHECK(px && px[9] == 0x80000900u, "B read past A");
+    CHECK(!a->data && b->data, "B's read did not free A");
+    CHECK(nv2a_tex_pack_resident_bytes() == TEXELS_B * 4, "B alone: %zu bytes",
+          nv2a_tex_pack_resident_bytes());
+    px = nv2a_tex_pack_texels(a);
+    CHECK(px && px[0] == 0xFF000000u && px[3] == 0xFF030303u, "A read again");
+    CHECK(a->data && !b->data, "A's read did not free B");
+
+    nv2a_tex_pack_unload();
+
+    /* Three 2x2 entries, room for two: a use (not only a read) makes an
+     * entry recent, and the least recently used is the one freed. */
+    {
+        uint8_t p3[NV2A_TEX_PACK_HDR + 3 * NV2A_TEX_PACK_ENTRY + 3 * 16];
+        struct nv2a_tex_pack_entry *c, *d, *x;
+        size_t pay = NV2A_TEX_PACK_HDR + 3 * NV2A_TEX_PACK_ENTRY;
+        uint32_t i, t;
+        memset(p3, 0, sizeof p3);
+        memcpy(p3, NV2A_TEX_PACK_MAGIC, 4);
+        wr32(p3 + 4, 1);
+        wr32(p3 + 8, 3);
+        wr32(p3 + 12, 2);
+        wr64(p3 + 16, NV2A_TEX_PACK_HDR);
+        for (i = 0; i < 3; i++) {
+            uint8_t *q = p3 + NV2A_TEX_PACK_HDR + i * NV2A_TEX_PACK_ENTRY;
+            wr64(q, 0x100ull + i);
+            wr32(q + 8, 2);
+            wr32(q + 12, 2);
+            wr32(q + 16, 1);
+            wr64(q + 24, pay + i * 16);
+            for (t = 0; t < 4; t++)
+                wr32(p3 + pay + i * 16 + t * 4, 0xFF000000u | (i << 8) | t);
+        }
+        write_file("resident3.pack", p3, sizeof p3);
+        nv2a_tex_pack_set_resident_max(2 * 16);
+        CHECK(nv2a_tex_pack_load("resident3.pack", err, sizeof err) == 3, "load 3: %s", err);
+        c = nv2a_tex_pack_find(0x100, 1, 1);
+        d = nv2a_tex_pack_find(0x101, 1, 1);
+        x = nv2a_tex_pack_find(0x102, 1, 1);
+        if (c && d && x) {
+            CHECK(nv2a_tex_pack_texels(c) && nv2a_tex_pack_texels(d), "C and D read");
+            CHECK(nv2a_tex_pack_texels(c) == c->data, "C used");   /* D is the oldest */
+            px = nv2a_tex_pack_texels(x);
+            CHECK(px && px[1] == 0xFF000201u, "E read");
+            CHECK(c->data && !d->data && x->data, "E's read did not free D alone");
+            px = nv2a_tex_pack_texels(d);                         /* C is the oldest */
+            CHECK(px && px[3] == 0xFF000103u, "D read again");
+            CHECK(!c->data && d->data && x->data, "D's read did not free C alone");
+            CHECK(nv2a_tex_pack_resident_bytes() == 2 * 16, "three: %zu bytes",
+                  nv2a_tex_pack_resident_bytes());
+        } else {
+            fails++;
+            printf("FAIL resident: three entries not found\n");
+        }
+        nv2a_tex_pack_unload();
+    }
+
+    /* An entry over the budget is read and held alone. */
+    nv2a_tex_pack_set_resident_max(TEXELS_A * 4);
+    CHECK(nv2a_tex_pack_load("resident.pack", err, sizeof err) == 2, "reload: %s", err);
+    a = nv2a_tex_pack_find(HASH_A, 1, 1);
+    b = nv2a_tex_pack_find(HASH_B, 2, 1);
+    CHECK(nv2a_tex_pack_texels(a) != NULL, "A at the budget");
+    px = nv2a_tex_pack_texels(b);
+    CHECK(px && px[0] == 0x80000000u && !a->data, "B over the budget: read, A freed");
+    CHECK(nv2a_tex_pack_resident_bytes() == TEXELS_B * 4, "over: %zu bytes",
+          nv2a_tex_pack_resident_bytes());
+    nv2a_tex_pack_unload();
+
+    /* Room for B alone, B held: reads of A that must fail keep B. */
+    {
+        struct stat st;
+        struct utimbuf ut;
+        nv2a_tex_pack_set_resident_max(TEXELS_B * 4);
+        write_file("resident.pack", buf, n);
+        CHECK(nv2a_tex_pack_load("resident.pack", err, sizeof err) == 2, "reload: %s", err);
+        a = nv2a_tex_pack_find(HASH_A, 1, 1);
+        b = nv2a_tex_pack_find(HASH_B, 2, 1);
+        CHECK(nv2a_tex_pack_texels(b) != NULL, "B read");
+        remove("resident.pack");
+        CHECK(nv2a_tex_pack_texels(a) == NULL, "A read from a missing file");
+        CHECK(b->data && nv2a_tex_pack_resident_bytes() == TEXELS_B * 4,
+              "a failed open freed B");
+        /* The same size, rebuilt in place: only the mtime tells. */
+        write_file("resident.pack", buf, n);
+        CHECK(stat("resident.pack", &st) == 0, "stat");
+        ut.actime = st.st_atime;
+        ut.modtime = st.st_mtime + 10;
+        CHECK(utime("resident.pack", &ut) == 0, "utime");
+        CHECK(nv2a_tex_pack_texels(a) == NULL, "A read from a rewritten file");
+        CHECK(b->data && !a->data, "a rewritten file freed B");
+        CHECK(nv2a_tex_pack_texels(b) == b->data, "B, held, no longer given");
+        ut.modtime = st.st_mtime;
+        utime("resident.pack", &ut);
+        CHECK(nv2a_tex_pack_texels(a) == NULL, "a changed file read again");
+        nv2a_tex_pack_unload();
+
+        /* Another size: refused too. A fresh load takes the new file. */
+        CHECK(nv2a_tex_pack_load("resident.pack", err, sizeof err) == 2, "reload: %s", err);
+        a = nv2a_tex_pack_find(HASH_A, 1, 1);
+        write_file("resident.pack", buf, n + 4);
+        CHECK(nv2a_tex_pack_texels(a) == NULL, "A read from a longer file");
+        nv2a_tex_pack_unload();
+        CHECK(nv2a_tex_pack_load("resident.pack", err, sizeof err) == 2, "reload: %s", err);
+        a = nv2a_tex_pack_find(HASH_A, 1, 1);
+        CHECK(nv2a_tex_pack_texels(a) != NULL, "a new load did not reset the check");
+        nv2a_tex_pack_unload();
+    }
+    nv2a_tex_pack_set_resident_max(NV2A_TEX_PACK_RESIDENT_MAX);
+}
+
 int main(void)
 {
     test_write();
@@ -467,6 +629,7 @@ int main(void)
     test_v2();
     test_bc3();
     test_misses();
+    test_resident();
     if (fails) {
         printf("tex_pack: %d failure(s)\n", fails);
         return 1;

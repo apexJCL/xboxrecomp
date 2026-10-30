@@ -96,7 +96,17 @@ The reader (`src/kernel/nv2a_tex_pack.c`) checks the magic and version,
 the reserved field and the flags, that the index and every entry's payload
 lie inside the file, the sizes, and the sort order, and refuses the whole file otherwise; the layer logs
 the reason and the run stays stock. The index is read at load; an entry's
-texels are read on first use and kept for the process. The sampler state
+texels are read on first use and kept while the read entries total at
+most 512 MB (`NV2A_TEX_PACK_RESIDENT_MAX`); past it the least recently
+used entries' CPU copies are freed, and an entry is read from the file
+again when a backend uploads it again. The GPU copies stay in the
+backends' texture caches, and a pack smaller than the budget is never
+trimmed. A re-read checks that the file still has the size and mtime it
+had at load: a pack rebuilt in place while the game runs would hold other
+bytes at the checked offsets, so it is not read again (said once in the
+log), and the textures not held go up from the guest until the next load.
+The file is opened before anything is freed, so a pack that cannot be
+read keeps what is held. The sampler state
 comes from the guest's registers as always, so a replacement is sampled
 with the guest's filter and wrap modes and, since swizzled and DXT
 textures use normalised coordinates, needs no other change. A linear
