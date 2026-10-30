@@ -22,3 +22,8 @@ set_tests_properties(apu_monitor PROPERTIES ENVIRONMENT
                      "RECOMP_APU_TRACE=1;RECOMP_TRACE=apu_ring,audio_host")
 set_tests_properties(apu_monitor_off PROPERTIES ENVIRONMENT
                      "RECOMP_APU_TRACE=0;RECOMP_TRACE=apu_ring=0,audio_host=0")
+
+# The stub's path under test: in a build with the APU DSP the JIT is the
+# run-time default, so every test here asks for the stub.
+get_property(_stub_tests DIRECTORY PROPERTY TESTS)
+set_property(TEST ${_stub_tests} APPEND PROPERTY ENVIRONMENT RECOMP_APU_DSP=0)

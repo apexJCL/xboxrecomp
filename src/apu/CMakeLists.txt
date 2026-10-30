@@ -25,8 +25,8 @@ target_include_directories(xbox_apu PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 # archive and its system libraries to the game's link. apu_dsp_emu.c is the
 # GP/EP device on it and apu_dsp_run.c runs it each APU frame. With them in,
 # XBOXRECOMP_APU_DSP_DEVICE (PUBLIC on recomp_env, like XBOXRECOMP_APU_DSP)
-# lets RECOMP_APU_DSP=1 through the key table; RECOMP_APU_DSP stays 0 by
-# default, so a build with the device plays as the stub until it is set.
+# lets RECOMP_APU_DSP=1 through the key table and makes it the run-time
+# default; RECOMP_APU_DSP=0 still plays as the stub.
 if(XBOXRECOMP_APU_DSP_TARGET)
     target_sources(xbox_apu PRIVATE apu_dsp_emu.c apu_dsp_run.c)
     target_link_libraries(xbox_apu PRIVATE ${XBOXRECOMP_APU_DSP_TARGET})

@@ -51,13 +51,11 @@ build_one() {
     shift; [ $# -gt 0 ] && shift
     gen=($gen_str)
     # The dsp56300 archive (cmake/dsp56300.cmake, about 12 MB packed and 26 MB
-    # unpacked) once per suite, not once per build that links it. They never
-    # configure at the same time: apu_dsp_link runs in the parallel phase,
-    # apu_dsp_emu and template_main_apu_dsp one after the other after it.
-    case $t in
-        apu_dsp_link|apu_dsp_emu|template_main_apu_dsp)
-            set -- "$@" "-DXBOXRECOMP_DSP56300_CACHE=$B/_deps/dsp56300" ;;
-    esac
+    # unpacked) once per suite, not once per build that links it: every
+    # project that adds the toolkit links it now that XBOXRECOMP_APU_DSP
+    # defaults ON. apu_dsp_link fills the cache before the parallel
+    # phase, which then only reads it (its stamp matches).
+    set -- "$@" "-DXBOXRECOMP_DSP56300_CACHE=$B/_deps/dsp56300"
     if ! cmake -S "$d" -B "$B/$t" ${gen[@]+"${gen[@]}"} -DCMAKE_BUILD_TYPE=Release "$@" \
             >"$log" 2>&1; then
         # n/a only when the one error is the harness's own refusal: an error
@@ -82,17 +80,20 @@ export here B
 export gen_str="${gen[*]-}"
 
 built=$B/built.txt
+: >"$built"
+[ -f "$here/apu_dsp_link/CMakeLists.txt" ] && build_one apu_dsp_link >>"$built"
 for d in "$here"/*/; do
     [ -f "$d/CMakeLists.txt" ] && is_project "$d" && basename "$d"
-done | grep -vx apu_dsp_emu | xargs -P "${JOBS:-6}" -I{} bash -c 'build_one "$@"' _ {} >"$built"
+done | grep -vxE 'apu_dsp_emu|apu_dsp_link' |
+    xargs -P "${JOBS:-6}" -I{} bash -c 'build_one "$@"' _ {} >>"$built"
 [ -f "$here/apu_dsp_emu/CMakeLists.txt" ] && build_one apu_dsp_emu >>"$built"
 # template_main once more with the enhancements layer in: the template starts
 # it only under XBOXRECOMP_ENHANCE, and a new game may build either way.
 if [ -f "$here/template_main/CMakeLists.txt" ]; then
     build_one template_main_enhance template_main -DXBOXRECOMP_ENHANCE=ON >>"$built"
-    # And with the APU DSP (XBOXRECOMP_APU_DSP), which adds the pinned
-    # dsp56300 archive and its system libraries to the game's link.
-    build_one template_main_apu_dsp template_main -DXBOXRECOMP_APU_DSP=ON >>"$built"
+    # And without the APU DSP: template_main itself links dsp56300 by
+    # default, and a game may still build stub-only (XBOXRECOMP_APU_DSP=OFF).
+    build_one template_main_stub template_main -DXBOXRECOMP_APU_DSP=OFF >>"$built"
 fi
 # input_actions once more under ThreadSanitizer: its live rebuild case races
 # a polling thread and a flip thread against rebuilds (n/a without TSan).
@@ -108,6 +109,7 @@ done >>"$built"
 if cmake -S "$root" -B "$B/_root" ${gen[@]+"${gen[@]}"} -DCMAKE_BUILD_TYPE=Release \
         -DXBOXRECOMP_LIBRASHADER_TEST_WIN64=ON \
         "-DXBOXRECOMP_LIBRASHADER_CACHE=$B/_deps/librashader" \
+        "-DXBOXRECOMP_DSP56300_CACHE=$B/_deps/dsp56300" \
         >"$B/_root.cfg.log" 2>&1 &&
     cmake --build "$B/_root" >"$B/_root.build.log" 2>&1; then
     root_ok=1

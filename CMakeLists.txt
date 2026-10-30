@@ -70,17 +70,28 @@ endif()
 
 # MCPX APU DSP emulation: the GP and EP run the title's DSP56300 programs on
 # the MIT dsp56300 JIT (cmake/dsp56300.cmake, a pinned prebuilt archive per
-# target) instead of the stub's host-side ack and stereo fold. Opt-in: OFF
-# by default, and even ON the stub stays the run-time default until
-# RECOMP_APU_DSP=1. ON defines XBOXRECOMP_APU_DSP on recomp_env (PUBLIC, so
-# the APU and the key table agree) and links dsp56300 into xbox_apu.
-# A target without an archive (iPadOS, MSVC, universal macOS) builds as OFF,
-# with a warning; a failed download is an error. src/apu adds the device
-# model and defines XBOXRECOMP_APU_DSP_DEVICE with it.
-option(XBOXRECOMP_APU_DSP "Build the opt-in MCPX APU DSP emulation (dsp56300 JIT)" OFF)
+# target) instead of the stub's host-side ack and stereo fold. It is the
+# stock audio path for every game: ON by default on every target
+# with an archive, and RECOMP_APU_DSP=0 still picks the stub at run time.
+# ON defines XBOXRECOMP_APU_DSP on recomp_env (PUBLIC, so the APU and the key
+# table agree) and links dsp56300 into xbox_apu. A target without an archive
+# (iPadOS, MSVC, universal macOS) defaults OFF quietly, so such a configure
+# never downloads anything; an explicit ON there warns and builds as OFF. A
+# failed download is an error. src/apu adds the device model and defines
+# XBOXRECOMP_APU_DSP_DEVICE with it.
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/dsp56300.cmake)
+_xboxrecomp_dsp56300_triple(_dsp56300_triple)
+if(_dsp56300_triple)
+    set(_dsp56300_default ON)
+else()
+    set(_dsp56300_default OFF)
+endif()
+# A tree configured when the option defaulted OFF holds that OFF in its
+# cache, which option() never replaces: turn it ON once (cmake/dsp56300.cmake).
+xboxrecomp_dsp56300_migrate(${_dsp56300_default})
+option(XBOXRECOMP_APU_DSP "${XBOXRECOMP_APU_DSP_HELP}" ${_dsp56300_default})
 set(XBOXRECOMP_APU_DSP_TARGET "")
 if(XBOXRECOMP_APU_DSP)
-    include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/dsp56300.cmake)
     xboxrecomp_dsp56300(XBOXRECOMP_APU_DSP_TARGET _dsp56300_why)
     if(XBOXRECOMP_APU_DSP_TARGET)
         target_compile_definitions(recomp_env PUBLIC XBOXRECOMP_APU_DSP)

@@ -18,6 +18,24 @@ blinx2-v0.3.2; earlier tags are described by their commits.
   same with and without the enhancements layer) keeps it on disk. The
   `[MEM] exit` line adds `ramcache_mib` and `ramcache_peak_mib` when the
   store was used.
+- The MCPX APU DSP is on by default: the GP and EP run each title's own
+  DSP56300 programs (reverb, effects sends, the title's mix) on the
+  dsp56300 JIT instead of the stub's stereo fold. `XBOXRECOMP_APU_DSP`
+  defaults ON on every target with a prebuilt archive (macOS, Linux and
+  llvm-mingw Windows, x86-64 and arm64) and OFF, without a warning, on
+  the others (MSVC, iPadOS, universal macOS). A tree that cached the old
+  default OFF turns ON once at its next configure, and so does an OFF
+  given with `-D` under the old toolkit (its cache cannot tell the two
+  apart); give `-DXBOXRECOMP_APU_DSP=OFF` again to keep the stub. Unset,
+  `RECOMP_APU_DSP` runs the JIT in a build with the DSP and its device;
+  `RECOMP_APU_DSP=0`, or a game's `D(APU_DSP, "0")`, keeps the stub.
+- Trees that point `XBOXRECOMP_DSP56300_CACHE` at one directory share
+  the dsp56300 download: the extraction is renamed into place whole, and
+  a tree whose stamp matches is only read. A cached tarball that does not
+  match the pin is fetched again, a download that loses the rename to
+  another tree with the same file is accepted, and download or extraction
+  debris older than an hour is swept. `tests/posix_ctest.sh` fills it
+  once per run.
 
 ## [blinx2-v0.9.0] - 2026-10-29
 

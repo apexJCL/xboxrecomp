@@ -224,10 +224,16 @@ static void default_on(const char **values, int id, int supported)
     values[id] = on ? (v ? v : "1") : NULL;
 }
 
-/* RECOMP_APU_DSP: 1 runs the GP and EP on the DSP56300 JIT, 0 (the default)
+/* RECOMP_APU_DSP: 1 runs the GP and EP on the DSP56300 JIT, 0 or empty
  * keeps the stub. Resolved to "1" or NULL, so a reader asks only "is it
  * set". It runs after the game's defaults, so the override below also
- * covers a game's own apu_dsp_ack default.
+ * covers a game's own apu_dsp_ack default, and a game's D(APU_DSP, "0")
+ * keeps that game on the stub.
+ *
+ * Unset (no variable, no game default), it is 1 in a build that can run
+ * the DSP: the JIT is the stock audio path for every game, so a
+ * game needs no setting for it. A build without the DSP or its device is
+ * then a choice, not a mistake, and keeps the stub with no line.
  *
  * With the DSP on, two stub keys no longer make sense: the GP answers its
  * own doorbell, so the host ack (apu_dsp_ack, default auto) would clear a
@@ -246,10 +252,18 @@ static void default_on(const char **values, int id, int supported)
 static void apu_dsp_resolve(const char **values, const char *set)
 {
     const char *v = values[RENV_APU_DSP];
+    int by_default = !v;
 
     (void)set;                    /* read only in a build with the device */
     values[RENV_APU_DSP] = NULL;
-    if (!v || !*v || !strcmp(v, "0"))
+    if (by_default) {
+#if defined(XBOXRECOMP_APU_DSP) && defined(XBOXRECOMP_APU_DSP_DEVICE)
+        v = "1";
+#else
+        return;
+#endif
+    }
+    if (!*v || !strcmp(v, "0"))
         return;
     if (strcmp(v, "1")) {
         note("[ENV] RECOMP_APU_DSP=%s: not 0 or 1; the stub (0)\n", v);
@@ -266,8 +280,9 @@ static void apu_dsp_resolve(const char **values, const char *set)
 #else
     values[RENV_APU_DSP] = "1";
     if (set[RENV_APU_DSP_ACK] || set[RENV_APU_MIXDOWN_ALL])
-        note("[ENV] RECOMP_APU_DSP=1 overrides %s%s%s: the GP acks its own"
+        note("[ENV] %s overrides %s%s%s: the GP acks its own"
              " doorbell and mixes the output\n",
+             by_default ? "the APU DSP (on by default)" : "RECOMP_APU_DSP=1",
              set[RENV_APU_DSP_ACK] ? "apu_dsp_ack (now 0)" : "",
              set[RENV_APU_DSP_ACK] && set[RENV_APU_MIXDOWN_ALL] ? " and " : "",
              set[RENV_APU_MIXDOWN_ALL] ? "apu_mixdown_all (ignored)" : "");

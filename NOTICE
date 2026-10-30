@@ -59,17 +59,17 @@ LGPL-2.1-or-later — extracted from xemu
   satisfies that.
 
 
-MIT and permissive — dsp56300, optional (XBOXRECOMP_APU_DSP)
-------------------------------------------------------------
+MIT and permissive — dsp56300 (XBOXRECOMP_APU_DSP)
+--------------------------------------------------
 
   https://github.com/xemu-project/dsp56300  (v1.0.0)
   (c) 2026 Matt Borgerson. MIT; the text is in LICENSES/MIT-dsp56300.txt.
 
   A Motorola DSP56300 JIT in Rust with a C interface. It is not in this
-  repository: a build with -DXBOXRECOMP_APU_DSP=ON (default OFF) downloads
-  the project's prebuilt static library for its target, pinned by sha256
-  in cmake/dsp56300.cmake, and links it into the APU. Builds with the
-  option OFF contain none of it.
+  repository: a build with -DXBOXRECOMP_APU_DSP=ON (the default on every
+  target with an archive) downloads the project's prebuilt static library
+  for its target, pinned by sha256 in cmake/dsp56300.cmake, and links it
+  into the APU. Builds with the option OFF contain none of it.
 
   That library bundles the Rust standard library, copyright The Rust
   Project Developers, used here under Apache-2.0 (it is MIT OR Apache-2.0;

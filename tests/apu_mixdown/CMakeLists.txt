@@ -23,3 +23,8 @@ set_tests_properties(apu_mixdown_unity PROPERTIES
 add_test(NAME apu_mixdown_two_bins COMMAND apu_mixdown_test)
 set_tests_properties(apu_mixdown_two_bins PROPERTIES
                      ENVIRONMENT "RECOMP_DEBUG=apu_mixdown_all=0;RECOMP_TEST_MIXDOWN_EXPECT=0")
+
+# The stub's path under test: in a build with the APU DSP the JIT is the
+# run-time default, so every test here asks for the stub.
+get_property(_stub_tests DIRECTORY PROPERTY TESTS)
+set_property(TEST ${_stub_tests} APPEND PROPERTY ENVIRONMENT RECOMP_APU_DSP=0)
