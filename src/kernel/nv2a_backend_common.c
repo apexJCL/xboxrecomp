@@ -1315,6 +1315,17 @@ int nv2a_present_rect(uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint32_t d
         fh = dst_h;
         fw = ((uint64_t)dst_h * src_w + src_h / 2) / src_h;
     }
+    /* A frame a hair off the output's shape fills it: hor+ pads by whole
+     * guest columns, so a 16:9 frame is 854 x 480 (2562 x 1440 at scale 3),
+     * and its fit in a 16:9 window came out a row short, the cleared row
+     * left at the bottom. Under 1/256 of the axis the stretch is
+     * invisible; a real letterbox or pillarbox is far wider. An axis
+     * already at 1:1 keeps its size: a NEAREST 640 x 480 frame in a 642 x
+     * 480 window stays crisp behind its two one-column bars. */
+    if ((dst_h - fh) * 256u < dst_h && fh != src_h)
+        fh = dst_h;
+    if ((dst_w - fw) * 256u < dst_w && fw != src_w)
+        fw = dst_w;
     r->w = (int32_t)fw;
     r->h = (int32_t)fh;
     r->x = (int32_t)((dst_w - fw) / 2);

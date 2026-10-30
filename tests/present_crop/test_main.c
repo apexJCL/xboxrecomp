@@ -71,10 +71,11 @@ int main(void)
 
     /* Why fit_w x fit_h is the uncropped size: fitting the rounded crop
      * (622x467) into a 640x480 back buffer gives 639 columns, a one-column
-     * bar. The whole frame's size gives the whole buffer. */
+     * bar that only nv2a_present_rect's near-shape fill hides, so the crop
+     * must hand over the whole frame's size, which gives the whole buffer
+     * on its own. */
     nv2a_present_crop(640, 480, 640, 480, 1, 0, 9, NV2A_PRESENT_NEAREST, &c);
-    nv2a_present_rect(622, 467, 640, 480, NV2A_PRESENT_NEAREST, &r);
-    CHECK(r.w == 639);
+    CHECK(c.fit_w == 640 && c.fit_h == 480);
     nv2a_present_rect(c.fit_w, c.fit_h, 640, 480, NV2A_PRESENT_NEAREST, &r);
     CHECK(rect_is(&r, 0, 0, 640, 480));
     /* and the same 4:3 letterbox as the uncropped frame in a 16:9 window */

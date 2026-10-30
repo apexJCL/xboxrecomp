@@ -1849,10 +1849,12 @@ unsigned nv2a_host_size(uint32_t w, uint32_t h, unsigned scale, uint32_t max_dim
 
 /* Where a src_w x src_h frame goes in a dst_w x dst_h output (device
  * pixels). NEAREST/LINEAR: the largest rectangle of the frame's aspect that
- * fits, centred. INTEGER: the largest whole multiple that fits, centred; if
- * 1x does not fit, the NEAREST/LINEAR fit. Returns 1 when the result is the
- * integer placement, 0 for a fit (the caller filters a downscaled fit
- * linearly). A zero size gives an empty rectangle. */
+ * fits, centred; an axis short of the output by under 1/256 takes the whole
+ * axis (a hor+ frame's whole-column pad rounding) unless it is already 1:1.
+ * INTEGER: the largest whole multiple that fits, centred; if 1x does not
+ * fit, the NEAREST/LINEAR fit. Returns 1 when the result is the integer
+ * placement, 0 for a fit (the caller filters a downscaled fit linearly). A
+ * zero size gives an empty rectangle. */
 struct nv2a_rect { int32_t x, y, w, h; };
 int nv2a_present_rect(uint32_t src_w, uint32_t src_h, uint32_t dst_w, uint32_t dst_h,
                       int filter, struct nv2a_rect *r);

@@ -805,6 +805,18 @@ int main(void)
     CHECK(nv2a_present_rect(1280, 960, 1000, 700, NV2A_PRESENT_INTEGER, &r) == 0 && rect_is(&r, 33, 0, 933, 700));
     /* Odd sizes round to the nearest pixel and stay inside. */
     CHECK(nv2a_present_rect(640, 480, 1001, 333, NV2A_PRESENT_NEAREST, &r) == 0 && rect_is(&r, 278, 0, 444, 333));
+    /* A hor+ 16:9 frame (854 x 480 guest, 2562 x 1440 at 3x) is a hair
+     * wider than 16:9: it fills a 16:9 output, not a row short of it with
+     * the cleared row at the bottom. 5K too (2 rows short). */
+    CHECK(nv2a_present_rect(2562, 1440, 1920, 1080, NV2A_PRESENT_LINEAR, &r) == 0 && rect_is(&r, 0, 0, 1920, 1080));
+    CHECK(nv2a_present_rect(2562, 1440, 3456, 1944, NV2A_PRESENT_NEAREST, &r) == 0 && rect_is(&r, 0, 0, 3456, 1944));
+    CHECK(nv2a_present_rect(2562, 1440, 5120, 2880, NV2A_PRESENT_LINEAR, &r) == 0 && rect_is(&r, 0, 0, 5120, 2880));
+    /* An axis already 1:1 is not stretched: a NEAREST 640 x 480 frame in a
+     * 642 x 480 (or 640 x 481) window keeps whole pixels, bars and all. */
+    CHECK(nv2a_present_rect(640, 480, 642, 480, NV2A_PRESENT_NEAREST, &r) == 0 && rect_is(&r, 1, 0, 640, 480));
+    CHECK(nv2a_present_rect(640, 480, 640, 481, NV2A_PRESENT_NEAREST, &r) == 0 && rect_is(&r, 0, 0, 640, 480));
+    /* The same frame in a 16:10 output stays letterboxed. */
+    CHECK(nv2a_present_rect(2562, 1440, 1920, 1200, NV2A_PRESENT_LINEAR, &r) == 0 && rect_is(&r, 0, 60, 1920, 1079));
     /* Empty in, empty out. */
     CHECK(nv2a_present_rect(0, 480, 640, 480, NV2A_PRESENT_NEAREST, &r) == 0 && rect_is(&r, 0, 0, 0, 0));
     CHECK(nv2a_present_rect(640, 480, 0, 0, NV2A_PRESENT_INTEGER, &r) == 0 && rect_is(&r, 0, 0, 0, 0));
