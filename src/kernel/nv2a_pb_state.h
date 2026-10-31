@@ -285,6 +285,12 @@ struct nv2a_pb_present {
 };
 const struct nv2a_pb_present *nv2a_pb_present_state(void);
 
+/* The walker's flip count (FLIP_STALLs so far), the number a flip's
+ * on_flip runs under and the HUD capture's requests name (nv2a_cap_take).
+ * A backend's own present count can fall behind it (a flip before its
+ * device is up never reaches its present). Walker thread only, as above. */
+uint32_t nv2a_pb_flips(void);
+
 /* RECOMP_FB_DUMP_AT: whether `flip` is listed. The executor dumps listed
  * flips for the CPU path and backends that write back; a backend that
  * presents from its own surfaces (D3D11) asks this at each present and dumps

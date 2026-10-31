@@ -18,6 +18,7 @@
 #include "enhance_actions.h"
 #include "enhance_cfg.h"
 #include "hud_anchor.h"
+#include "hud_capture.h"
 #ifdef XBOXRECOMP_ENHANCE
 #include "nv2a_overlay.h"
 #endif
@@ -149,6 +150,13 @@ struct mod_hook { xbox_mod_hook_fn pre, post; void *user; int owner; };
 static struct mod_hook s_hooks[MOD_HOOK_MAX];
 static int s_nhooks;
 
+/* The HUD capture's own hooks (hud_capture.h): the wrappers of the table
+ * it loads and its level-0 draws, under an owner of their own. */
+#define CAP_HOOK_MAX 96
+static struct mod_hook s_cap_hooks[CAP_HOOK_MAX];
+static int s_ncap_hooks;
+static char s_cap_owner;
+
 static void api_log(const struct xbox_mod *m, const char *fmt, ...)
 {
     va_list ap;
@@ -258,10 +266,20 @@ static int hook_owner_on(int i)
     return st == XBOX_MOD_RESTART && s_mod[i].start == XBOX_MOD_ON;
 }
 
+/* As hook_owner_on, and the HUD table's owner also while a capture runs,
+ * so its hooks reach hud_apply to be recorded (design A15). The layer's
+ * mod part stays off with the mod: hud_apply then records and returns -1,
+ * changing nothing; the mod's own work it skips by hud_capturing. Once the
+ * capture is done the owner's hooks follow the mod again. */
+static int hook_runs(int i)
+{
+    return hook_owner_on(i) || (i == s_hud_owner && hud_capture_live());
+}
+
 static void hook_pre(struct xbox_mod_call *c, void *user)
 {
     const struct mod_hook *h = user;
-    if (!hook_owner_on(h->owner))
+    if (!hook_runs(h->owner))
         return;
     mod_mem();
     h->pre(c, h->user);
@@ -270,7 +288,7 @@ static void hook_pre(struct xbox_mod_call *c, void *user)
 static void hook_post(struct xbox_mod_call *c, void *user)
 {
     const struct mod_hook *h = user;
-    if (!hook_owner_on(h->owner)) {
+    if (!hook_runs(h->owner)) {
         /* Switched off between the pre and this post: the HUD layer still
          * undoes what the pre began (a RESTORE shift, a wrapper's entry). */
         if (h->owner == s_hud_owner)
@@ -310,6 +328,61 @@ static int api_hook(uint32_t va, xbox_mod_hook_fn pre, xbox_mod_hook_fn post,
     return 1;
 }
 
+static void cap_hook_pre(struct xbox_mod_call *c, void *user)
+{
+    const struct mod_hook *h = user;
+    mod_mem();
+    h->pre(c, h->user);
+}
+
+static void cap_hook_post(struct xbox_mod_call *c, void *user)
+{
+    const struct mod_hook *h = user;
+    mod_mem();
+    h->post(c, h->user);
+}
+
+static int cap_hook(uint32_t va, xbox_mod_hook_fn pre, xbox_mod_hook_fn post, uint32_t flags,
+                    void *user)
+{
+    struct mod_hook *h;
+
+    if (s_ncap_hooks >= CAP_HOOK_MAX) {
+        fprintf(stderr, "[hud.capture] hook 0x%08X: refused, the hooks are full\n",
+                (unsigned)va);
+        return 0;
+    }
+    h = &s_cap_hooks[s_ncap_hooks];
+    h->pre = pre;
+    h->post = post;
+    h->user = user;
+    h->owner = -1;
+    if (!recomp_hook_add(&s_cap_owner, "hud_capture", va, pre ? cap_hook_pre : NULL,
+                         post ? cap_hook_post : NULL, flags, h))
+        return 0;
+    s_ncap_hooks++;
+    return 1;
+}
+
+/* The capture's start (hud_capture.h), after the mods' inits and before
+ * the hooks are published. One key read while it is off. */
+static void cap_start(void)
+{
+    if (!hud_capture_init(&s_api.mem))
+        return;
+    hud_capture_tables(cap_hook, s_hud_owner >= 0);
+}
+
+/* Its frame: the layer's own when no mod owns a table (the capture's
+ * table, or none), then the capture's. */
+static void cap_frame(void)
+{
+    mod_mem();
+    if (s_hud_owner < 0)
+        hud_layer_frame(0);
+    hud_capture_frame();
+}
+
 static int api_hud_table(const char *toml, size_t len)
 {
     int rc;
@@ -322,6 +395,13 @@ static int api_hud_table(const char *toml, size_t len)
     if (rc >= 0)
         s_hud_owner = s_init_owner;
     return rc;
+}
+
+static int api_hud_capturing(const struct xbox_mod *m)
+{
+    int o = s_hud_owner;
+    return o >= 0 && m && s_table && o < s_count && s_table[o] == m && !hook_owner_on(o)
+           && hud_capture_live();
 }
 
 static void api_active(const struct xbox_mod *m, int on)
@@ -392,6 +472,16 @@ static void exit_hook(const char *why)
 static void at_exit(void)
 {
     xbox_mod_shutdown();
+}
+
+static void cap_exit_hook(void)
+{
+    if (s_exit_hooked)
+        return;
+    s_exit_hooked = 1;
+    atexit(at_exit);
+    if (!recomp_exit_hook_add(exit_hook))
+        fprintf(stderr, LOGP "no exit hook: a window's exit skips the shutdowns\n");
 }
 
 /* ---- numbers in the C locale ----------------------------------------------
@@ -1146,6 +1236,7 @@ static int mod_init(int describe)
     }
     s_token = 0;
     s_nhooks = 0;
+    s_ncap_hooks = 0;
     s_hud_owner = -1;
     hud_layer_reset();
     recomp_hook_reset();
@@ -1156,6 +1247,12 @@ static int mod_init(int describe)
             nv2a_batch_filter_set(NULL);
             /* The one line a title without mods prints: the golden pins it. */
             token_print(0);
+            /* A capture needs no mod: its table and hooks are its own. */
+            cap_start();
+            if (hud_capture_on()) {
+                recomp_hook_publish();
+                cap_exit_hook();
+            }
         }
         return 0;
     }
@@ -1189,6 +1286,7 @@ static int mod_init(int describe)
     s_api.hud_table = api_hud_table;
     s_api.hud_apply = hud_layer_apply;
     s_api.hud_restore = hud_layer_restore;
+    s_api.hud_capturing = api_hud_capturing;
     hud_layer_set_mem(&s_api.mem);
     s_menu_on = enhance_cfg_bool("menu.enabled", 0);
 
@@ -1310,6 +1408,7 @@ static int mod_init(int describe)
 
     /* Installed last, so a filter a failed init asked for is never seen. */
     nv2a_batch_filter_set(s_nfilter ? filter_all : NULL);
+    cap_start();
     /* The hooks likewise: a failed init's were dropped from the queue. */
     {
         int nh = recomp_hook_publish();
@@ -1319,12 +1418,8 @@ static int mod_init(int describe)
     hud_frame();
     s_token = token_mask();
     token_print(s_token);
-    if (s_nrunning && !s_exit_hooked) {
-        s_exit_hooked = 1;
-        atexit(at_exit);
-        if (!recomp_exit_hook_add(exit_hook))
-            fprintf(stderr, LOGP "no exit hook: a window's exit skips the shutdowns\n");
-    }
+    if (s_nrunning || hud_capture_on())
+        cap_exit_hook();
 
     fprintf(stderr, LOGP "%d running:", s_nrunning);
     for (i = 0; i < s_nrunning; i++)
@@ -1348,8 +1443,11 @@ void xbox_mod_frame(void)
 {
     int i;
 
-    if (!s_nrunning)
+    if (!s_nrunning) {
+        if (hud_capture_on() && !__atomic_load_n(&s_shut, __ATOMIC_ACQUIRE))
+            cap_frame();
         return;
+    }
     mod_mem();
     if (__atomic_load_n(&s_shut, __ATOMIC_ACQUIRE))
         return;
@@ -1371,6 +1469,8 @@ void xbox_mod_frame(void)
         }
     }
     hud_frame();
+    if (hud_capture_on())
+        cap_frame();
     /* The token again when a toggle or a mod's active state changed it:
      * a few loads per frame, and only in a title with mods running. */
     {
@@ -1691,6 +1791,7 @@ void xbox_mod_shutdown(void)
     nv2a_batch_filter_set(NULL);
     /* The guest threads likewise: no hook runs into a shut-down mod. */
     recomp_hook_unpublish();
+    hud_capture_end();
     for (i = s_nrunning - 1; i >= 0; i--)
         if (s_running[i]->shutdown)
             s_running[i]->shutdown();

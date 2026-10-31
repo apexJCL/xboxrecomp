@@ -1649,6 +1649,28 @@ static void dump_at_flip(uint32_t flip)
         fprintf(stderr, "  [GPU] flip %u: fb_dump_at dump failed\n", flip);
 }
 
+/* The HUD capture's picture of the guest frame this flip presents
+ * (nv2a_backend_common.h): written here from guest memory on the CPU path
+ * and the write-back backends; D3D11 takes its own in its on_flip. Then the
+ * flip is noted, so the guest can name the next one. One load per flip
+ * while nothing is posted. */
+static void cap_at_flip(uint32_t flip)
+{
+#ifdef XBOXRECOMP_ENHANCE
+    if (nv2a_cap_pending()) {
+        const struct nv2a_pb_backend *be = nv2a_pb_get_backend();
+        char path[NV2A_CAP_PATH];
+        int slot;
+        if ((be == nv2a_pb_cpu_backend() || be->writes_back)
+            && (slot = nv2a_cap_take(flip, path, sizeof path)) >= 0)
+            nv2a_cap_done(slot, write_present_bmp(path));
+    }
+    nv2a_cap_note_flip(flip);
+#else
+    (void)flip;
+#endif
+}
+
 /* Write the current surface out as a 24-bit BMP.
  *
  * A framebuffer window needs someone watching it. A file does not, which makes
@@ -6202,6 +6224,7 @@ const uint8_t  *nv2a_pb_tex_regs_set(void)        { return s_tex_set; }
 uint32_t nv2a_pb_tex_regs_gen(void)               { return s_tex_gen; }
 uint32_t nv2a_pb_dma_resolve(uint32_t offset)     { return dma_resolve(offset); }
 const struct nv2a_pb_present *nv2a_pb_present_state(void) { return &s_present; }
+uint32_t nv2a_pb_flips(void) { return s_gpu.flips; }
 
 /* RECOMP_TRACE=px=x,y[;x,y],px_flips=a-b,px_max=n on the CPU path: each batch
  * that changes one of the pixels prints its colour and depth before and
@@ -7490,6 +7513,7 @@ void nv2a_pb_exec_method(uint32_t subch, uint32_t method, uint32_t param)
             last_draws = s_gpu.draws;
         }
         dump_at_flip(s_gpu.flips);
+        cap_at_flip(s_gpu.flips);
         /* RECOMP_FB_DUMP_FLIPS=<n>: with RECOMP_FB_DUMP, the finished frame
          * at every nth flip that drew something (up to 200), so a run leaves
          * whole frames behind rather than only the mid-frame 3D dumps. */

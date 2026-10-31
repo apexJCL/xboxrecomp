@@ -341,7 +341,11 @@ struct xbox_mod_api {
      * bad canvas fails with one line and returns < 0. One table per run.
      * Returns the number of sites. The mod that registers it is listed in
      * mods= only while the layer is active (the mod on, the table, a wide
-     * display.aspect); it need not call active itself. */
+     * display.aspect); it need not call active itself. While a mapping
+     * capture runs (debug.hud_capture), your hooks run with the mod off or
+     * dormant too, so hud_apply can record its calls: a pre or post that
+     * does more than hud_apply and hud_restore (writes guest state, counts,
+     * toggles) tests hud_capturing first and does only those two then. */
     int (*hud_table)(const char *toml, size_t len);
     /* From a hook's pre on the call that takes a HUD element's vertices:
      * find the element by return address (the wrappers' call chain, then
@@ -352,6 +356,12 @@ struct xbox_mod_api {
      * (the layer inactive, or the call skipped). Guest thread. */
     int (*hud_apply)(const struct xbox_mod_call *c, const struct xbox_hud_call *d);
     void (*hud_restore)(const struct xbox_mod_call *c);
+    /* Non-zero when m's hooks run only for a mapping capture: one runs
+     * (debug.hud_capture) and m owns the HUD table but is off or dormant,
+     * so the capture alone calls them. Then a hook does only hud_apply and
+     * hud_restore, and the run stays as it would be without the mod. 0
+     * otherwise, the mod on included. Any thread; a few loads. */
+    int (*hud_capturing)(const struct xbox_mod *m);
 };
 
 /* Stack argument n (0-based) of a hooked call, in a pre or a post. */

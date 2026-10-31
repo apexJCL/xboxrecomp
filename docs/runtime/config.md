@@ -1161,7 +1161,7 @@ points, its live class; the footer names the selected row's:
 
 | Class | Takes effect | Items |
 |---|---|---|
-| live | at the next flip | `render.aniso`, `render.snap_2d`, `present.filter`, `present.shader`, `present.pacing`, `display.overscan`, `display.movie`, `display.hud_margin` (listed while a HUD mod has registered a table), `overlay.stats`, `input.mouse_capture`, every action binding, a mod with `on_enable` |
+| live | at the next flip | `render.aniso`, `render.snap_2d`, `present.filter`, `present.shader`, `present.pacing`, `display.overscan`, `display.movie`, `display.hud_margin` (listed while a HUD mod has registered a table; a table only the capture loaded does not count), `overlay.stats`, `input.mouse_capture`, every action binding, a mod with `on_enable` |
 | at the flip | at the next flip, rebuilding the targets or the texture cache | `render.scale`, `present.fullscreen`, `textures.pack`, `textures.font`, `textures.text` |
 | next stage | at a later game point (a title's item) | none of the toolkit's |
 | next activation | when the mod next turns its feature on | a mod setting the descriptor marks so (the free camera's HUD choice) |
@@ -1337,6 +1337,7 @@ The title's glue calls two entries:
 | `hud_table(toml, len)` | v5. Registers the game's HUD table ([HUD table](#hud-table-v5)). Init only; one mod per run. |
 | `hud_apply(c, d)` | v5. From a hook's pre on the call that takes a HUD element's vertices: moves, clips or stretches them for this frame. Guest threads. |
 | `hud_restore(c)` | v5. From the same hook's post: puts back what an `XBOX_HUD_RESTORE` apply changed. |
+| `hud_capturing(mod)` | v5. Non-zero when the mod's hooks run only for a mapping capture (it owns the HUD table and is off or dormant): a hook then does only `hud_apply` and `hud_restore`. Any thread. |
 
 `struct xbox_mod` gained two fields in v4, after `desc`:
 
@@ -1481,8 +1482,14 @@ element = "portrait"
 group = "panel"              # or kind = "...": its own group
 note = "free text"
 
-[capture]                    # reserved for the mapping capture: only draws
-                             # (read, unused); any other key is refused
+[[capture.draws]]            # level 0 of the mapping capture (below);
+fn = 0x0004A3C0              # read with every table, used only by it
+name = "draw_quad"
+vtx = "stack:0"              # where the vertices are: "ecx", "edx" or
+count = "stack:4"            # "stack:N" (bytes past the return address);
+stride = 28                  # count and stride may be numbers; vtx and
+prim = 4                     # count go together; default layout's
+# or the short form: [capture] draws = [0x0004A3C0, "0x0004A400"]
 ```
 
 The canvas maps units to guest pixels by `s = view_w / w`. All rules run in
@@ -1537,6 +1544,79 @@ clipped there.
   - `[hud.unlisted]`: an unlisted site drawn past the 4:3 columns;
   - `[hud.skew]`: a site with a primitive the window cuts that is not axis-aligned, left unclipped;
   - `[hud.skip]`.
+
+**The mapping capture** (`src/enhance/hud_capture.h`, design A15 of the
+openspec change hud-anchors) records what the game draws as HUD, for
+`xbr hud-map` to turn into a table. Its `RECOMP_DEBUG` keys:
+
+| Key | Meaning |
+|---|---|
+| `hud_capture=<dir>` | on: writes `<dir>/capture.jsonl` and one `<dir>/frame_NNNNN.bmp` per captured guest frame |
+| `hud_capture_at=<from>:<count>` | the guest frames, counted in `xbox_mod_frame` calls from 1 (default `1:1`, count up to 10000) |
+| `hud_capture_table=<path>` | a table file the capture loads and hooks itself, so a capture needs no mod; a table a mod registered wins, with one `[hud.capture]` line |
+
+It records and changes nothing, whatever the HUD mod's switch: it sets the
+layer's active flag for recording only, so the wrappers keep their chain
+and `hud_apply` reports each call, while shifts, clips and the lift follow
+the mod alone. While it runs the HUD mod's hooks reach `hud_apply` even
+with the mod off (which then returns -1). The capture can keep that
+promise only for what the toolkit does: a HUD mod whose hooks do more
+than `hud_apply` and `hud_restore` tests `api->hud_capturing(mod)` and
+skips the rest while it is non-zero.
+
+Capturing changes the game's timing: at each captured frame's start
+`xbox_mod_frame` naps up to 200 ms for the walker, and on D3D11 each
+picture maps a staging copy of the frame synchronously at its present.
+
+- **Level 1** records every `hud_apply` call, before any change.
+- **Level 0** hooks each `[capture] draws` entry. A row the runtime cannot
+  use is skipped with a line and never fails the table: a `sig:` row needs
+  its VA (`xbr hud-map` writes a copy of the table with it). The callers
+  are words of the 96 above the return address that lie in the title's
+  code and follow a call (`E8`, `FF 15`, `FF D0+r`, `FF 50+r`), up to 8.
+  The site is the outermost listed one, else the return address. The
+  vertices, when located, are read as pretransformed (x at 0, y at 4) and
+  converted to canvas units. Vertices at or above 64 MB (past retail RAM)
+  are not read: the `bbox` is null, said once on stderr.
+
+Lines are gathered in a buffer on the guest's thread and written at
+`xbox_mod_frame`. A frame's lines wait until its picture is written or
+given up (120 frames), then go out as its sprites and its frame line last,
+so a reader that sees frame F has F's sprites and picture. The picture is
+the flip that presents the frame: at the frame's start the capture waits up
+to 200 ms for the walker to finish what the guest kicked, then asks for the
+next flip. It has the guest surface's size on every backend (D3D11 under
+`render.scale` averages each block down, as Metal's write-back does), so a
+`bbox` lands on the same pixels everywhere. A line a second guest thread finishes after its frame was
+sealed is dropped and counted in the `dropped` total, never written into a
+later frame; readers still group by `frame`. Each picture is a full BMP:
+10000 frames at 640x480 are about 12 GB. One JSON object per line:
+
+```json
+{"type":"sprite","level":1,"frame":2,"queue":7,"chain":["0x00012340"],
+ "ret":"0x00045678","site":"0x00012340","element":"score","group":"score",
+ "n":4,"bbox":[300,10,340,30],"prims":1,"tex":"0x00000000DEADBEEF"}
+{"type":"sprite","level":0,"frame":2,"queue":null,"draw":"0x0004A3C0",
+ "name":"draw_quad","chain":["0x00012900","0x00012010"],"ret":"0x00012F00",
+ "site":"0x00012010","element":"timer","group":"timer","n":4,
+ "bbox":[100,50,200,80],"prims":1,"tex":null}
+{"type":"frame","frame":2,"flip":31,"canvas":{"w":640,"h":480,
+ "origin":"top-left","y":"down","view":[0,0,640,480],"target":[640,480],
+ "pad":0},"bmp":"frame_00002.bmp"}
+```
+
+- `chain`: return addresses, outermost first (level 1: the wrappers';
+  level 0: the stack scan's). `ret`: the hooked call's own `[esp]`.
+- `site`, `element`, `group`: the matched row, else null; `group` is null
+  for a site with its own `kind`.
+- `bbox`: `[x0, y0, x1, y1]` in canvas units, null when no vertex was
+  read or a corner is not finite (a huge vertex under a small view
+  scale); `prims` is `n / prim`. A number is never `inf` or `nan`.
+- `queue` and `tex`: what the mod passed in `xbox_hud_call` (`tex` null
+  when 0); null at level 0.
+- `flip` is null and `bmp` null when no picture could be asked for or it
+  failed; `canvas` is null without a table.
+- Each VA is a `"0x%08X"` string; numbers are in the C locale.
 
 **Arrays of tables.** The toolkit's TOML reader takes `[[name]]` only
 through `recomp_cfg_load_string_aot`, which the HUD table uses. Its rows

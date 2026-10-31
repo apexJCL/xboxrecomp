@@ -2058,6 +2058,71 @@ static inline void nv2a_flip_hook_run(void)
 #endif
 }
 
+/* ------------------------------------------------------------------------ */
+/* HUD capture glue (enhancements layer only)                               */
+/* ------------------------------------------------------------------------ */
+
+/* The HUD mapping capture (src/enhance/hud_capture.c, RECOMP_DEBUG=
+ * hud_capture) asks for one BMP per captured guest frame, taken at the flip
+ * that presents it. The guest's frame thread posts a request naming that
+ * flip; the walker takes it at the flip and writes the picture (the CPU
+ * path and write-back backends from guest memory in nv2a_pb_exec.c, D3D11
+ * from its render target). It lives here, not in the layer, because the
+ * layer links the runtime and never the other way round. While nothing is
+ * posted a flip costs one load. */
+#define NV2A_CAP_SLOTS 64u
+#define NV2A_CAP_PATH  512u
+
+enum {
+    NV2A_CAP_FREE = 0,
+    NV2A_CAP_LIVE,              /* posted, its flip not reached */
+    NV2A_CAP_TAKEN,             /* the walker is writing it */
+    NV2A_CAP_DONE,
+    NV2A_CAP_FAILED,
+    NV2A_CAP_DEAD               /* its flip passed without a take */
+};
+
+/* What only the kernel knows (xbox_memory_layout.c registers it at the ack
+ * thread's start): whether the walker has executed everything the guest
+ * kicked (poking it when not), and where the title's code lies. */
+struct nv2a_cap_kernel {
+    int (*walk_idle)(void);
+    void (*code_range)(uint32_t *lo, uint32_t *hi);
+};
+
+#ifdef XBOXRECOMP_ENHANCE
+extern int nv2a_cap_live;       /* atomic: LIVE requests */
+
+void nv2a_cap_set_kernel(const struct nv2a_cap_kernel *k);
+const struct nv2a_cap_kernel *nv2a_cap_kernel(void);
+/* The walker, at every flip (FLIP_STALL), after the backend's present. */
+void nv2a_cap_note_flip(uint32_t flip);
+/* The last flip the walker reached. */
+uint32_t nv2a_cap_flips(void);
+/* Guest side: a request for `flip` into `path`; the slot, or -1 when the
+ * ring is full or the path too long. */
+int nv2a_cap_post(uint32_t flip, const char *path);
+/* Guest side: the slot's end state (DONE, FAILED, DEAD), the slot then
+ * free again; or -1 while it is LIVE or TAKEN. With `retract`, a LIVE slot
+ * is taken back and reads as DEAD. */
+int nv2a_cap_poll(int slot, int retract);
+/* Walker side, at `flip`: the slot to write (its path copied out), or -1.
+ * Requests for an earlier flip are marked DEAD on the way. */
+int nv2a_cap_take(uint32_t flip, char *path, size_t len);
+void nv2a_cap_done(int slot, int ok);
+/* Tests: every slot free, no kernel, flip 0. */
+void nv2a_cap_reset(void);
+#endif
+
+static inline int nv2a_cap_pending(void)
+{
+#ifdef XBOXRECOMP_ENHANCE
+    return __atomic_load_n(&nv2a_cap_live, __ATOMIC_ACQUIRE) != 0;
+#else
+    return 0;
+#endif
+}
+
 #ifdef __cplusplus
 }
 #endif

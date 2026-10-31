@@ -23,6 +23,7 @@
 #include "nv2a_flip_hold.h"
 #include "nv2a_kick_wake.h"
 #include "nv2a_gr_notify.h"
+#include "nv2a_backend_common.h"   /* the HUD capture's kernel view */
 #include "apu/apu_wav.h"  /* the watchdog finalises the WAV dump */
 #include "guest_vmem.h"
 #include "xbe_sections.h"
@@ -2704,8 +2705,37 @@ static DWORD WINAPI nv2a_ack_thread(LPVOID param)
     return 0;
 }
 
+#ifdef XBOXRECOMP_ENHANCE
+/* The HUD capture's view of the kernel (nv2a_backend_common.h): the walker
+ * has executed what the guest kicked when DMA_PUT is the PUT it scanned to;
+ * when not, it is poked so a sleeping ack loop looks now. */
+static int cap_walk_idle(void)
+{
+    uint32_t put;
+
+    if (!g_nv2a_memory)
+        return 1;
+    put = *(volatile uint32_t *)((char *)g_nv2a_memory + NV2A_USER_DMA_PUT);
+    if (put == g_scanned_put)
+        return 1;
+    xbox_Nv2aKickPoke();
+    return 0;
+}
+
+static void cap_code_range(uint32_t *lo, uint32_t *hi)
+{
+    *lo = g_xbox_code_lo;
+    *hi = g_xbox_code_hi;
+}
+
+static const struct nv2a_cap_kernel s_cap_kernel = { cap_walk_idle, cap_code_range };
+#endif
+
 static void xbox_Nv2aAckStart(void)
 {
+#ifdef XBOXRECOMP_ENHANCE
+    nv2a_cap_set_kernel(&s_cap_kernel);
+#endif
     dsp_ack_init();
     poke_init();
     g_nv2a_ack_stop = 0;

@@ -796,15 +796,20 @@ static const char k_hud_toml[] =
     "[[site]]\nret_va = 0x2000\nelement = \"score\"\nkind = \"left\"\n";
 static int s_hud_rc, s_hud_rc2, s_hud_fail;
 static int s_hud_off_in_pre, s_hud_moved, s_hud_restored;
+static const struct xbox_mod k_hudt;
 static const struct xbox_mod_api *s_hud_api;
 
 /* The mod's hook on its vertex call (VA_STD): four 16-byte vertices at
  * 0x1040, applied with RESTORE and put back at the post. */
+static int s_hud_pres, s_hud_cap_seen;
+
 static void hudt_pre(struct xbox_mod_call *c, void *u)
 {
     struct xbox_hud_call d = { 0x1040u, 4, XBOX_HUD_RESTORE, 0, 0 };
     uint8_t before[64];
     (void)u;
+    s_hud_pres++;
+    s_hud_cap_seen = s_hud_api->hud_capturing(&k_hudt);
     memcpy(before, s_guest + 0x40, sizeof before);
     s_hud_api->hud_apply(c, &d);
     s_hud_moved = memcmp(before, s_guest + 0x40, sizeof before) != 0;
@@ -820,7 +825,7 @@ static void hudt_post(struct xbox_mod_call *c, void *u)
 
 static int hudt_init(const struct xbox_mod_api *api)
 {
-    CHECK(api->size >= offsetof(struct xbox_mod_api, hud_restore) + sizeof api->hud_restore);
+    CHECK(api->size >= offsetof(struct xbox_mod_api, hud_capturing) + sizeof api->hud_capturing);
     s_hud_api = api;
     s_hud_rc = api->hud_table(k_hud_toml, sizeof k_hud_toml - 1);
     CHECK(api->hook(VA_STD, hudt_pre, hudt_post, 0, NULL) == 1);
@@ -905,6 +910,60 @@ static void test_hud_table(void)
     s_hud_fail = 0;
 }
 
+/* The owner's hooks under a mapping capture (hud_capture.h): they run with
+ * the mod off too, and hud_capturing says so only then. */
+static void test_hud_capturing(void)
+{
+    static const struct xbox_mod *const one[] = { &k_hudt, NULL };
+    static const float q[16] = { 600, 10, 0, 0, 700, 10, 1, 0,
+                                 700, 30, 1, 1, 600, 30, 0, 1 };
+    const uint32_t args[5] = { 1, 2, 3, 4, 5 };
+    uint8_t want[64];
+
+    MKDIR("hud_capture_out");
+    recomp_env_set(RENV_HUD_CAPTURE, "hud_capture_out");
+    recomp_env_set(RENV_HUD_CAPTURE_AT, "1:2");
+    start("[display]\naspect = \"16:9\"\n", NULL, one);
+    memcpy(s_guest + 0x40, q, sizeof q);
+    memcpy(want, s_guest + 0x40, sizeof want);
+    frame_out();
+
+    /* On: its hooks run as always, and not for the capture. */
+    s_hud_pres = 0;
+    s_hud_cap_seen = -1;
+    guest_call(sub_std, args, 5);
+    CHECK(s_hud_pres == 1 && s_hud_cap_seen == 0);
+
+    /* Off: the capture alone runs them, and they are told. Nothing moves. */
+    CHECK(xbox_mod_set_enabled(index_of("hudt"), 0) == XBOX_MOD_OFF);
+    frame_out();
+    s_hud_pres = 0;
+    s_hud_cap_seen = -1;
+    guest_call(sub_std, args, 5);
+    CHECK(s_hud_pres == 1 && s_hud_cap_seen != 0);
+    CHECK(!s_hud_moved && memcmp(want, s_guest + 0x40, sizeof want) == 0);
+    CHECK(s_hud_api->hud_capturing(NULL) == 0);
+
+    /* The window done (frames 1..2): the hooks follow the mod again. */
+    frame_out();
+    frame_out();
+    s_hud_pres = 0;
+    guest_call(sub_std, args, 5);
+    CHECK(s_hud_pres == 0 && s_hud_api->hud_capturing(&k_hudt) == 0);
+
+    /* No capture: off means not called, and never told. */
+    recomp_env_set(RENV_HUD_CAPTURE, NULL);
+    recomp_env_set(RENV_HUD_CAPTURE_AT, NULL);
+    start("[display]\naspect = \"16:9\"\n", NULL, one);
+    CHECK(xbox_mod_set_enabled(index_of("hudt"), 0) == XBOX_MOD_OFF);
+    frame_out();
+    s_hud_pres = 0;
+    guest_call(sub_std, args, 5);
+    CHECK(s_hud_pres == 0 && s_hud_api->hud_capturing(&k_hudt) == 0);
+    CHECK(xbox_mod_set_enabled(index_of("hudt"), 1) == XBOX_MOD_ON);
+    frame_out();
+}
+
 int main(void)
 {
     MKDIR("config");
@@ -914,6 +973,7 @@ int main(void)
     test_hooks();
     test_hook_state();
     test_hud_table();
+    test_hud_capturing();
     xbox_mod_shutdown();
     remove("config/config.toml");
     printf("mod_hook: %d checks, %d failed\n", s_checks, s_fail);

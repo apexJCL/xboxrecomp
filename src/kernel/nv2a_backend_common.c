@@ -1506,6 +1506,118 @@ void nv2a_bump_trace(const struct nv2a_pb_vsh *v, const struct nv2a_stage st[4],
 }
 
 #ifdef XBOXRECOMP_ENHANCE
+/* The HUD capture's requests (nv2a_backend_common.h). One guest thread
+ * posts and polls, the walker takes; a slot's state is the handover. */
+static struct {
+    int state;                  /* atomic */
+    uint32_t flip;
+    char path[NV2A_CAP_PATH];
+} s_cap[NV2A_CAP_SLOTS];
+int nv2a_cap_live;
+static uint32_t s_cap_flips;
+static const struct nv2a_cap_kernel *s_cap_k;
+
+void nv2a_cap_set_kernel(const struct nv2a_cap_kernel *k)
+{
+    __atomic_store_n(&s_cap_k, k, __ATOMIC_RELEASE);
+}
+
+const struct nv2a_cap_kernel *nv2a_cap_kernel(void)
+{
+    return __atomic_load_n(&s_cap_k, __ATOMIC_ACQUIRE);
+}
+
+void nv2a_cap_note_flip(uint32_t flip)
+{
+    __atomic_store_n(&s_cap_flips, flip, __ATOMIC_RELEASE);
+}
+
+uint32_t nv2a_cap_flips(void)
+{
+    return __atomic_load_n(&s_cap_flips, __ATOMIC_ACQUIRE);
+}
+
+int nv2a_cap_post(uint32_t flip, const char *path)
+{
+    size_t n = path ? strlen(path) : NV2A_CAP_PATH;
+
+    if (n >= NV2A_CAP_PATH)
+        return -1;
+    for (unsigned i = 0; i < NV2A_CAP_SLOTS; i++) {
+        if (__atomic_load_n(&s_cap[i].state, __ATOMIC_ACQUIRE) != NV2A_CAP_FREE)
+            continue;
+        s_cap[i].flip = flip;
+        memcpy(s_cap[i].path, path, n + 1);
+        __atomic_add_fetch(&nv2a_cap_live, 1, __ATOMIC_RELAXED);
+        __atomic_store_n(&s_cap[i].state, NV2A_CAP_LIVE, __ATOMIC_RELEASE);
+        return (int)i;
+    }
+    return -1;
+}
+
+int nv2a_cap_poll(int slot, int retract)
+{
+    int st;
+
+    if (slot < 0 || (unsigned)slot >= NV2A_CAP_SLOTS)
+        return -1;
+    st = __atomic_load_n(&s_cap[slot].state, __ATOMIC_ACQUIRE);
+    if (st == NV2A_CAP_LIVE && retract) {
+        int live = NV2A_CAP_LIVE;
+        if (__atomic_compare_exchange_n(&s_cap[slot].state, &live, NV2A_CAP_FREE, 0,
+                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+            __atomic_sub_fetch(&nv2a_cap_live, 1, __ATOMIC_RELAXED);
+            return NV2A_CAP_DEAD;
+        }
+        st = live;
+    }
+    if (st != NV2A_CAP_DONE && st != NV2A_CAP_FAILED && st != NV2A_CAP_DEAD)
+        return -1;
+    __atomic_store_n(&s_cap[slot].state, NV2A_CAP_FREE, __ATOMIC_RELEASE);
+    return st;
+}
+
+int nv2a_cap_take(uint32_t flip, char *path, size_t len)
+{
+    int got = -1;
+
+    for (unsigned i = 0; i < NV2A_CAP_SLOTS; i++) {
+        int live = NV2A_CAP_LIVE;
+        int32_t d;
+        if (__atomic_load_n(&s_cap[i].state, __ATOMIC_ACQUIRE) != NV2A_CAP_LIVE)
+            continue;
+        d = (int32_t)(s_cap[i].flip - flip);
+        if (d > 0 || (d == 0 && got >= 0))
+            continue;
+        if (!__atomic_compare_exchange_n(&s_cap[i].state, &live,
+                                         d == 0 ? NV2A_CAP_TAKEN : NV2A_CAP_DEAD, 0,
+                                         __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+            continue;           /* retracted meanwhile */
+        __atomic_sub_fetch(&nv2a_cap_live, 1, __ATOMIC_RELAXED);
+        if (d == 0) {
+            snprintf(path, len, "%s", s_cap[i].path);
+            got = (int)i;
+        }
+    }
+    return got;
+}
+
+void nv2a_cap_done(int slot, int ok)
+{
+    if (slot >= 0 && (unsigned)slot < NV2A_CAP_SLOTS)
+        __atomic_store_n(&s_cap[slot].state, ok ? NV2A_CAP_DONE : NV2A_CAP_FAILED,
+                         __ATOMIC_RELEASE);
+}
+
+void nv2a_cap_reset(void)
+{
+    for (unsigned i = 0; i < NV2A_CAP_SLOTS; i++)
+        __atomic_store_n(&s_cap[i].state, NV2A_CAP_FREE, __ATOMIC_RELEASE);
+    __atomic_store_n(&nv2a_cap_live, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_cap_flips, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_cap_k, NULL, __ATOMIC_RELEASE);
+}
+
 nv2a_flip_hook_fn nv2a_flip_hook_installed;
 
 void nv2a_flip_hook_set(nv2a_flip_hook_fn fn)

@@ -306,7 +306,7 @@ int xbox_enhance_init(const char *root, const char *title)
      * so they are named only then: the stock line stays as it was. */
     /* Only with a wide aspect (a pad): a HUD mod at 4:3 adds no line, so
      * the goldens' startup log is the same with the mod loaded. */
-    if (hud_layer_has_table() && hud_layer_pad() > 0)
+    if (hud_layer_has_mod_table() && hud_layer_pad() > 0)
         fprintf(stderr, LOGP "%s hud_pad=%d\n", hud_txt, hud_layer_pad_hud());
     /* [input.actions] once every action is registered (the key map of
      * rule 2 is the one enhance_input_init applied), then the hook line. */

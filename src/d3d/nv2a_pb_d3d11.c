@@ -3855,21 +3855,58 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
  * in RECOMP_FB_DUMP_AT are written too, as <prefix>flip_NNNNN.bmp named by
  * present number (= flip number), so a golden run can pick its frames by an
  * event's flip rather than every 60th present. */
+/* w x h 32-bit pixels (B8G8R8A8, `pitch` bytes a row) as a top-down BMP,
+ * with the dump's one line either way. */
+static int write_bmp32(const char *path, const uint8_t *px, size_t pitch, UINT w, UINT h)
+{
+    BITMAPFILEHEADER fh;
+    BITMAPINFOHEADER ih;
+    FILE *f = fopen(path, "wb");
+    UINT y;
+    int ok = 1;
+
+    if (!f) {
+        fprintf(stderr, LOGP "dump %s: cannot open it\n", path);
+        return 0;
+    }
+    memset(&fh, 0, sizeof fh);
+    memset(&ih, 0, sizeof ih);
+    fh.bfType = 0x4D42;
+    fh.bfOffBits = sizeof fh + sizeof ih;
+    fh.bfSize = fh.bfOffBits + w * h * 4;
+    ih.biSize = sizeof ih;
+    ih.biWidth = (LONG)w;
+    ih.biHeight = -(LONG)h;
+    ih.biPlanes = 1;
+    ih.biBitCount = 32;
+    if (fwrite(&fh, sizeof fh, 1, f) != 1 || fwrite(&ih, sizeof ih, 1, f) != 1)
+        ok = 0;
+    for (y = 0; ok && y < h; y++)
+        if (fwrite(px + (size_t)y * pitch, (size_t)w * 4, 1, f) != 1)
+            ok = 0;
+    if (fclose(f))
+        ok = 0;
+    if (ok)
+        fprintf(stderr, LOGP "dumped %s\n", path);
+    else
+        fprintf(stderr, LOGP "dump %s: write failed\n", path);
+    return ok;
+}
+
 /* The frame of this flip as a BMP: the back buffer after the direct copy
  * (the stock path, as always), or the present RT itself when the flip went
  * through the scaling blit, so a window size or a filter never reaches the
  * dump (under render.scale the RT is host-sized: dumps are hw x hh). */
-static void dump_texture(ID3D11Texture2D *src, const char *path)
+static int dump_texture(ID3D11Texture2D *src, const char *path)
 {
     D3D11_TEXTURE2D_DESC td;
     ID3D11Texture2D *st = NULL;
     D3D11_MAPPED_SUBRESOURCE m;
-    FILE *f;
-    UINT y;
+    int ok = 0;
 
     if (!src) {
         /* No back buffer after a failed resize (d3d11_on_flip said so). */
-        return;
+        return 0;
     }
     ID3D11Texture2D_GetDesc(src, &td);
     td.Usage = D3D11_USAGE_STAGING;
@@ -3877,37 +3914,79 @@ static void dump_texture(ID3D11Texture2D *src, const char *path)
     td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
     td.MiscFlags = 0;
     if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &st)))
-        return;
+        return 0;
     ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)st,
                                      (ID3D11Resource *)src);
     if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0,
                                           D3D11_MAP_READ, 0, &m))) {
-        f = fopen(path, "wb");
-        if (f) {
-            BITMAPFILEHEADER fh;
-            BITMAPINFOHEADER ih;
-            memset(&fh, 0, sizeof fh);
-            memset(&ih, 0, sizeof ih);
-            fh.bfType = 0x4D42;
-            fh.bfOffBits = sizeof fh + sizeof ih;
-            fh.bfSize = fh.bfOffBits + td.Width * td.Height * 4;
-            ih.biSize = sizeof ih;
-            ih.biWidth = (LONG)td.Width;
-            ih.biHeight = -(LONG)td.Height;
-            ih.biPlanes = 1;
-            ih.biBitCount = 32;
-            fwrite(&fh, sizeof fh, 1, f);
-            fwrite(&ih, sizeof ih, 1, f);
-            for (y = 0; y < td.Height; y++)
-                fwrite((const uint8_t *)m.pData + (size_t)y * m.RowPitch,
-                       td.Width * 4, 1, f);
-            fclose(f);
-            fprintf(stderr, LOGP "dumped %s\n", path);
+        ok = write_bmp32(path, (const uint8_t *)m.pData, m.RowPitch, td.Width, td.Height);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
+    }
+    ID3D11Texture2D_Release(st);
+    return ok;
+}
+
+static UINT s_shown_w, s_shown_h;   /* the last flip's present extent */
+
+#ifdef XBOXRECOMP_ENHANCE
+/* The HUD capture's picture (nv2a_backend_common.h): rt's frame, cw x ch
+ * guest pixels (its present extent, the hor+ pads left out), at guest size.
+ * Under render.scale each n x n block of host pixels is averaged, as
+ * Metal's write-back does, so the BMP is the guest surface that Metal and
+ * the CPU path write from guest memory and a guest-pixel bbox lands on the
+ * same pixels on every backend. A grown target or a crop never changes its
+ * size. The take maps a staging copy here, synchronously. */
+static int dump_guest_frame(RenderTarget *rt, UINT cw, UINT ch, const char *path)
+{
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_BOX b;
+    D3D11_MAPPED_SUBRESOURCE m;
+    ID3D11Texture2D *st = NULL;
+    unsigned n = rt->n ? rt->n : 1;
+    int ok = 0;
+
+    if (!rt->tex || !cw || !ch || (rt->pad + cw) * n > rt->hw || ch * n > rt->hh)
+        return 0;
+    ID3D11Texture2D_GetDesc(rt->tex, &td);
+    td.Width = cw * n;
+    td.Height = ch * n;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.SampleDesc.Count = 1;
+    td.SampleDesc.Quality = 0;
+    td.Usage = D3D11_USAGE_STAGING;
+    td.BindFlags = 0;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    td.MiscFlags = 0;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &st)))
+        return 0;
+    b.left = rt->pad * n;
+    b.top = 0;
+    b.front = 0;
+    b.right = b.left + cw * n;
+    b.bottom = ch * n;
+    b.back = 1;
+    ID3D11DeviceContext_CopySubresourceRegion(s_ctx, (ID3D11Resource *)st, 0, 0, 0, 0,
+                                              (ID3D11Resource *)rt->tex, 0, &b);
+    if (SUCCEEDED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)st, 0, D3D11_MAP_READ, 0,
+                                          &m))) {
+        if (n == 1) {
+            ok = write_bmp32(path, (const uint8_t *)m.pData, m.RowPitch, cw, ch);
+        } else {
+            uint8_t *px = (uint8_t *)malloc((size_t)cw * ch * 4u);
+            if (px) {
+                nv2a_downscale_box32((const uint8_t *)m.pData, m.RowPitch, cw, ch, n, px,
+                                     cw * 4u);
+                ok = write_bmp32(path, px, (size_t)cw * 4u, cw, ch);
+                free(px);
+            }
         }
         ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)st, 0);
     }
     ID3D11Texture2D_Release(st);
+    return ok;
 }
+#endif
 
 static void dump_back_buffer(const char *path)
 {
@@ -3930,6 +4009,21 @@ static void dump_frame(void)
         checked = 1;
         prefix = recomp_env(RENV_D3D11_DUMP);
     }
+#ifdef XBOXRECOMP_ENHANCE
+    /* The HUD capture's picture of the guest frame this present shows
+     * (nv2a_backend_common.h): the guest render target, before any scaling
+     * blit or shader, at guest size. Taken under the walker's flip number,
+     * which the request names: s_presents misses the flips before init().
+     * No frame (no target picked): the picture fails, never the window's
+     * back buffer at another size. One load while nothing is posted. */
+    if (nv2a_cap_pending()) {
+        char cpath[NV2A_CAP_PATH];
+        int slot = nv2a_cap_take(nv2a_pb_flips(), cpath, sizeof cpath);
+        if (slot >= 0)
+            nv2a_cap_done(slot, s_drawn && dump_guest_frame(s_drawn, s_shown_w, s_shown_h,
+                                                            cpath));
+    }
+#endif
     if (!prefix) {
         /* fb_dump_at and fb_dump_prog leave their flips to this backend,
          * which writes them only next to its d3d11_dump frames. */
@@ -4597,7 +4691,6 @@ static int present_chain(RenderTarget *rt, int filter, int internal)
 }
 #endif /* XBOXRECOMP_ENHANCE */
 
-static UINT s_shown_w, s_shown_h;   /* the last flip's present extent */
 #ifdef XBOXRECOMP_ENHANCE
 /* ── The overlay (nv2a_overlay.h) ─────────────────────────────────────────
  *

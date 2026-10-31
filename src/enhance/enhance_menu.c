@@ -591,7 +591,7 @@ static void build_slots(void)
     s_pack_off = nv2a_host_opts()->pack_off;
     for (int i = 0; i < N_ITEMS; i++)
         slot_add(&k_items[i], page_by_name(k_items[i].page, PAGE_RENDER), -1);
-    if (hud_layer_has_table())
+    if (hud_layer_has_mod_table())
         slot_add(&k_hud_margin, PAGE_RENDER, -1);
     for (int i = 0; i < s_ntitle; i++)
         slot_add(s_title[i], page_by_name(s_title[i]->page, PAGE_GAME), -1);

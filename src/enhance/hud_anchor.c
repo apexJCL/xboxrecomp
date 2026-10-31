@@ -1,6 +1,6 @@
 /*
  * hud_anchor.c - the HUD layer (hud_anchor.h; openspec change hud-anchors,
- * design A1 to A14).
+ * design A1 to A15).
  *
  * Every rule runs in guest pixels of the canvas's target: the table's x
  * values are converted from canvas units on the way in and back on the way
@@ -33,6 +33,7 @@
 #define HUD_NAME_MAX   48
 #define HUD_DIM_MAX    4096.0f
 #define HUD_MARGIN_MAX 64
+#define HUD_BBOX_MAX   4096u   /* vertices a capture's bbox reads */
 
 enum { SRC_FIXED = 0, SRC_MEMORY, SRC_TARGET };
 
@@ -81,7 +82,13 @@ static struct hud_site *s_sites;
 static int s_nsites;
 static int s_nwrappers;
 static int s_table;             /* atomic: a table is registered */
-static int s_on;                /* atomic: the active flag */
+static int s_on;                /* atomic: the active flag (mod or capture) */
+static int s_mod;               /* atomic: its mod part, which alone changes vertices */
+static int s_cap;               /* atomic: a capture runs (hud_layer_set_capture) */
+static int s_table_cap;         /* atomic: the table came from hud_capture_table, not a mod */
+static hud_record_fn s_rec;     /* atomic: the capture's recorder */
+static struct hud_draw s_draws[HUD_DRAWS_MAX];
+static int s_ndraws;
 static const uintptr_t *s_memp;
 static uint32_t s_epoch = 1;    /* atomic */
 static unsigned s_aw, s_ah;     /* atomic: display.hud_aspect, 0:0 = display */
@@ -388,6 +395,7 @@ int hud_layer_frame(int owner_on)
     if (!__atomic_load_n(&s_table, __ATOMIC_ACQUIRE)) {
         if (__atomic_load_n(&s_on, __ATOMIC_RELAXED)) {
             __atomic_store_n(&s_on, 0, __ATOMIC_RELEASE);
+            __atomic_store_n(&s_mod, 0, __ATOMIC_RELEASE);
             nv2a_aspect_hud_set(0, 0, 0);
         }
         return 0;
@@ -410,18 +418,42 @@ int hud_layer_frame(int owner_on)
         s_lift_hud = ph;
     }
     nv2a_aspect_hud_set(on, sn.tw, sn.th);
-    __atomic_store_n(&s_on, on, __ATOMIC_RELEASE);
+    /* A capture widens the flag for recording only (design A15): the
+     * wrappers keep their chain and apply reports its calls, while the
+     * lift, the shifts and the clips follow the mod part alone. */
+    __atomic_store_n(&s_mod, on, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_on, on || __atomic_load_n(&s_cap, __ATOMIC_RELAXED), __ATOMIC_RELEASE);
     return on;
 }
 
 int hud_layer_active(void)
 {
-    return __atomic_load_n(&s_on, __ATOMIC_ACQUIRE);
+    return __atomic_load_n(&s_mod, __ATOMIC_ACQUIRE);
+}
+
+void hud_layer_set_capture(int on)
+{
+    __atomic_store_n(&s_cap, on != 0, __ATOMIC_RELEASE);
+}
+
+void hud_layer_set_recorder(hud_record_fn fn)
+{
+    __atomic_store_n(&s_rec, fn, __ATOMIC_RELEASE);
 }
 
 int hud_layer_has_table(void)
 {
     return __atomic_load_n(&s_table, __ATOMIC_ACQUIRE);
+}
+
+void hud_layer_table_is_capture(void)
+{
+    __atomic_store_n(&s_table_cap, 1, __ATOMIC_RELEASE);
+}
+
+int hud_layer_has_mod_table(void)
+{
+    return hud_layer_has_table() && !__atomic_load_n(&s_table_cap, __ATOMIC_ACQUIRE);
 }
 
 int hud_layer_pad(void)
@@ -632,6 +664,129 @@ static float group_ref(struct hud_group *g, float centre, uint32_t now)
     return bits_f((uint32_t)v);
 }
 
+/* ---- the capture's view (design A15) --------------------------------------- */
+
+/* Guest reads for the capture's view stop here: retail RAM, where the
+ * vertices live (xbox_memory_layout.h). Level 1 reads a mod's vtx_va even
+ * with the mod off, so a bad one must not reach past the guest map. */
+#define HUD_VA_TOP (64u * 1024u * 1024u)
+
+/* The vertices' bounds in canvas units, as the game wrote them: x at
+ * layout.x_off and y right after it (pretransformed x, y, z, rhw), when
+ * the stride holds it. Capped, and non-finite values skipped; none read
+ * when the last one would reach past HUD_VA_TOP. */
+static int vtx_bbox(uint8_t *b, uint32_t va, uint32_t n, uint32_t stride, uint32_t x_off,
+                    float out[4])
+{
+    int has_y = x_off + 8u <= stride, any = 0;
+    float x0 = INFINITY, y0 = INFINITY, x1 = -INFINITY, y1 = -INFINITY;
+
+    if (n > HUD_BBOX_MAX)
+        n = HUD_BBOX_MAX;
+    if (!n || (uint64_t)va + (uint64_t)(n - 1u) * stride + x_off + (has_y ? 8u : 4u)
+                  > HUD_VA_TOP)
+        return 0;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t at = va + i * stride + x_off;
+        float x = rdf(b, at), y = has_y ? rdf(b, at + 4u) : 0.0f;
+        if (!isfinite(x) || !isfinite(y))
+            continue;
+        x0 = x < x0 ? x : x0;
+        x1 = x > x1 ? x : x1;
+        y0 = y < y0 ? y : y0;
+        y1 = y > y1 ? y : y1;
+        any = 1;
+    }
+    if (!any)
+        return 0;
+    out[0] = x0;
+    out[1] = y0;
+    out[2] = x1;
+    out[3] = y1;
+    return 1;
+}
+
+int hud_layer_bbox(uint32_t va, uint32_t n, uint32_t stride, uint32_t x_off, float out[4])
+{
+    uint8_t *b = mem_base();
+    if (!b || !n || stride < x_off + 4u)
+        return 0;
+    return vtx_bbox(b, va, n, stride, x_off, out);
+}
+
+static void record(hud_record_fn rec, uint8_t *b, uint32_t own, const struct hud_site *site,
+                   const struct hud_group *grp, const struct xbox_hud_call *d, uint32_t now)
+{
+    struct hud_record r;
+    unsigned i;
+
+    memset(&r, 0, sizeof r);
+    for (i = 0; i < t_nchain; i++)
+        if (chain_live(t_chain[i].epoch, now))
+            r.chain[r.nchain++] = t_chain[i].ret;
+    r.ret = own;
+    if (site) {
+        r.site = site->ret;
+        r.element = site->element;
+        r.group = grp && !grp->implicit ? grp->name : NULL;
+    }
+    r.n = d->n;
+    r.prims = d->n / s_prim;
+    r.has_bbox = vtx_bbox(b, d->vtx_va, d->n, s_stride, s_x_off, r.bbox);
+    r.queue = d->queue;
+    r.tex = d->tex;
+    rec(&r);
+}
+
+int hud_layer_canvas(struct hud_layer_canvas *out)
+{
+    struct hud_snap sn;
+    if (!hud_layer_has_table() || !out)
+        return 0;
+    snap_read(&sn);
+    out->w = sn.w;
+    out->h = sn.h;
+    out->view[0] = sn.vx;
+    out->view[1] = sn.vy;
+    out->view[2] = sn.vw;
+    out->view[3] = sn.vh;
+    out->tw = sn.tw;
+    out->th = sn.th;
+    out->pad = sn.pad;
+    out->top_left = sn.top_left;
+    out->y_up = s_cv.y_up;
+    return 1;
+}
+
+int hud_layer_site(uint32_t ret, const char **element, const char **group)
+{
+    const struct hud_site *st;
+    if (!hud_layer_has_table() || !(st = site_find(ret)))
+        return 0;
+    if (element)
+        *element = st->element;
+    if (group)
+        *group = s_groups[st->group].implicit ? NULL : s_groups[st->group].name;
+    return 1;
+}
+
+void hud_layer_layout(uint32_t *stride, uint32_t *x_off, uint32_t *prim)
+{
+    if (stride)
+        *stride = s_stride;
+    if (x_off)
+        *x_off = s_x_off;
+    if (prim)
+        *prim = s_prim;
+}
+
+int hud_layer_draws(const struct hud_draw **out)
+{
+    if (out)
+        *out = s_draws;
+    return hud_layer_has_table() ? s_ndraws : 0;
+}
+
 static void skip_line(uint32_t what, uint32_t ret, const char *why)
 {
     if (trace_on() && seen_first(what, ret))
@@ -673,6 +828,14 @@ int hud_layer_apply(const struct xbox_mod_call *c, const struct xbox_hud_call *d
     if (site)
         grp = &s_groups[site->group];
     n = d->n;
+    {
+        hud_record_fn rec = __atomic_load_n(&s_rec, __ATOMIC_ACQUIRE);
+        if (rec && n)
+            record(rec, b, own, site, grp, d, now);
+    }
+    /* A capture alone records and changes nothing. */
+    if (!__atomic_load_n(&s_mod, __ATOMIC_ACQUIRE))
+        return -1;
     if (!n)
         return kind;
     if (n % s_prim) {
@@ -1052,7 +1215,159 @@ static void drop_table(void)
     free(s_sites);
     s_groups = NULL;
     s_sites = NULL;
-    s_ngroups = s_nsites = s_nwrappers = 0;
+    s_ngroups = s_nsites = s_nwrappers = s_ndraws = 0;
+}
+
+/* ---- [capture] draws: lenient (design A15) --------------------------------
+ *
+ * Read with every table but used only by the capture: a row the runtime
+ * cannot use keeps va 0 with the reason, and never fails the table. */
+
+static int draw_va(const char *s, uint32_t *va, const char **why)
+{
+    char *end;
+    unsigned long v;
+
+    if (!strncmp(s, "sig:", 4)) {
+        /* Hook slots carry no names and guest code is not mapped at init:
+         * the CLI writes a copy of the table with the VA resolved. */
+        *why = "a sig: draw needs its VA (xbr hud-map writes it)";
+        return 0;
+    }
+    v = strtoul(s, &end, 0);
+    if (end == s || *end || !v || v > 0xFFFFFFFFul) {
+        *why = "fn is not an address";
+        return 0;
+    }
+    *va = (uint32_t)v;
+    return 1;
+}
+
+/* "ecx", "edx", "stack:N" (bytes past the return address, N a multiple of
+ * 4 below 4096), or an integer constant when `cst` allows one. */
+static int draw_loc(const recomp_cfg *cfg, const char *key, int cst, struct hud_loc *loc)
+{
+    recomp_cfg_type t = recomp_cfg_type_of(cfg, key);
+    const char *s;
+
+    memset(loc, 0, sizeof *loc);
+    if (recomp_cfg_find(cfg, key) < 0)
+        return 1;
+    if (t == RCFG_INT && cst) {
+        long long v = recomp_cfg_int(cfg, key, -1);
+        if (v < 0 || v > 0xFFFF)
+            return 0;
+        loc->kind = HUD_LOC_CONST;
+        loc->v = (uint32_t)v;
+        return 1;
+    }
+    if (t != RCFG_STRING)
+        return 0;
+    s = recomp_cfg_string(cfg, key, "");
+    if (!strcmp(s, "ecx")) {
+        loc->kind = HUD_LOC_ECX;
+        return 1;
+    }
+    if (!strcmp(s, "edx")) {
+        loc->kind = HUD_LOC_EDX;
+        return 1;
+    }
+    if (!strncmp(s, "stack:", 6)) {
+        char *end;
+        unsigned long v = strtoul(s + 6, &end, 0);
+        if (end == s + 6 || *end || v % 4u || v >= 4096u)
+            return 0;
+        loc->kind = HUD_LOC_STACK;
+        loc->v = (uint32_t)v;
+        return 1;
+    }
+    return 0;
+}
+
+static void parse_draws(const recomp_cfg *cfg)
+{
+    size_t nt = recomp_cfg_table_count(cfg, "capture.draws");
+    size_t na = nt ? 0 : recomp_cfg_array_len(cfg, "capture.draws");
+    char key[96];
+    size_t i;
+
+    s_ndraws = 0;
+    memset(s_draws, 0, sizeof s_draws);
+    /* The short form: a list of VAs (or "0x..." / "sig:" strings), each
+     * recorded with its chain only. */
+    for (i = 0; i < na && s_ndraws < (int)HUD_DRAWS_MAX; i++) {
+        struct hud_draw *dr = &s_draws[s_ndraws++];
+        recomp_cfg_type t = recomp_cfg_array_type(cfg, "capture.draws", i);
+        dr->prim = s_prim;
+        if (t == RCFG_INT) {
+            long long v = recomp_cfg_array_int(cfg, "capture.draws", i, 0);
+            snprintf(dr->spec, sizeof dr->spec, "0x%08llX", (unsigned long long)v);
+            if (v <= 0 || v > 0xFFFFFFFFll)
+                dr->why = "fn is not an address";
+            else
+                dr->va = (uint32_t)v;
+        } else if (t == RCFG_STRING) {
+            const char *v = recomp_cfg_array_string(cfg, "capture.draws", i, "");
+            snprintf(dr->spec, sizeof dr->spec, "%s", v);
+            if (!draw_va(v, &dr->va, &dr->why))
+                dr->va = 0;
+        } else {
+            dr->why = "not an address or a string";
+        }
+    }
+    for (i = 0; i < nt && s_ndraws < (int)HUD_DRAWS_MAX; i++) {
+        struct hud_draw *dr = &s_draws[s_ndraws++];
+        const char *fk = "fn";
+        long long prim;
+
+        dr->prim = s_prim;
+        snprintf(key, sizeof key, "capture.draws.%zu.fn", i);
+        if (recomp_cfg_find(cfg, key) < 0) {
+            snprintf(key, sizeof key, "capture.draws.%zu.va", i);
+            fk = "va";
+        }
+        snprintf(key, sizeof key, "capture.draws.%zu.%s", i, fk);
+        if (recomp_cfg_type_of(cfg, key) == RCFG_INT) {
+            long long v = recomp_cfg_int(cfg, key, 0);
+            snprintf(dr->spec, sizeof dr->spec, "0x%08llX", (unsigned long long)v);
+            if (v > 0 && v <= 0xFFFFFFFFll)
+                dr->va = (uint32_t)v;
+            else
+                dr->why = "fn is not an address";
+        } else if (recomp_cfg_type_of(cfg, key) == RCFG_STRING) {
+            const char *v = recomp_cfg_string(cfg, key, "");
+            snprintf(dr->spec, sizeof dr->spec, "%s", v);
+            if (!draw_va(v, &dr->va, &dr->why))
+                dr->va = 0;
+        } else {
+            snprintf(key, sizeof key, "capture.draws.%zu.sig", i);
+            snprintf(dr->spec, sizeof dr->spec, "sig:%s", recomp_cfg_string(cfg, key, "?"));
+            dr->why = recomp_cfg_find(cfg, key) >= 0
+                          ? "a sig: draw needs its VA (xbr hud-map writes it)"
+                          : "no fn";
+        }
+        snprintf(key, sizeof key, "capture.draws.%zu.name", i);
+        snprintf(dr->name, sizeof dr->name, "%s", recomp_cfg_string(cfg, key, ""));
+        snprintf(key, sizeof key, "capture.draws.%zu.vtx", i);
+        if (!draw_loc(cfg, key, 0, &dr->vtx))
+            dr->why = dr->why ? dr->why : "vtx is not ecx, edx or stack:N";
+        snprintf(key, sizeof key, "capture.draws.%zu.count", i);
+        if (!draw_loc(cfg, key, 1, &dr->count))
+            dr->why = dr->why ? dr->why : "count is not ecx, edx, stack:N or a number";
+        snprintf(key, sizeof key, "capture.draws.%zu.stride", i);
+        if (!draw_loc(cfg, key, 1, &dr->stride))
+            dr->why = dr->why ? dr->why : "stride is not ecx, edx, stack:N or a number";
+        if ((dr->vtx.kind != HUD_LOC_NONE) != (dr->count.kind != HUD_LOC_NONE))
+            dr->why = dr->why ? dr->why : "vtx and count go together";
+        snprintf(key, sizeof key, "capture.draws.%zu.prim", i);
+        prim = recomp_cfg_int(cfg, key, (long long)s_prim);
+        if (prim < 1 || prim > 64)
+            dr->why = dr->why ? dr->why : "prim is not 1..64";
+        else
+            dr->prim = (uint32_t)prim;
+        if (dr->why)
+            dr->va = 0;
+    }
 }
 
 static int parse_table(const recomp_cfg *cfg, hud_hook_fn hook)
@@ -1067,6 +1382,7 @@ static int parse_table(const recomp_cfg *cfg, hud_hook_fn hook)
         return fail("version must be 1");
     if (check_keys(cfg) < 0 || parse_canvas(cfg, &s_cv) < 0 || parse_layout(cfg) < 0)
         return -1;
+    parse_draws(cfg);
     if (ng + ns > 65536)
         return fail("too many groups and sites");
     s_groups = calloc(ng + ns + 1, sizeof *s_groups);
@@ -1203,6 +1519,10 @@ int hud_layer_table(const char *toml, size_t len, hud_hook_fn hook)
 void hud_layer_reset(void)
 {
     __atomic_store_n(&s_on, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_mod, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_cap, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_table_cap, 0, __ATOMIC_RELEASE);
+    __atomic_store_n(&s_rec, NULL, __ATOMIC_RELEASE);
     __atomic_store_n(&s_table, 0, __ATOMIC_RELEASE);
     nv2a_aspect_hud_set(0, 0, 0);
     drop_table();

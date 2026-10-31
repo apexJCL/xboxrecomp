@@ -82,10 +82,80 @@ void hud_layer_post_off(const struct xbox_mod_call *c);
 
 int hud_layer_active(void);
 int hud_layer_has_table(void);
+/* The table was loaded by the capture (hud_capture_table): the player's
+ * HUD margin item and the hud_pad line stay off, as they are with no mod. */
+void hud_layer_table_is_capture(void);
+int hud_layer_has_mod_table(void);
 /* The pad the edge kinds move by now, guest pixels: 0 while inactive. */
 int hud_layer_pad_hud(void);
 /* The canvas's target pad, guest pixels (0 at 4:3). */
 int hud_layer_pad(void);
+
+/* ---- the mapping capture (hud_capture.c; design A15) --------------------
+ *
+ * The capture records and changes nothing. While it runs, the active flag
+ * is set for recording only: the wrappers keep their chain and
+ * hud_layer_apply reports each call to the recorder, but only the mod part
+ * (the owner on and a pad) shifts vertices or lifts batches, as without a
+ * capture. */
+
+/* One hud_layer_apply call, before any change to its vertices. */
+struct hud_record {
+    uint32_t chain[HUD_CHAIN_MAX];  /* the wrappers' return addresses, outermost first */
+    unsigned nchain;
+    uint32_t ret;                   /* the hooked call's own [esp] */
+    uint32_t site;                  /* the matched row's ret_va, 0 when unlisted */
+    const char *element, *group;    /* the row's, NULL when unlisted */
+    uint32_t n, prims;              /* vertices; n / layout.prim */
+    int has_bbox;
+    float bbox[4];                  /* x0, y0, x1, y1 in canvas units */
+    uint32_t queue;
+    uint64_t tex;
+};
+typedef void (*hud_record_fn)(const struct hud_record *r);
+
+/* The capture's part of the active flag, read at the next hud_layer_frame.
+ * Init thread. */
+void hud_layer_set_capture(int on);
+/* The recorder hud_layer_apply calls (NULL: none). Any thread. */
+void hud_layer_set_recorder(hud_record_fn fn);
+
+/* This frame's canvas (the snapshot apply reads). 0 without a table. */
+struct hud_layer_canvas {
+    float w, h, view[4];            /* canvas units; view in guest px */
+    uint32_t tw, th, pad;           /* the target, guest px */
+    int top_left, y_up;
+};
+int hud_layer_canvas(struct hud_layer_canvas *out);
+/* The site row for a return address: 1 with its element and group names. */
+int hud_layer_site(uint32_t ret, const char **element, const char **group);
+/* The layout: bytes per vertex, x's offset, vertices per primitive. */
+void hud_layer_layout(uint32_t *stride, uint32_t *x_off, uint32_t *prim);
+/* The bounds of n vertices at va, `stride` bytes apart (x at x_off, y
+ * right after it when the stride holds it), in the units they are written
+ * in; up to 4096 vertices, non-finite ones skipped. 0 when none is finite
+ * or guest memory is not mapped. */
+int hud_layer_bbox(uint32_t va, uint32_t n, uint32_t stride, uint32_t x_off, float out[4]);
+
+/* The table's [capture] draws (level 0): read with the table and never
+ * hooked by the layer. A row the runtime cannot use keeps va 0 and says
+ * why; such a row never fails the table, so a mod's table is unchanged by
+ * what its capture rows say. */
+enum { HUD_LOC_NONE = 0, HUD_LOC_ECX, HUD_LOC_EDX, HUD_LOC_STACK, HUD_LOC_CONST };
+struct hud_loc {
+    int kind;
+    uint32_t v;                     /* STACK: byte offset past the return address; CONST */
+};
+#define HUD_DRAWS_MAX 64u
+struct hud_draw {
+    uint32_t va;                    /* 0: not usable, see why */
+    char spec[64];                  /* the row's fn/va as written */
+    char name[48];
+    struct hud_loc vtx, count, stride;
+    uint32_t prim;                  /* vertices per primitive */
+    const char *why;
+};
+int hud_layer_draws(const struct hud_draw **out);
 
 /* Tests and shutdown: drop the table and every state. The wrappers stay
  * hooked in the hook service, and do nothing until a new table lists

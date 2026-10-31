@@ -284,6 +284,9 @@ extern "C" {
     X(FB_DUMP_PROG,      DEBUG, "fb_dump_prog",    NULL,                       "=hash[,hash]: fb_dump the flips around the first draw of these vertex programs (hex, up to 16)") \
     X(FB_DUMP_PROG_BEFORE, DEBUG, "fb_dump_prog_before", NULL,                 "=n: fb_dump_prog flips kept before the trigger, 0..240 (default 30; CPU/Metal)") \
     X(FB_DUMP_PROG_AFTER, DEBUG, "fb_dump_prog_after", NULL,                   "=n: fb_dump_prog flips dumped from the trigger on, capped at 240 (default 60)") \
+    X(HUD_CAPTURE,       DEBUG, "hud_capture",     NULL,                       "=dir: the HUD mapping capture (hud_capture.h): capture.jsonl and one BMP per captured guest frame; records and changes nothing") \
+    X(HUD_CAPTURE_AT,    DEBUG, "hud_capture_at",  NULL,                       "=from:count: hud_capture's guest frames (default 1:1, count up to 10000)") \
+    X(HUD_CAPTURE_TABLE, DEBUG, "hud_capture_table", NULL,                     "=path: a HUD table (TOML) hud_capture loads and hooks itself, so a capture needs no mod; a table a mod registered wins") \
     X(FB_WINDOW_DUMP_EVERY, DEBUG, "fb_window_dump_every", "RECOMP_FB_WINDOW_DUMP_EVERY", "=n: window dump period") \
     X(WINDOW_SHOT,       DEBUG, "window_shot",     "RECOMP_WINDOW_SHOT",       "=flips: SDL window shots") \
     X(WINDOW_SHOT_PREFIX, DEBUG, "window_shot_prefix", "RECOMP_WINDOW_SHOT_PREFIX", "=prefix: window shot files") \
