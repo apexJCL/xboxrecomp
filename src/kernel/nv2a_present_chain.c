@@ -199,7 +199,10 @@ int nv2a_present_chain_request_rearm(unsigned gen, void (*prepare)(void))
 {
     int ok;
     lock();
-    ok = prepare && atomic_load(&s_gen) == gen && s_req_slug[0];
+    /* Only the pending request's own empty "none": rearming a real
+     * profile request would set s_pending, and failed() would then ignore
+     * that generation's genuine build failure. */
+    ok = prepare && atomic_load(&s_gen) == gen && s_req_slug[0] && is_none(s_req);
     if (ok) {
         s_prepare = prepare;
         atomic_store(&s_pending, 1);

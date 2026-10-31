@@ -890,6 +890,8 @@ static void case_start(void)
                "version = 1\nname = \"Two\"\nstages = [\"user:a\", \"user:b\"]\n"
                "[params.b]\nX = 0.5\n");
     write_file(ST "/config/shader-profiles/broken.toml", "version = \n");
+    write_file(ST "/config/shader-profiles/gap.toml",
+               "version = 1\nname = \"Gap\"\nstages = [\"user:a\", \"user:gone\"]\n");
     recomp_env_set(RENV_CONFIG, NULL);
     recomp_env_set(RENV_PRESENT_SHADER, NULL);
     recomp_env_set(RENV_PRESENT_PROFILE, NULL);
@@ -998,6 +1000,30 @@ static void case_start(void)
     nv2a_present_chain_gen();
     CHECK(requested("two") && preset_ends("/cache/slangp/two.slangp") && !profile_error());
     CHECK(shader_profile_start_loaded(e, sizeof e) && !strcmp(e, "two"));
+    /* a real failure once the wait is over still counts: the backend's
+     * failed() at the composed chain's generation clears wanted and sets
+     * the error */
+    s_cache[0] = 0;
+    CHECK(start(sh, sizeof sh) == 2);
+    nv2a_present_chain_gen();
+    nv2a_present_chain_gen();
+    CHECK(nv2a_present_chain_wanted() && !profile_error());
+    snprintf(s_cache, sizeof s_cache, "%s/cache", ST);
+    {
+        unsigned g = nv2a_present_chain_gen();
+        CHECK(requested("two") && preset_ends("/cache/slangp/two.slangp"));
+        nv2a_present_chain_failed(g);
+        CHECK(!nv2a_present_chain_wanted() && profile_error());
+    }
+    shader_profile_start_loaded(e, sizeof e);
+    /* a missing stage fails at the first present, not when the folder
+     * appears: the stages do not need it */
+    s_cache[0] = 0;
+    start_files(NULL, "present.profile = \"gap\"\n", NULL);
+    CHECK(start(sh, sizeof sh) == 2 && requested("gap") && nv2a_present_chain_wanted());
+    nv2a_present_chain_gen();
+    CHECK(requested(NULL) && !nv2a_present_chain_wanted() && profile_error());
+    start_files(NULL, "present.profile = \"two\"\n", NULL);
     /* a menu request while it waits drops the wait */
     s_cache[0] = 0;
     CHECK(start(sh, sizeof sh) == 2);
@@ -1048,6 +1074,12 @@ static void case_start(void)
         CHECK(nv2a_present_chain_request_profile_at(g, "two", ST "/shaders/a.slangp", NULL, 0,
                                                     NULL));
         CHECK(requested("two") && preset_ends("/shaders/a.slangp") && !profile_error());
+        /* a real profile request is never rearmed: its build failure
+         * must not be hidden as a wait */
+        g = nv2a_present_chain_request_gen();
+        CHECK(!nv2a_present_chain_request_rearm(g, count_prepare));
+        nv2a_present_chain_failed(g);
+        CHECK(!nv2a_present_chain_wanted() && profile_error());
     }
 
     start_files(NULL, NULL, NULL);

@@ -14,6 +14,7 @@
 
 #include "kernel.h"
 #include "recomp_env.h"
+#include <stdatomic.h>
 #include <stdio.h>
 #include <string.h>
 #include <ctype.h>
@@ -493,7 +494,16 @@ static void host_clear_stale(const char *dir, const char *prefix);
 static WCHAR s_game_dir[MAX_PATH];
 static WCHAR s_save_dir[MAX_PATH];
 static WCHAR s_user_dir[MAX_PATH];   /* UDATA/TDATA/TitleCache root: s_save_dir or RECOMP_SAVE_DIR */
-static BOOL  s_initialized = FALSE;
+/* Set last by xbox_path_init, after the roots above. Other threads read the
+ * roots once it is set (the present thread polls xbox_path_hdd_root while a
+ * shader profile start waits on guest-main's init), so the store releases
+ * and every read acquires. */
+static atomic_int s_initialized;
+
+static int path_ready(void)
+{
+    return atomic_load_explicit(&s_initialized, memory_order_acquire);
+}
 
 #define XBOX_DISK_IMAGE_NAME   L"Partition0.img"
 
@@ -1001,14 +1011,14 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         }
     }
 
-    s_initialized = TRUE;
+    atomic_store_explicit(&s_initialized, 1, memory_order_release);
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%S, save=%S, user data=%S",
              s_game_dir, s_save_dir, s_user_dir);
 }
 
 int xbox_path_hdd_root(char *out, size_t n)
 {
-    if (!s_initialized || !n)
+    if (!path_ready() || !n)
         return 0;
     return WideCharToMultiByte(CP_UTF8, 0, s_save_dir, -1, out, (int)n,
                                NULL, NULL) > 0;
@@ -1040,7 +1050,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     if (!xbox_path || !host_path_buf || buf_size == 0)
         return FALSE;
 
-    if (!s_initialized)
+    if (!path_ready())
         xbox_path_init(NULL, NULL);
 
     {
@@ -1131,7 +1141,16 @@ translate:
 static char s_game_dir[MAX_PATH];
 static char s_save_dir[MAX_PATH];
 static char s_user_dir[MAX_PATH];   /* UDATA/TDATA/TitleCache root: s_save_dir or RECOMP_SAVE_DIR */
-static BOOL s_initialized = FALSE;
+/* Set last by xbox_path_init, after the roots above. Other threads read the
+ * roots once it is set (the present thread polls xbox_path_hdd_root while a
+ * shader profile start waits on guest-main's init), so the store releases
+ * and every read acquires. */
+static atomic_int s_initialized;
+
+static int path_ready(void)
+{
+    return atomic_load_explicit(&s_initialized, memory_order_acquire);
+}
 
 /* Strip a single trailing '/' (but never the root '/'). */
 static void strip_trailing_slash(char* s)
@@ -1650,14 +1669,14 @@ void xbox_path_init(const char* game_dir, const char* save_dir)
         }
     }
 
-    s_initialized = TRUE;
+    atomic_store_explicit(&s_initialized, 1, memory_order_release);
     xbox_log(XBOX_LOG_INFO, XBOX_LOG_PATH, "Path init: game=%s, save=%s, user data=%s",
              s_game_dir, s_save_dir, s_user_dir);
 }
 
 int xbox_path_hdd_root(char *out, size_t n)
 {
-    if (!s_initialized || !n || strlen(s_save_dir) >= n)
+    if (!path_ready() || !n || strlen(s_save_dir) >= n)
         return 0;
     memcpy(out, s_save_dir, strlen(s_save_dir) + 1);
     return 1;
@@ -1673,7 +1692,7 @@ BOOL xbox_translate_path(const char* xbox_path, xbox_host_char* host_path_buf, D
     if (!xbox_path || !host_path_buf || buf_size == 0)
         return FALSE;
 
-    if (!s_initialized)
+    if (!path_ready())
         xbox_path_init(NULL, NULL);
 
     {

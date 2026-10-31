@@ -53,6 +53,10 @@ static unsigned s_start_gen;
 /* 1 once the deferred half put the profile's values in the store, until
  * the menu takes it (shader_profile_start_loaded). */
 static atomic_int s_start_loaded;
+/* 1 once the start's wait for the shader cache checked its stages and
+ * said so. Each start clears it before its pending request; only that
+ * request's prepare, under s_req_lock, sets it. */
+static int s_start_waiting;
 
 /* The start's deferred request: its stock fallback and its request go
  * through the generation check (request_profile_at). Not in the header. */
@@ -327,16 +331,32 @@ int shader_profile_start_loaded(char *out, size_t cap)
  * which waits for a presenter that wants it. */
 static void start_prepare(void)
 {
-    char cache[PATH_CAP];
+    char cache[PATH_CAP], path[PATH_CAP], err[SHADER_PROFILE_ERR_MAX];
     req_lock();
     /* A chain composes under the hdd's shader cache, and the boot can
      * present before the path module is up (cat opens its window first):
      * wait for the folder, one cheap test a present, rather than fail the
      * start. One stage needs no cache and goes on at once. */
-    if (s_pending.nstages > 1 && !xbox_path_shader_cache(cache, sizeof cache)
-        && nv2a_present_chain_request_rearm(s_start_gen, start_prepare)) {
-        req_unlock();
-        return;
+    if (s_pending.nstages > 1 && !xbox_path_shader_cache(cache, sizeof cache)) {
+        /* The stages do not need the folder: a missing one fails now,
+         * not when the wait ends, and a wait that never ends (a host
+         * that presents without path init) is in the log. */
+        if (!s_start_waiting) {
+            for (int s = 0; s < s_pending.nstages; s++)
+                if (shader_profile_stage_path(s_pending.stage[s], s_root, NULL, path,
+                                              sizeof path, err, sizeof err) < 0) {
+                    failed(s_pending.slug, REQ_START, err, 0);
+                    req_unlock();
+                    return;
+                }
+            s_start_waiting = 1;
+            fprintf(stderr, LOGP "profile %s: waiting for the shader cache folder\n",
+                    s_pending.slug);
+        }
+        if (nv2a_present_chain_request_rearm(s_start_gen, start_prepare)) {
+            req_unlock();
+            return;
+        }
     }
     request_locked(&s_pending, REQ_START, NULL, 0);
     req_unlock();
@@ -395,6 +415,7 @@ static void start_profile(const char *slug, const char *why)
      * cache, which the path module sets up after this call, and describing
      * any stage loads librashader, which only a presenter that runs a chain
      * should load. One stage or eight take the same path. */
+    s_start_waiting = 0;
     nv2a_present_chain_request_pending(s_pending.slug, start_prepare);
     s_start_gen = nv2a_present_chain_request_gen();
 }
