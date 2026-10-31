@@ -9,6 +9,32 @@ blinx2-v0.3.2; earlier tags are described by their commits.
 
 ## [Unreleased]
 
+## [blinx2-v0.10.0] - 2026-10-30
+
+### Added
+- Mod API v4: a mod declares `needs` and `follows` (the setting it acts
+  on), and reports with `api->active()` when it has nothing to do, so a
+  default-on mod stays out of the way. Mods can hook recompiled
+  functions: `recomp_hook.h` is the contract the CLI's generated hook
+  slots call (`[mods] hook_functions` in `game.toml`); hooks run pre in
+  order and post in reverse, may skip the original with its stack pop
+  and x87 return, and stop at shutdown and while their mod is off. A
+  game with no hook slots is unchanged.
+- The `[ENHANCE] mods=` token lists the mods at work (`none` at stock),
+  so a golden run proves no mod changed it.
+- The HUD anchor layer and mod API v5: a game's HUD mod hands over a
+  table of the calls that draw each HUD element, and under Hor+ each one
+  moves to its anchor (left, right, centre, proportional, stretch) at
+  that call and is restored byte for byte after it. Metal and D3D11 lift
+  the 4:3 2D clip for the moved batches only while the layer works.
+  `display.hud_aspect` (default `display`) and `display.hud_margin`
+  (default 0), a *HUD margin* item on the Render page when a table is
+  loaded, and `RECOMP_TRACE=hud`. With no table it does nothing.
+- HUD mapping capture (`RECOMP_DEBUG=hud_capture=<dir>`,
+  `hud_capture_at`, `hud_capture_table`): per-draw HUD candidates in
+  `capture.jsonl` and guest-sized frames, for mapping where a game draws
+  its HUD; mods see `api->hud_capturing`.
+
 ### Changed
 - `storage.ram_cache` (`RECOMP_STORAGE_RAM_CACHE`) is on by default: every
   title's cache partition (`Z:`, `Partition3`-`5`) lives in memory, capped
@@ -36,6 +62,25 @@ blinx2-v0.3.2; earlier tags are described by their commits.
   another tree with the same file is accepted, and download or extraction
   debris older than an hour is swept. `tests/posix_ctest.sh` fills it
   once per run.
+- A texture pack keeps the entries it has read under a 512 MB resident
+  budget, oldest freed first, and reads them again on their next upload;
+  a pack rebuilt mid-session falls back to the guest's texels.
+- Metal decodes a linear read narrower than a dirty render target's pitch
+  from guest memory without writing the target back on every flip, as
+  D3D11 does (Kingdom Under Fire's front end at render scale 4: about 18
+  to 30 fps).
+
+### Fixed
+- A window within a pixel of the picture's shape is filled instead of
+  letterboxed by one pixel (Kingdom Under Fire sat one row off with a
+  dark line at the edge), on D3D11, Metal, the shader viewports and the
+  overlay.
+- At render scale above 1, flat full-screen draws cover the first host
+  row and column (Kingdom Under Fire showed a stale strip); stock scale
+  is unchanged.
+- The RAM cache drops seeds a title never opened, oldest first, when a
+  write needs room past the 750 MB cap, so a stale shared `Cache`
+  directory no longer fills it (BLiNX 2's rewind looped on a full disk).
 
 ## [blinx2-v0.9.0] - 2026-10-29
 
