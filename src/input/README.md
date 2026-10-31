@@ -429,6 +429,40 @@ those inputs drive. They use the walker's flip count and the same step
 format, so a record replays with `RECOMP_PAD_SCRIPT=@file` through either
 path. BLiNX 2's `src/pad_input.c` uses it; `tests/usb_pad_game` covers it.
 
+A flip-timed step can miss when a replay runs slower or faster than the
+record: a press that waited on a game event (a movie that takes A only some
+seconds in) lands before the event. An anchor fixes the step to the event:
+`f<flip>:@open:<text>[:<buttons>/<period>]` says that in the record a file
+whose name starts with `<text>` (any case; a text holding `\` or `/` may
+match anywhere in the guest path) opened at that flip. Steps that start at
+or after it count their flips from the replay's open of that file and press
+nothing before it; while the open is late, the replay taps the retry
+`<buttons>` for half of every `<period>` flips (2 to 300), eight times, then
+only waits. Anchors match in order, and the kernel's `NtCreateFile` reports
+each successful open through `usb_gamepad_file_open`. An open that matches
+a later anchor gives up the ones between and is taken: one on the armed
+anchor's record flip at any time, one up to 1800 record flips on once the
+armed anchor is late. A re-open of the last matched file is not a later
+anchor while its clock is nearer the matched one than the later (before the
+midpoint of their record flips); inside one record flip it always is. An
+open 1800 flips late is given
+up, along with later anchors that clock has passed: the replay goes on on
+the clock it was due by, and steps already past on it are skipped. Each
+give-up logs how many steps it skipped. Live lines (`RECOMP_PAD_LIVE`) take
+no anchors.
+`RECOMP_DEBUG=pad_record=<file>,pad_anchor=<text>|...` writes an anchor for
+each open whose path holds one of the texts. It writes a retry only for a
+tap: the last three presses before the open press the same buttons at an
+even spacing, and the open comes within one spacing of the last. A `# retry`
+comment line before the anchor names those presses, so a wrong guess can be
+deleted; three same-button presses that miss the rule, the last within
+three spacings of the open, get a `# no retry` line, so one can be added
+by hand. An open in the same flip as a press is written a flip later, so
+that press stays before it; the steps under that anchor then replay one
+flip early against the open.
+`tests/pad_script` covers the grammar and the clock, `tests/usb_pad_anchor`
+the tap with opens.
+
 ## Ports
 
 ```c

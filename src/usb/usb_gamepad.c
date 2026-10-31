@@ -346,9 +346,28 @@ static uint8_t synthetic_buttons(void)
  * recorded as pressed or not, as a script presses them. The path cannot
  * hold a comma: RECOMP_DEBUG is a comma list.
  *
+ * A script or record may carry anchors, f<flip>:@open:<text> (pad_script.h):
+ * the steps after one count their flips from the flip at which that file
+ * opens in this run (usb_gamepad_file_open, from NtCreateFile), so a press
+ * that waited on a movie or a loading screen lands on it. With
+ * RECOMP_DEBUG=pad_record=<file>,pad_anchor=<text>|<text>, the record writes
+ * one for each open whose path holds one of the texts.
+ *
  * Like RECOMP_PAD_PRESS these are bring-up tools, off unless set. */
 static PadStep s_script[PAD_SCRIPT_MAX];
 static int     s_script_len = -1;
+static PadAnchors s_anchors;
+/* The pads the anchors' retries press: fixed once the script is read. */
+static uint32_t s_anchor_pads;
+/* Opens come on the game's threads, any of them at once (a loader thread
+ * and the main one), and the pad thread ticks the give-up and records: an
+ * anchor matched twice, or lost, would hang a replay. Taken only with a
+ * pad script or record set (usb_gamepad_file_open's `on`). */
+static SRWLOCK s_anchor_lock = SRWLOCK_INIT;
+/* 0 not read, 1 being read, 2 read. The script is read on the first pad
+ * poll or the first file open, whichever comes first, and those are
+ * different threads. */
+static int s_script_state;
 /* Bumped by every compaction: the steps below s_script_len have moved, so
  * script_pads must look at all of them again (a live poll may compact and
  * append in one go, leaving the length past where it last looked). */
@@ -365,7 +384,7 @@ void usb_gamepad_flip(uint32_t flip)
 
 uint32_t usb_gamepad_flips(void) { return s_flip; }
 
-static void pad_script_load(void)
+static void pad_script_read(void)
 {
     const char *spec = recomp_env(RENV_PAD_SCRIPT);
 
@@ -393,13 +412,42 @@ static void pad_script_load(void)
         n = (long)fread(buf, 1, (size_t)n, f);
         fclose(f);
         buf[n] = 0;
-        s_script_len = pad_script_parse(buf, s_script, 0, PAD_SCRIPT_MAX);
+        s_script_len = pad_script_parse_anchored(buf, s_script, 0, PAD_SCRIPT_MAX,
+                                                 &s_anchors);
         free(buf);
     } else {
-        s_script_len = pad_script_parse(spec, s_script, 0, PAD_SCRIPT_MAX);
+        s_script_len = pad_script_parse_anchored(spec, s_script, 0, PAD_SCRIPT_MAX,
+                                                 &s_anchors);
     }
-    fprintf(stderr, "  PAD: script of %d step(s)\n", s_script_len);
+    {
+        int i;
+        for (i = 0; i < s_anchors.n; i++)
+            if (s_anchors.a[i].period)
+                s_anchor_pads |= 1u << (s_anchors.a[i].retry.pad & 3);
+    }
+    if (s_anchors.n)
+        fprintf(stderr, "  PAD: script of %d step(s), %d anchor(s)\n",
+                s_script_len, s_anchors.n);
+    else
+        fprintf(stderr, "  PAD: script of %d step(s)\n", s_script_len);
     fflush(stderr);
+}
+
+static void pad_script_load(void)
+{
+    int idle = 0;
+
+    if (__atomic_load_n(&s_script_state, __ATOMIC_ACQUIRE) == 2)
+        return;
+    if (__atomic_compare_exchange_n(&s_script_state, &idle, 1, 0,
+                                    __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        pad_script_read();
+        __atomic_store_n(&s_script_state, 2, __ATOMIC_RELEASE);
+        return;
+    }
+    /* The other thread is reading the file: a few milliseconds, once. */
+    while (__atomic_load_n(&s_script_state, __ATOMIC_ACQUIRE) != 2)
+        SwitchToThread();
 }
 
 /* Drop steps that have finished, so a long live session never fills up. */
@@ -407,7 +455,7 @@ static void pad_script_compact(unsigned long t)
 {
     int i, n = 0;
     for (i = 0; i < s_script_len; i++)
-        if (!pad_step_done(&s_script[i], t, s_flip))
+        if (!pad_step_done_at(&s_script[i], &s_anchors, t, s_flip))
             s_script[n++] = s_script[i];
     s_script_len = n;
     s_script_gen++;
@@ -473,6 +521,9 @@ static void pad_live_poll(unsigned long t)
                     pad_script_compact(t);
                 {
                     int had = s_script_len;
+                    /* No anchors here: one added under the open's thread
+                     * would race it, and a live line is pressed now, not on
+                     * a recorded event. The parser says it skipped one. */
                     s_script_len = pad_script_parse(line, s_script, s_script_len,
                                                     PAD_SCRIPT_MAX);
                     if (s_script_len > had)
@@ -502,8 +553,7 @@ static void pad_script_apply(int pad, uint8_t *out, uint32_t flip)
     unsigned long now, t;
     int i;
 
-    if (s_script_len < 0)
-        pad_script_load();
+    pad_script_load();
     now = (unsigned long)GetTickCount();
     if (!t0)
         t0 = now;
@@ -524,7 +574,7 @@ static void pad_script_apply(int pad, uint8_t *out, uint32_t flip)
     }
     for (i = 0; i < s_script_len; i++) {
         PadStep *st = &s_script[i];
-        if (st->pad != pad || !pad_step_active(st, t, flip))
+        if (st->pad != pad || !pad_step_active_at(st, &s_anchors, t, flip))
             continue;
         if (!st->announced) {
             st->announced = 1;
@@ -533,6 +583,22 @@ static void pad_script_apply(int pad, uint8_t *out, uint32_t flip)
             fflush(stderr);
         }
         pad_step_press(st, out);
+    }
+    if (s_anchors.n) {
+        PadStep retry;
+        int on;
+        char log[512], rlog[160];
+        AcquireSRWLockExclusive(&s_anchor_lock);
+        pad_anchors_tick(&s_anchors, s_script, s_script_len, flip, log, sizeof log);
+        on = pad_anchor_retry(&s_anchors, pad, flip, &retry, rlog, sizeof rlog);
+        ReleaseSRWLockExclusive(&s_anchor_lock);
+        if (log[0] || rlog[0]) {
+            fputs(log, stderr);
+            fputs(rlog, stderr);
+            fflush(stderr);
+        }
+        if (on)
+            pad_step_press(&retry, out);
     }
 }
 
@@ -556,8 +622,7 @@ static uint32_t script_pads(void)
     static unsigned gen;
     int i;
 
-    if (s_script_len < 0)
-        pad_script_load();
+    pad_script_load();
     /* A game's own poll asks once per port per frame, and a recorded route
      * holds thousands of steps: look only at the ones added since (from the
      * start again after a live session's compaction). */
@@ -568,6 +633,7 @@ static uint32_t script_pads(void)
     for (i = scanned; i < s_script_len; i++)
         named |= 1u << (s_script[i].pad & 3);
     scanned = s_script_len;
+    named |= s_anchor_pads;
     {
         const char *live = recomp_env(RENV_PAD_LIVE);
         if (live && *live)
@@ -692,6 +758,70 @@ static void pad_record_signal(int sig)
     raise(sig);
 }
 
+/* The record's last anchor: the next one's retry looks only at presses
+ * after it, and a file that opens again straight after is not a second
+ * anchor (a movie's or a save's few opens of one file). */
+static uint32_t s_rec_anchor_at;
+static char s_rec_anchor_name[PAD_ANCHOR_TEXT];
+
+/* RECOMP_DEBUG=pad_anchor=<text>|<text>: an open whose path holds one of
+ * them, in any case. */
+static int anchor_wanted(const char *path)
+{
+    const char *list = recomp_env(RENV_PAD_ANCHOR), *p;
+
+    if (!list || !*list)
+        return 0;
+    for (p = list; *p; ) {
+        size_t n = strcspn(p, "|"), i, j;
+        for (i = 0; n && path[i]; i++) {
+            for (j = 0; j < n && path[i + j]; j++)
+                if (tolower((unsigned char)path[i + j]) != tolower((unsigned char)p[j]))
+                    break;
+            if (j == n)
+                return 1;
+        }
+        p += n;
+        if (*p == '|')
+            p++;
+    }
+    return 0;
+}
+
+/* An anchor line for an open, written on the thread that opened the file,
+ * under s_anchor_lock: the pad thread feeds the recorders under it too, so
+ * the presses the retry is read from are whole and the anchor's line goes
+ * in order with the steps around it. */
+/* Under s_anchor_lock: a refusal goes to log[0..logn), printed after it. */
+static void pad_record_open(const char *path, char *log, size_t logn)
+{
+    FILE *f = s_rec_file;
+    char line[512];
+    uint32_t at;
+    const char *name;
+    int w;
+
+    if (!f || !anchor_wanted(path))
+        return;
+    name = pad_path_name(path);
+    if (s_rec_anchor_name[0] && !strcmp(name, s_rec_anchor_name))
+        return;
+    w = pad_recorder_anchor(s_rec, USB_GAMEPAD_MAX, path, s_flip,
+                            s_rec_anchor_at, line, sizeof line, &at);
+    if (w <= 0) {
+        size_t used = strlen(log);
+        if (used + 1 < logn)
+            snprintf(log + used, logn - used,
+                     w ? "  PAD: %s: its anchor line is too long; not recorded\n"
+                       : "  PAD: %s cannot be an anchor (its name)\n", path);
+        return;
+    }
+    s_rec_anchor_at = at;
+    snprintf(s_rec_anchor_name, sizeof s_rec_anchor_name, "%s", name);
+    fputs(line, f);
+    fflush(f);
+}
+
 static void pad_record(int pad, const uint8_t *out, uint32_t flip)
 {
     static int state = -1;
@@ -728,11 +858,14 @@ static void pad_record(int pad, const uint8_t *out, uint32_t flip)
     f = s_rec_file;
     if (!f)   /* the signal path has written the record's end */
         return;
+    /* One uncontended lock per pad poll, only while recording. */
+    AcquireSRWLockExclusive(&s_anchor_lock);
     if (pad_recorder_feed(&s_rec[pad], pad_bits_from_report(out), flip, lines,
                           sizeof lines)) {
         fputs(lines, f);
         fflush(f);
     }
+    ReleaseSRWLockExclusive(&s_anchor_lock);
 }
 
 int usb_gamepad_report(int pad, uint8_t *out, int max)
@@ -850,4 +983,33 @@ void usb_gamepad_game_record(int pad, const struct XBOX_GAMEPAD *g)
 uint32_t usb_gamepad_game_pads(void)
 {
     return script_pads() & ((1u << USB_GAMEPAD_MAX) - 1u);
+}
+
+/* ---- file opens, for anchors -------------------------------------------- */
+
+void usb_gamepad_file_open(const char *path, uint32_t status)
+{
+    /* Every thread works out the same answer: a race on it is harmless.
+     * Without a script or a record this is the one load per open. */
+    static int on = -1;
+    int o = __atomic_load_n(&on, __ATOMIC_RELAXED);
+    char log[512];
+
+    if (o < 0) {
+        o = (recomp_env(RENV_PAD_SCRIPT) && *recomp_env(RENV_PAD_SCRIPT))
+            || (recomp_env(RENV_PAD_RECORD) && *recomp_env(RENV_PAD_RECORD));
+        __atomic_store_n(&on, o, __ATOMIC_RELAXED);
+    }
+    if (!o || status || !path)
+        return;
+    pad_script_load();
+    AcquireSRWLockExclusive(&s_anchor_lock);
+    pad_anchors_open(&s_anchors, path, s_flip, log, sizeof log);
+    pad_record_open(path, log, sizeof log);
+    ReleaseSRWLockExclusive(&s_anchor_lock);
+    /* Printed unlocked: a slow stderr must not hold the pad threads. */
+    if (log[0]) {
+        fputs(log, stderr);
+        fflush(stderr);
+    }
 }

@@ -20,6 +20,18 @@
  *
  * A stick may also be set to a value: lx=<v>, ly, rx, ry, -32768..32767, up
  * positive. "#" starts a comment to the end of the line, for files.
+ *
+ * An anchor, f<flip>:@open:<text>[:<buttons>/<period>], ties the flip count
+ * to a game event: in the record, a file opened at that flip whose name
+ * starts with <text> (any case; a text holding \\ or / matches anywhere in
+ * the path). A step that starts after it counts its flips from
+ * the flip at which that open comes in the replay, and does not press
+ * before it. A press that waited on a screen or a movie then lands on it
+ * however long the load before it took. When the open is late, the replay
+ * taps <buttons> for period/2 flips every <period> flips until it comes
+ * (a movie that takes A only a few seconds in, by its decoder's clock).
+ * After PAD_ANCHOR_GIVE_UP_FLIPS late the replay gives the open up and goes
+ * on as recorded.
  */
 #ifndef XBOX_USB_PAD_SCRIPT_H
 #define XBOX_USB_PAD_SCRIPT_H
@@ -46,8 +58,97 @@ typedef struct {
     uint8_t axis_set;        /* bit n: axis[n] (LX LY RX RY) is set */
     int16_t axis[4];
     uint8_t by_flip;
+    uint16_t anchor;         /* 0, or 1 + the anchor it counts from */
     int announced;
 } PadStep;
+
+/* ---- anchors ------------------------------------------------------------ */
+
+#define PAD_ANCHOR_MAX  256
+#define PAD_ANCHOR_TEXT 64
+/* A retry longer than this is two presses, not a tap. */
+#define PAD_RETRY_MAX_FLIPS 300
+/* The recorder writes a retry for this many presses of the same buttons,
+ * spaced within PAD_RETRY_SLACK flips of each other. */
+#define PAD_RETRY_PRESSES 3
+#define PAD_RETRY_SLACK 2
+/* An open this late (30 s at 60 flips/s) is not coming: a file the replay
+ * never opens, or two opening in the other order. */
+#define PAD_ANCHOR_GIVE_UP_FLIPS 1800
+/* A late anchor's retry taps this many times, then only waits. */
+#define PAD_RETRY_MAX_TAPS 8
+/* "# no retry" only for presses this many spacings or fewer before the
+ * open: earlier ones are a menu walk, not a wait for it. */
+#define PAD_NO_RETRY_NEAR 3
+
+typedef struct {
+    char text[PAD_ANCHOR_TEXT];
+    unsigned long at;        /* the open's flip in the record */
+    unsigned long period;    /* the retry's, in flips; 0 for none */
+    PadStep retry;           /* its buttons and pad */
+    long long seen_flip;     /* the open's flip in this run (a given-up one's
+                                may be before 0 or past now) */
+    int seen;
+    int logged;              /* 1 the wait, 2 the retry's cap */
+    int skip;                /* given up, its skipped steps not yet counted */
+    unsigned long skip_clock; /* the clock it was given up on */
+} PadAnchor;
+
+/* Sorted by at. Only `armed`, the first one not seen, takes an open: the
+ * anchors match in the order the record saw them. */
+typedef struct {
+    PadAnchor a[PAD_ANCHOR_MAX];
+    int n, armed;
+    int skip;                /* some anchor's skip is set */
+} PadAnchors;
+
+/* pad_script_parse, plus anchor entries into *anchors (kept sorted), and
+ * each new step tied to its anchor. Without anchors (NULL) an anchor entry
+ * is reported and skipped. A new anchor ties every step again, since it can
+ * take steps from the one before it. */
+int pad_script_parse_anchored(const char *text, PadStep *steps, int len,
+                              int max, PadAnchors *anchors);
+
+/* Tie steps[from..len) to the last anchor at or before their start. A step
+ * that starts on an anchor's flip counts from it (the recorder moves an
+ * anchor a flip on when a press began earlier in its flip). */
+void pad_anchors_assign(const PadAnchors *anchors, PadStep *steps, int from, int len);
+
+/* A file opened at flip: the armed anchor, if its text matches the path, is
+ * seen. An open that matches a later anchor gives up the ones before it
+ * and is seen: one on the armed one's record flip at any time, one up to
+ * PAD_ANCHOR_GIVE_UP_FLIPS of record later once the armed one is late. A
+ * re-open of the last seen anchor's file is never a later one. Returns the
+ * index seen, or -1. Not thread-safe: the caller serialises the opens and
+ * the other anchor calls. It does not read the script: the steps a give-up
+ * skips are counted at the next pad_anchors_tick. The log goes to
+ * log[0..logn) when log is set (the caller prints it once its lock is
+ * free), else to stderr. */
+int pad_anchors_open(PadAnchors *anchors, const char *path, uint32_t flip,
+                     char *log, size_t logn);
+
+/* Give up the armed anchor once PAD_ANCHOR_GIVE_UP_FLIPS late on the clock
+ * it is due by: it is seen as if it came on time, its retry stops, and its
+ * steps run on that clock. Later anchors that clock has passed go with it,
+ * silently. Logs each give-up with the steps it skipped, and the steps an
+ * open's give-up skipped since the last tick. Returns how many anchors it
+ * gave up. steps[0..nsteps) are the script's; log as for
+ * pad_anchors_open. */
+int pad_anchors_tick(PadAnchors *anchors, const PadStep *steps, int nsteps,
+                     uint32_t flip, char *log, size_t logn);
+
+/* pad_step_active and pad_step_done on the step's anchor's clock: flip read
+ * as flips since the open, from the record's flip of it. Before the open a
+ * step is neither active nor done. */
+int pad_step_active_at(const PadStep *st, const PadAnchors *anchors,
+                       unsigned long t_ms, uint32_t flip);
+int pad_step_done_at(const PadStep *st, const PadAnchors *anchors,
+                     unsigned long t_ms, uint32_t flip);
+
+/* The armed anchor's retry for this pad at flip: 1 and *out to press when
+ * the open is late and the retry taps now. Logs the first late flip. */
+int pad_anchor_retry(PadAnchors *anchors, int pad, uint32_t flip, PadStep *out,
+                     char *log, size_t logn);
 
 /* Parse text (comma or newline separated) and append its steps to
  * steps[len..max). Returns the new length. Bad entries are reported on
@@ -93,6 +194,9 @@ typedef struct {
     uint32_t since, ax_since;
     PadBits pend;            /* the flip being gathered */
     uint32_t pend_flip;
+    PadBits press[PAD_RETRY_PRESSES]; /* the last presses' buttons, newest last */
+    uint32_t press_at[PAD_RETRY_PRESSES];
+    int presses;             /* how many of them there are */
     int pad;
     int started;
 } PadRecorder;
@@ -109,5 +213,25 @@ int pad_recorder_feed(PadRecorder *r, PadBits b, uint32_t flip, char *out, size_
 /* Write the steps still held at the end of a run, as if released at flip
  * (or the flip after the last report, if that is later). */
 int pad_recorder_end(PadRecorder *r, uint32_t flip, char *out, size_t n);
+
+/* An anchor line for a file that opened at flip, after the anchor at
+ * `since` (0 for none): "f<flip>:@open:<name>[:<buttons>/<period>]\n", the
+ * name being the path's file name. The retry comes from the first pad whose
+ * newest PAD_RETRY_PRESSES presses came after `since` with the same
+ * buttons, evenly spaced (within PAD_RETRY_SLACK flips, at most
+ * PAD_RETRY_MAX_FLIPS), the open within one spacing of the last; a
+ * "# retry" comment line before the anchor says which presses. Three
+ * same-button presses that miss the rule get a "# no retry" line instead,
+ * so a person can add one by hand. When a pad's flip under gathering
+ * already holds a new press, the anchor goes one flip on, so that press
+ * stays before it. Returns the line's length (0 when the name cannot be an
+ * anchor: empty, too long, or holding ":,#" or a blank; -1 when out is too
+ * small), and its flip in *at. */
+int pad_recorder_anchor(const PadRecorder *recs, int n, const char *path,
+                        uint32_t flip, uint32_t since, char *out, size_t size,
+                        uint32_t *at);
+
+/* The file name in a guest path ("d:\\movie\\x.sfd" -> "x.sfd"). */
+const char *pad_path_name(const char *path);
 
 #endif /* XBOX_USB_PAD_SCRIPT_H */

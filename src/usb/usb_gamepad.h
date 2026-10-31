@@ -120,4 +120,11 @@ void usb_gamepad_game_press(int pad, struct XBOX_GAMEPAD *g);
 void usb_gamepad_game_record(int pad, const struct XBOX_GAMEPAD *g);
 uint32_t usb_gamepad_game_pads(void);
 
+/* A file the title opened (status 0) or failed to: the pad script's armed
+ * anchor may be waiting on it, and the pad record may write an anchor for
+ * it (pad_script.h). Called by NtCreateFile on the thread that opened it.
+ * Without a pad script, live file or pad record it does nothing. */
+#define USB_GAMEPAD_HAVE_FILE_OPEN 1
+void usb_gamepad_file_open(const char *path, uint32_t status);
+
 #endif /* XBOX_USB_GAMEPAD_H */

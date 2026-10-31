@@ -41,6 +41,7 @@
 #include "platform/host_time.h"
 #include "recomp_icall_feedback.h"
 #include "kernel_user_apc.h"
+#include "usb_gamepad.h"   /* usb_gamepad_file_open: pad anchors */
 #include <stdio.h>
 #ifndef _WIN32
 #include <pthread.h>
@@ -4787,6 +4788,8 @@ static NTSTATUS bridge_create_file_impl(
                     g_xbox_kernel_caller, status);
         if (xbox_FileOpenHook)              /* e.g. a scripted pad waiting on a movie */
             xbox_FileOpenHook(gpath, status);
+        /* The pad script's anchors and the pad record's (pad_script.h). */
+        usb_gamepad_file_open(gpath, status);
     }
     fflush(stderr);
     return st;

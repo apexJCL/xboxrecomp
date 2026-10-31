@@ -237,6 +237,403 @@ static void test_round_trip(void)
     }
 }
 
+/* Anchors: f<flip>:@open:<text>[:<buttons>/<period>]. */
+static void test_anchor_parse(void)
+{
+    static PadAnchors a;
+    PadStep s[16];
+    int n;
+
+    memset(&a, 0, sizeof a);
+    n = pad_script_parse_anchored("f10:a:5\nf40:@open:menu.xpr\n"
+                                  "f45:b:2 f20:@open:intro.sfd:a/61\n"
+                                  "f20:start f60:p2-x f40:y",
+                                  s, 0, 16, &a);
+    CHECK(n == 5);
+    /* Sorted by flip, the retry parsed. */
+    CHECK(a.n == 2 && a.a[0].at == 20 && a.a[1].at == 40);
+    CHECK(strcmp(a.a[0].text, "intro.sfd") == 0);
+    CHECK(a.a[0].period == 61 && a.a[0].retry.analog == 0x01
+          && a.a[0].retry.hold == 30);
+    CHECK(a.a[1].period == 0);
+    /* Each step takes the last anchor at or before its start: ties after. */
+    CHECK(s[0].anchor == 0);            /* f10 */
+    CHECK(s[1].anchor == 2);            /* f45 */
+    CHECK(s[2].anchor == 1);            /* f20, on the anchor's flip */
+    CHECK(s[3].anchor == 2 && s[3].pad == 1);
+    CHECK(s[4].anchor == 2);            /* f40 */
+
+    /* A retry for another pad, and with two buttons. */
+    memset(&a, 0, sizeof a);
+    n = pad_script_parse_anchored("f5:@open:x:p2-start+a/30", s, 0, 16, &a);
+    CHECK(n == 0 && a.n == 1 && a.a[0].retry.pad == 1
+          && a.a[0].retry.digital == 0x10 && a.a[0].retry.analog == 0x01);
+
+    /* Bad anchors end the parse, as a bad step does. */
+    memset(&a, 0, sizeof a);
+    CHECK(pad_script_parse_anchored("f1:a 100:@open:x f2:b", s, 0, 16, &a) == 1
+          && a.n == 0);
+    CHECK(pad_script_parse_anchored("f1:a f2:@open: f3:b", s, 0, 16, &a) == 1);
+    CHECK(pad_script_parse_anchored("f1:a f2:@close:x f3:b", s, 0, 16, &a) == 1);
+    CHECK(pad_script_parse_anchored("f1:a f2:@open:x:a f3:b", s, 0, 16, &a) == 1);
+    CHECK(pad_script_parse_anchored("f1:a f2:@open:x:a/1 f3:b", s, 0, 16, &a) == 1);
+    /* Past the cap, a retry pressing nothing or not a button, a pad on the
+     * anchor rather than its retry. */
+    CHECK(pad_script_parse_anchored("f1:a f2:@open:x:a/301 f3:b", s, 0, 16, &a) == 1);
+    CHECK(pad_script_parse_anchored("f1:a f2:@open:x:zz/10 f3:b", s, 0, 16, &a) == 1);
+    CHECK(pad_script_parse_anchored("f1:a f2:@open:x:/10 f3:b", s, 0, 16, &a) == 1);
+    CHECK(pad_script_parse_anchored("f1:a f2:@open:x:lx=100/10 f3:b", s, 0, 16, &a) == 1);
+    CHECK(pad_script_parse_anchored("f1:a f2:p2-@open:x f3:b", s, 0, 16, &a) == 1);
+    CHECK(a.n == 0);
+    CHECK(pad_script_parse_anchored("f2:@open:x:a/300", s, 0, 16, &a) == 0 && a.n == 1);
+    /* Without an anchor table the entry is skipped, the steps kept. */
+    n = pad_script_parse("f1:a f2:@open:x:a/10 f3:b", s, 0, 16);
+    CHECK(n == 2 && s[1].at == 3 && s[0].anchor == 0 && s[1].anchor == 0);
+}
+
+static void test_anchor_match(void)
+{
+    static PadAnchors a;
+    PadStep s[4];
+
+    /* A bare name is the start of the file name: "stop.sfd" is not op's. */
+    memset(&a, 0, sizeof a);
+    pad_script_parse_anchored("f10:@open:op.sfd f20:@open:movie\\end", s, 0, 4, &a);
+    CHECK(pad_anchors_open(&a, "d:\\movie\\stop.sfd", 5, NULL, 0) == -1);
+    CHECK(pad_anchors_open(&a, "d:\\op\\x.sfd", 5, NULL, 0) == -1);
+    CHECK(pad_anchors_open(&a, "d:\\movie\\OP.SFD", 6, NULL, 0) == 0);
+    /* With a directory in it, anywhere in the path. */
+    CHECK(pad_anchors_open(&a, "d:\\movie\\ending.sfd", 7, NULL, 0) == 1 && a.armed == 2);
+    /* A prefix of the name takes it. */
+    memset(&a, 0, sizeof a);
+    pad_script_parse_anchored("f10:@open:intro", s, 0, 4, &a);
+    CHECK(pad_anchors_open(&a, "d:\\Intro.sfd", 5, NULL, 0) == 0);
+}
+
+static void test_anchor_clock(void)
+{
+    static PadAnchors a;
+    PadStep s[4], r;
+    int k;
+
+    memset(&a, 0, sizeof a);
+    pad_script_parse_anchored("f10:a:3 f100:@open:movie f110:b:4 "
+                              "f200:@open:menu:a/20 f205:x:2",
+                              s, 0, 4, &a);
+    /* Before its open, an anchored step neither presses nor is done. */
+    CHECK(pad_step_active_at(&s[0], &a, 0, 10));
+    CHECK(!pad_step_active_at(&s[1], &a, 0, 110));
+    CHECK(!pad_step_done_at(&s[1], &a, 0, 100000));
+    /* Only the armed anchor takes an open while it is not late, and in
+     * any case. */
+    CHECK(pad_anchors_open(&a, "d:\\menu.xpr", 90, NULL, 0) == -1);
+    CHECK(pad_anchors_open(&a, "d:\\MOVIE\\Movie.sfd", 150, NULL, 0) == 0);
+    CHECK(a.armed == 1);
+    /* 50 flips late: the step lands 10 flips after the open. */
+    CHECK(!pad_step_active_at(&s[1], &a, 0, 159));
+    CHECK(pad_step_active_at(&s[1], &a, 0, 160));
+    CHECK(pad_step_active_at(&s[1], &a, 0, 163));
+    CHECK(pad_step_done_at(&s[1], &a, 0, 164));
+    /* The menu is due at flip 250 on the movie's clock. Not late before. */
+    CHECK(!pad_anchor_retry(&a, 0, 249, &r, NULL, 0));
+    /* Late: taps A for 10 flips every 20, from 10 flips after it is due. */
+    CHECK(!pad_anchor_retry(&a, 0, 250, &r, NULL, 0));
+    CHECK(!pad_anchor_retry(&a, 0, 259, &r, NULL, 0));
+    CHECK(pad_anchor_retry(&a, 0, 260, &r, NULL, 0) && r.analog == 0x01);
+    CHECK(pad_anchor_retry(&a, 0, 269, &r, NULL, 0));
+    CHECK(!pad_anchor_retry(&a, 0, 270, &r, NULL, 0));
+    CHECK(pad_anchor_retry(&a, 0, 280, &r, NULL, 0));
+    CHECK(!pad_anchor_retry(&a, 1, 280, &r, NULL, 0));   /* pad 1's own */
+    /* An open early on its clock pulls the next steps in. */
+    k = pad_anchors_open(&a, "z:\\menu", 282, NULL, 0);
+    CHECK(k == 1 && !pad_anchor_retry(&a, 0, 290, &r, NULL, 0));
+    CHECK(pad_step_active_at(&s[2], &a, 0, 287) && !pad_step_active_at(&s[2], &a, 0, 286));
+    /* A step on no anchor is on the raw count, as before. */
+    CHECK(s[0].anchor == 0 && pad_step_done_at(&s[0], &a, 0, 13));
+    /* Every anchor seen: no more opens taken. */
+    CHECK(pad_anchors_open(&a, "movie", 300, NULL, 0) == -1);
+}
+
+static void test_anchor_give_up(void)
+{
+    static PadAnchors a;
+    PadStep s[4], r;
+    char log[512];
+
+    memset(&a, 0, sizeof a);
+    pad_script_parse_anchored("f100:@open:movie f110:b:4 "
+                              "f3000:@open:menu:a/20 f3005:x:2",
+                              s, 0, 4, &a);
+    /* The first is due on the raw count: given up 1800 flips late, its
+     * steps on that count, as without anchors. */
+    CHECK(pad_anchors_tick(&a, s, 2, 100 + PAD_ANCHOR_GIVE_UP_FLIPS - 1, NULL, 0) == 0
+          && a.armed == 0);
+    CHECK(pad_anchors_tick(&a, s, 2, 100 + PAD_ANCHOR_GIVE_UP_FLIPS, log, sizeof log) == 1
+          && a.armed == 1);
+    CHECK(strstr(log, "gave up on @open:movie") && strstr(log, "1 step(s) skipped"));
+    CHECK(a.a[0].seen && a.a[0].seen_flip == 100);
+    CHECK(pad_step_done_at(&s[0], &a, 0, 115));
+    /* The next, due at 3000 on that clock, taps from 3010 every 20, for
+     * PAD_RETRY_MAX_TAPS taps, then only waits. */
+    CHECK(!pad_anchor_retry(&a, 0, 3009, &r, NULL, 0));
+    CHECK(pad_anchor_retry(&a, 0, 3010, &r, NULL, 0));
+    CHECK(pad_anchor_retry(&a, 0, 3010 + 20 * (PAD_RETRY_MAX_TAPS - 1), &r, NULL, 0));
+    CHECK(!pad_anchor_retry(&a, 0, 3010 + 20 * PAD_RETRY_MAX_TAPS, &r, NULL, 0));
+    CHECK(!pad_anchor_retry(&a, 0, 3010 + 20 * (PAD_RETRY_MAX_TAPS + 5), &r, NULL, 0));
+    CHECK(pad_anchors_tick(&a, s, 2, 3000 + PAD_ANCHOR_GIVE_UP_FLIPS, NULL, 0) == 1
+          && a.armed == 2);
+    CHECK(pad_anchors_tick(&a, s, 2, 100000, NULL, 0) == 0);
+    /* An open after it gave up is not taken. */
+    CHECK(pad_anchors_open(&a, "menu", 5000, NULL, 0) == -1);
+
+    /* A later anchor the restored clock has passed goes with it, silently:
+     * its retry does not tap, nor wait 1800 flips more. */
+    memset(&a, 0, sizeof a);
+    pad_script_parse_anchored("f100:@open:movie f110:b:4 "
+                              "f200:@open:menu:a/20 f205:x:2",
+                              s, 0, 4, &a);
+    CHECK(pad_anchors_tick(&a, s, 2, 100 + PAD_ANCHOR_GIVE_UP_FLIPS, log, sizeof log) == 2
+          && a.armed == 2);
+    CHECK(strstr(log, ", and 1 later anchor(s) it passed; 2 step(s) skipped"));
+    CHECK(a.a[1].seen_flip == 200);
+    CHECK(!pad_anchor_retry(&a, 0, 100 + PAD_ANCHOR_GIVE_UP_FLIPS + 10, &r, NULL, 0));
+
+    /* Several overdue at once all go, each read on the give-up's clock. */
+    memset(&a, 0, sizeof a);
+    pad_script_parse_anchored("f10:@open:a f20:@open:b f30:x", s, 0, 4, &a);
+    CHECK(pad_anchors_tick(&a, s, 1, 5000, NULL, 0) == 2 && a.armed == 2);
+    CHECK(a.a[1].seen_flip == 5000 - (5000 - 20));
+}
+
+static void test_anchor_skip_ahead(void)
+{
+    static PadAnchors a;
+    PadStep s[4];
+    char log[512];
+
+    memset(&a, 0, sizeof a);
+    pad_script_parse_anchored("f10:@open:a f20:x:2 f50:@open:b f60:y:2 "
+                              "f2000:@open:c",
+                              s, 0, 4, &a);
+    /* Not late yet: the order holds, b's open is not taken over a. */
+    CHECK(pad_anchors_open(&a, "b", 5, NULL, 0) == -1 && a.armed == 0);
+    /* Late, a later anchor's open gives up the ones before it. Its steps
+     * passed: they are skipped, not pressed at once. */
+    CHECK(pad_anchors_open(&a, "d:\\b.bin", 30, log, sizeof log) == 1 && a.armed == 2);
+    CHECK(strstr(log, "gave up on 1 anchor(s) from @open:a")
+          && strstr(log, "@open:b at flip 30"));
+    /* The pad thread counts them, at its next tick. */
+    CHECK(pad_anchors_tick(&a, s, 2, 31, log, sizeof log) == 0
+          && strstr(log, "1 step(s) skipped by that give-up"));
+    CHECK(pad_anchors_tick(&a, s, 2, 32, log, sizeof log) == 0 && !log[0]);
+    CHECK(a.a[0].seen && pad_step_done_at(&s[0], &a, 0, 30));
+    CHECK(!pad_step_active_at(&s[1], &a, 0, 39) && pad_step_active_at(&s[1], &a, 0, 40));
+    /* Only within the give-up's wait of record: c is too far past b. */
+    memset(&a, 0, sizeof a);
+    pad_script_parse_anchored("f10:@open:a f2000:@open:c", s, 0, 4, &a);
+    CHECK(pad_anchors_open(&a, "c", 100, NULL, 0) == -1 && a.armed == 0);
+
+    /* a, b, a: an open of a nearer the a seen than its next anchor is a
+     * re-open (the recorder keeps one anchor for opens in a row), late b
+     * or not. */
+    memset(&a, 0, sizeof a);
+    pad_script_parse_anchored("f100:@open:movie.sfd f590:start f600:@open:menu.xpr "
+                              "f700:a f1500:@open:movie.sfd",
+                              s, 0, 4, &a);
+    CHECK(pad_anchors_open(&a, "d:\\movie.sfd", 100, NULL, 0) == 0);
+    CHECK(pad_anchors_open(&a, "d:\\movie.sfd", 650, NULL, 0) == -1 && a.armed == 1);
+    CHECK(pad_anchors_open(&a, "d:\\menu.xpr", 660, NULL, 0) == 1);
+    CHECK(pad_anchors_open(&a, "d:\\movie.sfd", 1500, NULL, 0) == 2);
+    /* Nearer a's next anchor it is that one's open, b's missed. */
+    memset(&a, 0, sizeof a);
+    pad_script_parse_anchored("f100:@open:a.bin f150:x f200:@open:b.bin f250:y "
+                              "f300:@open:a.bin f310:start",
+                              s, 0, 4, &a);
+    CHECK(pad_anchors_open(&a, "d:\\a.bin", 100, NULL, 0) == 0);
+    CHECK(pad_anchors_open(&a, "d:\\a.bin", 199, NULL, 0) == -1 && a.armed == 1);
+    CHECK(pad_anchors_open(&a, "d:\\a.bin", 300, log, sizeof log) == 2 && a.armed == 3);
+    CHECK(strstr(log, "gave up on 1 anchor(s) from @open:b.bin")
+          && strstr(log, "(+0 flips against the record)"));
+
+    /* Two opens on one record flip, come the other way while on time: the
+     * second's open takes it, and the first's after it is a re-open. */
+    memset(&a, 0, sizeof a);
+    pad_script_parse_anchored("f100:@open:x.bin f100:@open:y.bin f110:a", s, 0, 4, &a);
+    CHECK(pad_anchors_open(&a, "y.bin", 98, NULL, 0) == 1 && a.armed == 2);
+    CHECK(pad_anchors_open(&a, "x.bin", 99, NULL, 0) == -1);
+    CHECK(pad_step_active_at(&s[0], &a, 0, 108) && !pad_step_active_at(&s[0], &a, 0, 107));
+    /* A later record flip still waits its turn while on time. */
+    memset(&a, 0, sizeof a);
+    pad_script_parse_anchored("f100:@open:x.bin f101:@open:y.bin", s, 0, 4, &a);
+    CHECK(pad_anchors_open(&a, "y.bin", 98, NULL, 0) == -1 && a.armed == 0);
+    /* x, y, x on one record flip, replayed x, x, y: the second x is the
+     * third anchor, not a re-open; nothing was skipped. */
+    memset(&a, 0, sizeof a);
+    pad_script_parse_anchored("f100:@open:x.bin f100:@open:y.bin f100:@open:x.bin "
+                              "f110:a",
+                              s, 0, 4, &a);
+    CHECK(pad_anchors_open(&a, "x.bin", 100, NULL, 0) == 0);
+    CHECK(pad_anchors_open(&a, "x.bin", 100, log, sizeof log) == 2 && a.armed == 3);
+    CHECK(strstr(log, "@open:x.bin taken before @open:y.bin (same record flip)")
+          && !strstr(log, "skipped"));
+    CHECK(pad_step_active_at(&s[0], &a, 0, 110) && !pad_step_active_at(&s[0], &a, 0, 109));
+}
+
+static void test_anchor_log(void)
+{
+    static PadAnchors a;
+    PadStep s[4], r;
+    char log[512], small[40];
+    size_t n;
+    int i;
+
+    /* The retry's lines go to the buffer, for the caller to print after
+     * its lock. */
+    memset(&a, 0, sizeof a);
+    pad_script_parse_anchored("f10:@open:a:a/20", s, 0, 4, &a);
+    CHECK(!pad_anchor_retry(&a, 0, 10, &r, log, sizeof log)
+          && strstr(log, "waiting on @open:a from flip 10"));
+    CHECK(!pad_anchor_retry(&a, 0, 11, &r, log, sizeof log) && !log[0]);
+    /* A full buffer still ends in a newline. */
+    memset(&a, 0, sizeof a);
+    a.n = 6;
+    for (i = 0; i < a.n; i++) {
+        memset(a.a[i].text, 'x', PAD_ANCHOR_TEXT - 1);
+        a.a[i].at = 10 + (unsigned long)i * 3000;
+    }
+    CHECK(pad_anchors_tick(&a, s, 0, 100000, small, sizeof small) == 6);
+    n = strlen(small);
+    CHECK(n == sizeof small - 1 && small[n - 1] == '\n');
+    /* A line that fills the buffer exactly still marks the one dropped:
+     * a give-up's line, then the match's. */
+    {
+        char big[512], fit[512];
+        size_t first = 0;
+        int round;
+
+        for (round = 0; round < 2; round++) {
+            memset(&a, 0, sizeof a);
+            pad_script_parse_anchored("f10:@open:a f50:@open:b", s, 0, 4, &a);
+            if (!round) {
+                CHECK(pad_anchors_open(&a, "b", 60, big, sizeof big) == 1);
+                first = (size_t)(strchr(big, '\n') - big) + 1;
+            } else {
+                CHECK(pad_anchors_open(&a, "b", 60, fit, first + 1) == 1);
+            }
+        }
+        n = strlen(fit);
+        CHECK(first < strlen(big) && n == first && !strcmp(fit + n - 4, "...\n"));
+    }
+}
+
+static void test_anchor_early_limit(void)
+{
+    static PadAnchors a;
+    PadStep s[4];
+
+    /* A step under the anchor before keeps its clock when the next open
+     * comes early: y, after x in the record, presses before it (Limits). */
+    memset(&a, 0, sizeof a);
+    pad_script_parse_anchored("f10:@open:a f25:x:2 f30:@open:b f35:y:2", s, 0, 4, &a);
+    CHECK(pad_anchors_open(&a, "a", 10, NULL, 0) == 0);
+    CHECK(pad_anchors_open(&a, "b", 15, NULL, 0) == 1);
+    CHECK(pad_step_active_at(&s[1], &a, 0, 20) && !pad_step_active_at(&s[0], &a, 0, 20));
+    CHECK(pad_step_active_at(&s[0], &a, 0, 25));
+}
+
+static void test_recorder_anchor(void)
+{
+    PadRecorder rec[2];
+    char out[256];
+    uint32_t at = 0;
+    int f;
+
+    memset(rec, 0, sizeof rec);
+    rec[1].pad = 1;
+    /* A tapped every 10 flips for 4, from flip 10. */
+    for (f = 0; f < 36; f++) {
+        pad_recorder_feed(&rec[0], bits(0, (f % 10) < 4 && f >= 10 ? 1 : 0, 0, 0),
+                          (uint32_t)f, out, sizeof out);
+        pad_recorder_feed(&rec[1], bits(0, 0, 0, 0), (uint32_t)f, out, sizeof out);
+    }
+    /* The open comes at flip 36, 6 after the last A started. */
+    CHECK(pad_recorder_anchor(rec, 2, "d:\\movie\\intro.sfd", 36, 0, out,
+                              sizeof out, &at) > 0);
+    CHECK(strcmp(out, "# retry a/10: pressed at f10 f20 f30, the open 6 flips"
+                      " after the last\nf36:@open:intro.sfd:a/10\n") == 0 && at == 36);
+    /* Presses before the previous anchor are not its retry. */
+    CHECK(pad_recorder_anchor(rec, 2, "x.bin", 36, 11, out, sizeof out, &at) > 0);
+    CHECK(strcmp(out, "f36:@open:x.bin\n") == 0);
+    /* An open later than one spacing after the last is no retry. */
+    CHECK(pad_recorder_anchor(rec, 2, "x.bin", 43, 0, out, sizeof out, &at) > 0);
+    CHECK(strcmp(out, "# no retry a: pressed at f10 f20 f30 (gaps 10 10), the open 13"
+                      " flips after the last\nf43:@open:x.bin\n") == 0);
+    /* Presses long before the open are a menu walk: no note. */
+    CHECK(pad_recorder_anchor(rec, 2, "x.bin", 61, 0, out, sizeof out, &at) > 0);
+    CHECK(strcmp(out, "f61:@open:x.bin\n") == 0);
+    /* A press polled earlier in the open's flip stays before it: the anchor
+     * goes a flip on. The press under gathering counts for the retry. */
+    pad_recorder_feed(&rec[0], bits(0, 0, 0, 0), 36, out, sizeof out);
+    pad_recorder_feed(&rec[0], bits(0, 0, 0, 0), 37, out, sizeof out);
+    pad_recorder_feed(&rec[0], bits(0, 0x01, 0, 0), 40, out, sizeof out);
+    CHECK(pad_recorder_anchor(rec, 2, "menu", 40, 0, out, sizeof out, &at) > 0);
+    CHECK(strcmp(out, "# retry a/10: pressed at f20 f30 f40, the open 0 flips"
+                      " after the last\nf41:@open:menu:a/10\n") == 0 && at == 41);
+
+    /* Pad 2's retry is named for it. */
+    memset(rec, 0, sizeof rec);
+    rec[1].pad = 1;
+    for (f = 0; f < 6; f++)
+        pad_recorder_feed(&rec[1], bits(f & 1 ? 0 : 0x10, 0, 0, 0),
+                          (uint32_t)(100 + f * 8), out, sizeof out);
+    CHECK(pad_recorder_anchor(rec, 2, "a", 140, 0, out, sizeof out, &at) > 0);
+    CHECK(strcmp(out, "# retry p2-start/16: pressed at f100 f116 f132, the open 8"
+                      " flips after the last\nf140:@open:a:p2-start/16\n") == 0);
+
+    /* Menu choices are no retry: two presses, uneven ones, other buttons. */
+    memset(rec, 0, sizeof rec);
+    pad_recorder_feed(&rec[0], bits(0, 1, 0, 0), 10, out, sizeof out);
+    pad_recorder_feed(&rec[0], bits(0, 0, 0, 0), 12, out, sizeof out);
+    pad_recorder_feed(&rec[0], bits(0, 1, 0, 0), 30, out, sizeof out);
+    pad_recorder_feed(&rec[0], bits(0, 0, 0, 0), 32, out, sizeof out);
+    CHECK(pad_recorder_anchor(rec, 1, "a", 40, 0, out, sizeof out, &at) > 0);
+    CHECK(strcmp(out, "f40:@open:a\n") == 0);
+    pad_recorder_feed(&rec[0], bits(0, 1, 0, 0), 80, out, sizeof out);
+    pad_recorder_feed(&rec[0], bits(0, 0, 0, 0), 82, out, sizeof out);
+    CHECK(pad_recorder_anchor(rec, 1, "a", 90, 0, out, sizeof out, &at) > 0);
+    CHECK(strcmp(out, "# no retry a: pressed at f10 f30 f80 (gaps 20 50), the open 10"
+                      " flips after the last\nf90:@open:a\n") == 0);
+    memset(rec, 0, sizeof rec);
+    for (f = 0; f < 3; f++) {
+        pad_recorder_feed(&rec[0], bits(f == 1 ? 0x01 : 0, f == 1 ? 0 : 1, 0, 0),
+                          (uint32_t)(10 + f * 10), out, sizeof out);
+        pad_recorder_feed(&rec[0], bits(0, 0, 0, 0), (uint32_t)(12 + f * 10), out,
+                          sizeof out);
+    }
+    CHECK(pad_recorder_anchor(rec, 1, "a", 35, 0, out, sizeof out, &at) > 0);
+    CHECK(strcmp(out, "f35:@open:a\n") == 0);
+    /* Nor presses past the cap apart. */
+    memset(rec, 0, sizeof rec);
+    for (f = 0; f < 3; f++) {
+        pad_recorder_feed(&rec[0], bits(0, 1, 0, 0),
+                          (uint32_t)(1 + f * (PAD_RETRY_MAX_FLIPS + 1)), out, sizeof out);
+        pad_recorder_feed(&rec[0], bits(0, 0, 0, 0),
+                          (uint32_t)(2 + f * (PAD_RETRY_MAX_FLIPS + 1)), out, sizeof out);
+    }
+    CHECK(pad_recorder_anchor(rec, 1, "a", 2 * PAD_RETRY_MAX_FLIPS + 10, 0, out,
+                              sizeof out, &at) > 0);
+    CHECK(strncmp(out, "# no retry a:", 13) == 0 && !strchr(out, '/'));
+    /* A line past the buffer is -1, not a bad name. */
+    CHECK(pad_recorder_anchor(rec, 1, "a", 2 * PAD_RETRY_MAX_FLIPS + 10, 0, out, 20, &at)
+          == -1);
+    /* Names that cannot be a text. */
+    CHECK(pad_recorder_anchor(rec, 1, "d:\\my file.bin", 1, 0, out, sizeof out, &at) == 0);
+    CHECK(pad_recorder_anchor(rec, 1, "d:\\dir\\", 1, 0, out, sizeof out, &at) == 0);
+    CHECK(pad_recorder_anchor(rec, 1, "a,b", 1, 0, out, sizeof out, &at) == 0);
+    CHECK(strcmp(pad_path_name("d:\\movie\\x.sfd"), "x.sfd") == 0);
+    CHECK(strcmp(pad_path_name("x.sfd"), "x.sfd") == 0);
+}
+
 int main(void)
 {
     test_parse();
@@ -246,6 +643,14 @@ int main(void)
     test_bits();
     test_recorder();
     test_round_trip();
+    test_anchor_parse();
+    test_anchor_match();
+    test_anchor_clock();
+    test_anchor_give_up();
+    test_anchor_skip_ahead();
+    test_anchor_early_limit();
+    test_anchor_log();
+    test_recorder_anchor();
     if (fails) {
         fprintf(stderr, "pad_script: %d failure(s)\n", fails);
         return 1;
