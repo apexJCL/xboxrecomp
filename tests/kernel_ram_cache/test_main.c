@@ -10,6 +10,12 @@
  * (the RAMCACHE_OFF_VALUE builds) or when xbox_RamCacheEnable(0) runs with
  * the variable unset (RAMCACHE_OFF_ENABLE, the `ram_cache = false` case);
  * on, with a warning, when the variable is not a bool (RAMCACHE_BAD_VALUE).
+ * A Cache dir over the cap (RAMCACHE_OVER_CAP): the seed stops at the
+ * cap, and a write that needs room drops the seeds neither opened nor listed
+ * nor queried, oldest first (ties: the first seeded), from subdirectories too,
+ * never one the title met or its own files; free space counts them. A Cache
+ * dir that fit (RAMCACHE_UNDER_CAP) never loses a seed; a directory past the
+ * cap is left out like a file (RAMCACHE_DIR_OVER_CAP).
  * One way per process, since the store fixes on or off at its first use.
  * Then seed reads; create, rewrite, seek and size; the
  * FATX overwrite semantics the disk backends keep; the cap (STATUS_DISK_FULL)
@@ -37,6 +43,7 @@
 #include <dirent.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <utime.h>
 #endif
 
 /* Provided by the generated title; nothing here calls a guest function. */
@@ -903,6 +910,268 @@ static void test_dir_search(void)
     check(fresh == SEARCHES, "each new search starts in its own directory", d);
 }
 
+#if defined(RAMCACHE_OVER_CAP) || defined(RAMCACHE_UNDER_CAP) || defined(RAMCACHE_DIR_OVER_CAP)
+/* A Cache dir past the cap, against the 64-cluster test cap. The
+ * seeds are named by state (xbox_RamCacheSeedState), since a listing or a
+ * query is what marks a seed seen. Write times are seconds past a fixed base
+ * so the oldest is known whatever the host's listing order. */
+static void host_backdate(const char *name, unsigned secs)
+{
+    char p[700];
+    long long t = 1500000000ll + (long long)secs;
+    snprintf(p, sizeof p, "%s" SEP_S "%s", g_cache, name);
+#if defined(_WIN32)
+    {
+        HANDLE f = CreateFileA(p, FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ, NULL,
+                               OPEN_EXISTING, 0, NULL);
+        ULONGLONG ft = 116444736000000000ull + (ULONGLONG)t * 10000000ull;
+        FILETIME w;
+        w.dwLowDateTime = (DWORD)ft;
+        w.dwHighDateTime = (DWORD)(ft >> 32);
+        if (f != INVALID_HANDLE_VALUE) {
+            SetFileTime(f, NULL, NULL, &w);
+            CloseHandle(f);
+        }
+    }
+#else
+    {
+        struct utimbuf u;
+        u.actime = u.modtime = (time_t)t;
+        utime(p, &u);
+    }
+#endif
+}
+
+static unsigned char g_big[65u * CLUSTER];
+
+/* A seed of `cl` clusters with write time `secs`. */
+static void seed(const char *name, unsigned cl, unsigned secs)
+{
+    host_write(name, g_big, (size_t)cl * CLUSTER);
+    host_backdate(name, secs);
+}
+
+static void seed_subdir(const char *name)
+{
+    char p[700];
+    snprintf(p, sizeof p, "%s" SEP_S "%s", g_cache, name);
+    make_dir(p);
+}
+
+static int state(const char *path)
+{
+    return xbox_RamCacheSeedState(path, NULL);
+}
+
+static uint32_t order_of(const char *path)
+{
+    uint32_t o = 0;
+    xbox_RamCacheSeedState(path, &o);
+    return o;
+}
+
+static LONGLONG avail(HANDLE h)
+{
+    XBOX_FILE_FS_SIZE_INFORMATION fs;
+    XBOX_IO_STATUS_BLOCK ios;
+    if (xbox_NtQueryVolumeInformationFile(h, &ios, &fs, sizeof fs,
+                                          XboxFileFsSizeInformation) != 0)
+        return -1;
+    return fs.AvailableAllocationUnits.QuadPart;
+}
+
+static void cap_setup(void)
+{
+    unsigned i;
+    for (i = 0; i < sizeof g_big; i++) g_big[i] = pattern(i);
+#if defined(RAMCACHE_OVER_CAP)
+    /* big.bin alone is past the cap, so it is left out whatever the order,
+     * and the other 62 clusters all fit. */
+    seed("big.bin", 65, 0);
+    seed_subdir("sub");
+    seed("sub" SEP_S "t.rec", 10, 100);
+    seed_subdir("sub2");
+    seed("sub2" SEP_S "e.rec", 5, 50);
+    seed("s1.rec", 10, 200);
+    seed("s2.rec", 10, 300);
+    seed("s3.rec", 10, 300);
+    seed("s4.rec", 10, 400);
+    seed("s5.rec", 5, 60);
+#elif defined(RAMCACHE_UNDER_CAP)
+    for (i = 0; i < 4; i++) {
+        char name[16];
+        snprintf(name, sizeof name, "s%u.rec", i);
+        seed(name, 10, 100 + i * 100);
+    }
+#else
+    /* A file of the whole cap and a directory: whichever is listed second
+     * is left out. */
+    seed("a.bin", 64, 100);
+    seed_subdir("d");
+    seed("d" SEP_S "x.rec", 1, 200);
+#endif
+}
+#endif
+
+#if defined(RAMCACHE_OVER_CAP)
+static void test_over_cap(const unsigned char *buf)
+{
+    static const char *const seeds[] = {
+        "sub\\t.rec", "sub2\\e.rec", "s1.rec", "s2.rec", "s3.rec", "s4.rec", "s5.rec",
+    };
+    XBOX_ANSI_STRING name;
+    XBOX_OBJECT_ATTRIBUTES oa;
+    XBOX_FILE_NETWORK_OPEN_INFORMATION net;
+    unsigned char got[4096];
+    char names[256], d[200];
+    const char *first, *second;
+    unsigned i, all = 1;
+    ULONG n;
+    HANDLE h, g;
+    NTSTATUS st;
+
+    printf("\nA Cache dir over the cap\n");
+    xbox_RamCacheSetCap(CAP);
+    /* The first file call starts the store. */
+    list_dir("z:\\sub2", "*", names, sizeof names);
+    for (i = 0; i < sizeof seeds / sizeof seeds[0]; i++)
+        all &= state(seeds[i]) == 1;
+    snprintf(d, sizeof d, "used %llu clusters, big.bin %d",
+             (unsigned long long)(xbox_RamCacheUsed() / CLUSTER), state("big.bin"));
+    check(all && state("big.bin") == -1 && state("sub") == 0
+          && xbox_RamCacheUsed() == 62ull * CLUSTER,
+          "the seed leaves out what passes the cap: 62 clusters", d);
+    check(!strcmp(names, "e.rec"), "sub2 lists e.rec (now seen)", names);
+
+    /* Seen by a query, and opened: neither may go. A first open re-charges
+     * what the seed held, so it drops nothing. */
+    set_name(&name, &oa, "z:\\s5.rec", NULL);
+    st = xbox_NtQueryFullAttributesFile(&oa, &net);
+    check(st == 0 && net.EndOfFile.QuadPart == 5 * CLUSTER, "s5.rec queried (now seen)",
+          NULL);
+    st = open_file("z:\\s1.rec", XBOX_FILE_OPEN, &h);
+    check(st == 0 && read_at(h, got, sizeof got, 0, &n) == 0 && n == sizeof got
+          && matches(got, 0, sizeof got), "s1.rec opens and reads", NULL);
+    xbox_NtClose(h);
+    all = 1;
+    for (i = 0; i < sizeof seeds / sizeof seeds[0]; i++)
+        if (strcmp(seeds[i], "s1.rec")) all &= state(seeds[i]) == 1;
+    check(all && state("s1.rec") == 0 && xbox_RamCacheUsed() == 62ull * CLUSTER,
+          "a seed's first open drops nothing", NULL);
+
+    /* Free space counts the droppable seeds: 2 free + t, s2, s3, s4. */
+    st = open_file("z:\\game.rec", XBOX_FILE_OVERWRITE_IF, &g);
+    snprintf(d, sizeof d, "avail %lld", (long long)avail(g));
+    check(st == 0 && avail(g) == 42, "free space: 2 clusters + 40 droppable", d);
+
+    /* Up to the cap: nothing dropped. */
+    st = write_at(g, buf, 2 * CLUSTER, 0);
+    check(st == 0 && state("sub\\t.rec") == 1 && xbox_RamCacheUsed() == CAP,
+          "game.rec up to the cap drops nothing", NULL);
+
+    /* One cluster past: e.rec and s5.rec are older but seen, so t.rec in
+     * sub goes. */
+    st = write_at(g, buf, CLUSTER, 2 * CLUSTER);
+    snprintf(d, sizeof d, "status 0x%08X, t %d e %d s5 %d", (unsigned)st,
+             state("sub\\t.rec"), state("sub2\\e.rec"), state("s5.rec"));
+    check(st == 0 && state("sub\\t.rec") == -1 && state("sub2\\e.rec") == 1
+          && state("s5.rec") == 1 && state("sub") == 0,
+          "the oldest unseen seed goes, from its subdirectory", d);
+
+    /* s2 and s3 share a write time: the first seeded goes. */
+    first = order_of("s2.rec") < order_of("s3.rec") ? "s2.rec" : "s3.rec";
+    second = first[1] == '2' ? "s3.rec" : "s2.rec";
+    st = set_eof(g, 13ll * CLUSTER);
+    snprintf(d, sizeof d, "status 0x%08X, %s %d, %s %d", (unsigned)st, first,
+             state(first), second, state(second));
+    check(st == 0 && state(first) == -1 && state(second) == 1 && state("s4.rec") == 1,
+          "a tie on write time: the first seeded goes", d);
+
+    /* Past every droppable seed: refused, nothing dropped. */
+    st = set_eof(g, (LONGLONG)CAP);
+    check(st == ST_DISK_FULL && state(second) == 1 && state("s4.rec") == 1,
+          "past every droppable seed: STATUS_DISK_FULL, nothing dropped", NULL);
+
+    /* The rest: both droppable seeds go, the seen and opened ones stay. */
+    st = set_eof(g, 42ll * CLUSTER);
+    snprintf(d, sizeof d, "status 0x%08X, used %llu", (unsigned)st,
+             (unsigned long long)(xbox_RamCacheUsed() / CLUSTER));
+    check(st == 0 && state(second) == -1 && state("s4.rec") == -1
+          && state("s1.rec") == 0 && state("sub2\\e.rec") == 1 && state("s5.rec") == 1
+          && xbox_RamCacheUsed() == CAP,
+          "the rest of the cap: only the seen and opened seeds are left", d);
+    st = write_at(g, buf, 1, 42ll * CLUSTER);
+    check(st == ST_DISK_FULL, "then the cap answers STATUS_DISK_FULL", NULL);
+    xbox_NtClose(g);
+
+    printf("\nHost Cache\n");
+    check(host_entries() == 8 && host_size("s2.rec") == 10l * CLUSTER
+          && host_size("s4.rec") == 10l * CLUSTER
+          && host_size("sub" SEP_S "t.rec") == 10l * CLUSTER,
+          "every host seed is still there, whole", NULL);
+}
+#elif defined(RAMCACHE_UNDER_CAP)
+/* A Cache dir that fit: it may be the title's own state, so the cap answers
+ * as stock and nothing is ever dropped. */
+static void test_over_cap(const unsigned char *buf)
+{
+    unsigned i, all = 1;
+    HANDLE g, dir;
+    NTSTATUS st;
+    ULONG_PTR info;
+    char d[120];
+
+    printf("\nA Cache dir under the cap\n");
+    xbox_RamCacheSetCap(CAP);
+    st = open_file("z:\\game.rec", XBOX_FILE_OVERWRITE_IF, &g);
+    check(st == 0 && xbox_RamCacheUsed() == 40ull * CLUSTER, "four seeds, 40 clusters",
+          NULL);
+    snprintf(d, sizeof d, "avail %lld", (long long)avail(g));
+    check(avail(g) == 24, "free space: the cap less the seeds", d);
+    st = set_eof(g, 24ll * CLUSTER);
+    check(st == 0 && avail(g) == 0, "game.rec up to the cap", NULL);
+    st = write_at(g, buf, 1, 24ll * CLUSTER);
+    check(st == ST_DISK_FULL, "a write past it: STATUS_DISK_FULL", NULL);
+    st = open_at(NULL, "z:\\newdir", XBOX_FILE_CREATE, 0x21, &dir, &info);
+    check(st != 0, "a new directory past it fails", NULL);
+    if (st == 0) xbox_NtClose(dir);
+    for (i = 0; i < 4; i++) {
+        char name[16];
+        snprintf(name, sizeof name, "s%u.rec", i);
+        all &= state(name) == 1;
+    }
+    check(all, "no seed was dropped", NULL);
+    xbox_NtClose(g);
+}
+#elif defined(RAMCACHE_DIR_OVER_CAP)
+/* A directory past the cap is left out like a file, so the charge stays in
+ * the cap and the overflow lets a write drop the seed that did fit. */
+static void test_over_cap(const unsigned char *buf)
+{
+    const char *kept;
+    HANDLE g;
+    NTSTATUS st;
+    char d[160];
+    (void)buf;
+
+    printf("\nA directory past the cap\n");
+    xbox_RamCacheSetCap(CAP);
+    st = open_file("z:\\game.rec", XBOX_FILE_OVERWRITE_IF, &g);
+    kept = state("a.bin") == 1 ? "a.bin" : "d\\x.rec";
+    snprintf(d, sizeof d, "a.bin %d, d %d, d\\x.rec %d, used %llu", state("a.bin"),
+             state("d"), state("d\\x.rec"),
+             (unsigned long long)(xbox_RamCacheUsed() / CLUSTER));
+    check(st == 0 && xbox_RamCacheUsed() <= CAP
+          && ((state("a.bin") == 1 && state("d") == -1 && state("d\\x.rec") == -1)
+              || (state("a.bin") == -1 && state("d") == 0 && state("d\\x.rec") == 1)),
+          "the one listed second is left out, the charge within the cap", d);
+    st = set_eof(g, 63ll * CLUSTER);
+    snprintf(d, sizeof d, "status 0x%08X, %s %d", (unsigned)st, kept, state(kept));
+    check(st == 0 && state(kept) == -1, "the seed that fit is dropped for the write", d);
+    xbox_NtClose(g);
+}
+#endif
+
 int main(int argc, char **argv)
 {
     static unsigned char buf[65536];
@@ -930,6 +1199,13 @@ int main(int argc, char **argv)
     snprintf(g_cache, sizeof g_cache, "%s" SEP_S "Cache", root);
     make_dir(g_cache);
     for (i = 0; i < sizeof buf; i++) buf[i] = pattern(i);
+#if defined(RAMCACHE_OVER_CAP) || defined(RAMCACHE_UNDER_CAP) || defined(RAMCACHE_DIR_OVER_CAP)
+    cap_setup();
+    snprintf(p, sizeof p, "%s" SEP_S "UDATA", root);
+    make_dir(p);
+    xbox_path_init(root, root);
+    test_over_cap(buf);
+#else
     host_write("seed.bin", buf, 3000);
     snprintf(p, sizeof p, "%s" SEP_S "sub", g_cache);
     make_dir(p);
@@ -960,6 +1236,7 @@ int main(int argc, char **argv)
     printf("\nHost Cache\n");
     check(host_entries() == 2, "only the two seeded entries on disk", NULL);
     check(host_size("seed.bin") == 3000, "seed.bin unchanged in size", NULL);
+#endif
 #endif
 
     {

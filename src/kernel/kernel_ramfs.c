@@ -80,6 +80,7 @@ typedef struct ram_node {
     uint64_t      buf_cap;
     LARGE_INTEGER ctime, mtime;
     xbox_host_char *seed;       /* host file still to be read in, or NULL  */
+    int           seen;         /* named to the title by a listing or query */
 } ram_node;
 
 typedef struct ram_file {
@@ -112,6 +113,7 @@ static size_t       s_node_count, s_node_cap;
 static ram_handle  *s_handles;
 static size_t       s_handle_count, s_handle_cap;
 static int          s_full_warned;
+static int          s_seed_overflow;        /* the seed left something out */
 
 /* Every change of the charge goes through here, so the [MEM] exit line
  * (mem_stats.h) can say what the store held at the end and at its peak. */
@@ -392,6 +394,95 @@ static int dir_has_children(const ram_node *d)
     return 0;
 }
 
+/* Tests: whether `path` is still a seed never opened, and its node order,
+ * without the query marking it seen. */
+int xbox_RamCacheSeedState(const char *path, uint32_t *order)
+{
+    char rel[RAMFS_PATH];
+    ram_node *n;
+    int state = -1;
+    if (!normalize(path, rel, sizeof rel))
+        return -1;
+    AcquireSRWLockExclusive(&s_lock);
+    n = find_node(rel);
+    if (n) {
+        state = n->seed ? 1 : 0;
+        if (order)
+            *order = n->id;
+    }
+    ReleaseSRWLockExclusive(&s_lock);
+    return state;
+}
+
+/* Room for `extra` more bytes of charge, dropping seeds if it takes
+ * that. The partition is scratch, and <hdd>/Cache is shared: a dev
+ * Cache dir held 360 stale BLiNX 2 pages and 300 BLiNX 1 ones, the seed
+ * filled 747 MB of the 750 MB, and BLiNX 2 then could not grow its own time
+ * record, so REW looped its 10-frame ring.
+ *
+ * Only when the seed itself overflowed (s_seed_overflow: a file or directory
+ * was left out at the cap). Then the Cache dir is not a state a console could
+ * hold, and its contents are the host's leftovers, not the title's. A seed
+ * that fit is the title's own data from an earlier run: dropping one of its
+ * files would lose it silently mid-run, where the cap answering
+ * STATUS_DISK_FULL lets the title clean up itself, as on the console.
+ *
+ * What goes is a seed the title has not met this run: never opened (its bytes
+ * still on the host, no handle on it) and never named to it by a listing or a
+ * query (`seen`), so it cannot be counting on it. The oldest write time goes
+ * first, ties to the first seeded; the host copy stays. A seed the title
+ * opened or saw, and every file it made, is never dropped: past those the cap
+ * answers STATUS_DISK_FULL, and a request that would fail anyway drops
+ * nothing. Under the cap nothing is dropped.
+ *
+ * The charge never runs past the cap from seeding (directories are capped
+ * too, seed_dir), so a seed's first open (seed_fill) re-charges what it
+ * already held and never needs room. */
+static int droppable(const ram_node *c, const ram_node *keep)
+{
+    return c != keep && c->seed && !c->seen && !c->is_dir && !c->open_count
+        && c->size;
+}
+
+static uint64_t droppable_bytes(const ram_node *keep)
+{
+    uint64_t spare = 0;
+    size_t i;
+    if (!s_seed_overflow)
+        return 0;
+    for (i = 0; i < s_node_count; i++)
+        if (droppable(s_nodes[i], keep))
+            spare += node_charge(s_nodes[i]);
+    return spare;
+}
+
+static int make_room(uint64_t extra, const ram_node *keep)
+{
+    size_t i;
+
+    if (s_used + extra <= cap_bytes())
+        return 1;
+    if (s_used - droppable_bytes(keep) + extra > cap_bytes())
+        return 0;
+    while (s_used + extra > cap_bytes()) {
+        ram_node *victim = NULL;
+        for (i = 0; i < s_node_count; i++) {
+            ram_node *c = s_nodes[i];
+            if (droppable(c, keep)
+                    && (!victim || c->mtime.QuadPart < victim->mtime.QuadPart))
+                victim = c;
+        }
+        if (!victim)
+            return 0;
+        fprintf(stderr, "  [FILE] ram cache: %s (%llu bytes), a seed the title "
+                "has not opened or listed, dropped to make room\n", victim->path,
+                (unsigned long long)victim->size);
+        fflush(stderr);
+        unlink_node(victim);
+    }
+    return 1;
+}
+
 /* Grow or shrink a file to `size`. Growth past the cap writes nothing. */
 static NTSTATUS set_size(ram_node *n, uint64_t size)
 {
@@ -406,7 +497,8 @@ static NTSTATUS set_size(ram_node *n, uint64_t size)
         return STATUS_SUCCESS;
     }
     new_charge = clusters(size);
-    if (s_used - old_charge + new_charge > cap_bytes()) {
+    if (s_used - old_charge + new_charge > cap_bytes()
+            && !make_room(new_charge - old_charge, n)) {
         full_warning(n->path);
         return STATUS_DISK_FULL;
     }
@@ -476,6 +568,7 @@ static void seed_file(const char *rel, uint64_t size, LONGLONG ctime,
         fprintf(stderr, "  [FILE] ram cache: %s (%llu bytes) left out, past "
                 "the cap\n", rel, (unsigned long long)size);
         fflush(stderr);
+        s_seed_overflow = 1;
         return;
     }
     n = new_node(rel, 0);
@@ -496,6 +589,22 @@ static void seed_file(const char *rel, uint64_t size, LONGLONG ctime,
     n->mtime.QuadPart = mtime;
     s_seed_files++;
     s_seed_bytes += size;
+}
+
+/* A seeded directory costs a cluster like any other: past the cap it is left
+ * out with what is in it, so the seed never charges more than the cap. */
+static int seed_dir(const char *rel)
+{
+    if (find_node(rel))
+        return 1;
+    if (s_used + RAMFS_CLUSTER > cap_bytes()) {
+        fprintf(stderr, "  [FILE] ram cache: %s\\ left out with its files, past "
+                "the cap\n", rel);
+        fflush(stderr);
+        s_seed_overflow = 1;
+        return 0;
+    }
+    return new_node(rel, 1) != NULL;
 }
 
 #if defined(_WIN32)
@@ -521,7 +630,7 @@ static void seed_scan(const WCHAR *dir, const char *rel, int depth)
             continue;
         child[MAX_PATH - 1] = 0;
         if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (!find_node(sub) && !new_node(sub, 1))
+            if (!seed_dir(sub))
                 continue;
             seed_scan(child, sub, depth + 1);
         } else {
@@ -588,7 +697,7 @@ static void seed_scan(const char *dir, const char *rel, int depth)
                 || stat(child, &st) != 0)
             continue;
         if (S_ISDIR(st.st_mode)) {
-            if (!find_node(sub) && !new_node(sub, 1))
+            if (!seed_dir(sub))
                 continue;
             seed_scan(child, sub, depth + 1);
         } else if (S_ISREG(st.st_mode)) {
@@ -664,6 +773,8 @@ static void start(void)
     new_node("", 1);
     if (seed_root(dir, sizeof dir / sizeof dir[0], shown, sizeof shown)) {
         seed_scan(dir, "", 0);
+        if (s_used > cap_bytes())
+            s_seed_overflow = 1;
         fprintf(stderr, "  [FILE] ram cache: on, %u files %llu MB seeded from %s, "
                 "cap %llu MB, nothing written back\n", s_seed_files,
                 (unsigned long long)(s_seed_bytes >> 20), shown,
@@ -863,7 +974,7 @@ int xbox_ramfs_create(PHANDLE out, ACCESS_MASK access, PXBOX_OBJECT_ATTRIBUTES o
             *st = fail_open(ios, STATUS_OBJECT_NAME_NOT_FOUND, 2);
             goto out;
         }
-        if (want_dir && s_used + RAMFS_CLUSTER > cap_bytes()) {
+        if (want_dir && !make_room(RAMFS_CLUSTER, NULL)) {
             full_warning(rel);
             *st = fail_open(ios, STATUS_DISK_FULL, 112);
             goto out;
@@ -1229,8 +1340,11 @@ int xbox_ramfs_query_volume(HANDLE h, PXBOX_IO_STATUS_BLOCK ios, PVOID info,
         s->BytesPerSector = 512;
         s->SectorsPerAllocationUnit = 32;
         s->TotalAllocationUnits.QuadPart = (LONGLONG)(cap / RAMFS_CLUSTER);
+        /* What a write could get: the seeds make_room would drop count as
+         * free, so a title that checks before it writes sees the room too. */
+        uint64_t used = s_used - droppable_bytes(NULL);
         s->AvailableAllocationUnits.QuadPart =
-            (LONGLONG)(s_used < cap ? (cap - s_used) / RAMFS_CLUSTER : 0);
+            (LONGLONG)(used < cap ? (cap - used) / RAMFS_CLUSTER : 0);
         ios->Status = *st = STATUS_SUCCESS;
         ios->Information = sizeof *s;
     } else if (cls == XboxFileFsVolumeInformation) {
@@ -1278,6 +1392,7 @@ int xbox_ramfs_query_full(PXBOX_OBJECT_ATTRIBUTES oa,
     start();
     n = find_node(rel);
     if (n) {
+        n->seen = 1;
         fill_net(n, info);
         *st = STATUS_SUCCESS;
     } else {
@@ -1366,6 +1481,7 @@ int xbox_ramfs_query_dir(HANDLE h, PXBOX_IO_STATUS_BLOCK ios, PVOID info, ULONG 
             goto out;
         }
         f->enum_last = hit->id;
+        hit->seen = 1;
         memset(e, 0, len);
         fill_net(hit, &net);
         e->CreationTime = net.CreationTime;

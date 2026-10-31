@@ -6,7 +6,11 @@
  * With it on, the paths kernel_path.c sends to <hdd>/Cache -- Z:, and
  * Partition3-5 below the device -- are served from memory instead, capped at
  * the stock 750 MB partition and seeded read-only from <hdd>/Cache when it
- * starts. Nothing is written back.
+ * starts. Nothing is written back. When the seed did not fit under the cap
+ * (a shared or stale Cache dir) and a write needs room, seeds the title has
+ * neither opened nor listed this run are dropped from memory, oldest first
+ * (the host copies stay), so the leftovers cannot starve the
+ * title's own files. A Cache dir that fit is never touched.
  *
  * The console's utility drives are scratch: the dashboard and other titles
  * clear them, so a title cannot count on what it left there. BLiNX 1 rewrites
@@ -38,6 +42,11 @@ void xbox_RamCacheEnable(int on);
 void xbox_RamCacheSetCap(uint64_t bytes);
 /* Bytes in use against the cap, in 16 KB clusters (tests, logs). */
 uint64_t xbox_RamCacheUsed(void);
+/* Tests: 1 when the store path (`s0.rec`, `sub\\t.rec`) is a seed not yet
+ * opened, 0 for any other file or directory, -1 when there is no such name;
+ * *order (if given) is its creation order, the seed's host listing order.
+ * Unlike a query or a listing, it does not mark the seed seen. */
+int xbox_RamCacheSeedState(const char *path, uint32_t *order);
 
 int xbox_ramfs_active(void);
 
