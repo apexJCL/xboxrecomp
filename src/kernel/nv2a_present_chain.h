@@ -39,11 +39,78 @@ void nv2a_present_chain_request(const char *shader);
  * default beside the executable. Before the first present. */
 void nv2a_present_chain_set_lib(const char *path);
 
-/* The current request, copied into out ("none" when off). */
+/* The current request, copied into out ("none" when off; a profile's
+ * preset path for a profile request). */
 void nv2a_present_chain_requested(char *out, size_t cap);
 
+/* ---- Profile requests (present.profile, shader_profile.h) ----
+ *
+ * A profile is requested as one preset file (the composed .slangp, or a
+ * one-stage profile's own preset) plus what the store cannot learn from the
+ * library: librashader lists a chain's parameters with no pass index, so
+ * the caller hands in each stage's preset key and the names its preset
+ * declares (nv2a_present_chain_describe on the stage alone, at compose
+ * time). Publish tags each row by name from those lists. Its values live in
+ * the profile scope, keyed by the slug, never in the per-preset overrides. */
+#define NV2A_PRESENT_STAGES_MAX 8
+#define NV2A_PRESENT_PROFILE_ERR_MAX 160
+/* Rows in the active parameter table (below), and names per stage. */
+#define NV2A_PRESENT_PARAMS_MAX 128
+
+struct nv2a_present_stage {
+    char key[64];                     /* the stage's preset key */
+    int nnames;
+    char name[NV2A_PRESENT_PARAMS_MAX][64];   /* the parameters it declares */
+};
+
+/* Request profile slug, run as the preset at path (absolute), with
+ * stages[0..nstages) (past NV2A_PRESENT_STAGES_MAX the first 8). Moves the
+ * generation and clears the profile error, as nv2a_present_chain_request
+ * does; the store copies stages. */
+void nv2a_present_chain_request_profile(const char *slug, const char *path,
+                                        const struct nv2a_present_stage *stages, int nstages);
+
+/* Request profile slug before its chain can be composed: at start the
+ * composed file goes under the shader cache, which the path module sets up
+ * after the enhancements layer has read the config. The request is a
+ * profile (requested_profile says so, wanted is 1) with no preset yet; the
+ * first nv2a_present_chain_gen() after it runs prepare once (again when it
+ * rearms), on that caller's thread (the backend's present), and prepare
+ * makes the real request (request_profile, or "none" with the profile error). Any other
+ * request first drops prepare unrun. */
+void nv2a_present_chain_request_pending(const char *slug, void (*prepare)(void));
+
+/* From a pending start's prepare, which cannot make its request yet (the
+ * boot can present before the path module is up, so the shader cache has
+ * no folder): run prepare again at the next nv2a_present_chain_gen(), but
+ * only while the generation is still gen. Keeps the generation, so the
+ * start stays pending. 1 rearmed, 0 when another request came first. */
+int nv2a_present_chain_request_rearm(unsigned gen, void (*prepare)(void));
+
+/* The generation as it stands, without running a pending prepare. */
+unsigned nv2a_present_chain_request_gen(void);
+
+/* A pending start's real request, from its prepare: as request_profile
+ * (path "none" or NULL: stock with err as the profile error), but only
+ * while the generation is still gen, read right after request_pending. A
+ * menu request made meanwhile wins: 1 stored, 0 dropped. */
+int nv2a_present_chain_request_profile_at(unsigned gen, const char *slug, const char *path,
+                                          const struct nv2a_present_stage *stages, int nstages,
+                                          const char *err);
+
+/* 1 with the slug in out when the request is a profile; 0 with "" else. */
+int nv2a_present_chain_requested_profile(char *out, size_t cap);
+
+/* The profile error: why the chosen profile presents stock (a parse error,
+ * a missing stage, a clash, a limit, or a chain that failed to build). The
+ * profile module sets it after requesting stock; a build failure of a
+ * profile request sets it in nv2a_present_chain_failed. Cleared by the next
+ * request. get: 1 with the text, 0 with "" when there is none. */
+void nv2a_present_chain_profile_error_set(const char *msg);
+int nv2a_present_chain_profile_error_get(char *out, size_t cap);
+
 /* Moves on every request and on nv2a_present_chain_failed(); 0 before the
- * first request. */
+ * first request. Runs a pending request's prepare first. */
 unsigned nv2a_present_chain_gen(void);
 
 /* 1 when a shader is requested and has not failed for this generation:
@@ -75,7 +142,10 @@ int nv2a_present_chain_preset(char *out, size_t cap, unsigned *gen_out);
 
 /* The backend could not build the chain for generation gen (said by the
  * backend): wanted() is 0 until the next request, so a broken preset is
- * not retried every frame. */
+ * not retried every frame. For a profile request it also sets the profile
+ * error, naming the profile and the composed file. A start still waiting
+ * to compose (pending again after a rearm) has no preset yet and does not
+ * count. */
 void nv2a_present_chain_failed(unsigned gen);
 
 /* The rate the chain's frames arrive at, for the presets' frame-rate
@@ -99,13 +169,17 @@ void nv2a_present_chain_error(void *err, char *out, size_t cap);
  * keyed by preset (the bundled name, or a path's file stem) so each preset
  * keeps its own. A value equal to the preset's own removes the override,
  * so the config only ever holds differences. */
-#define NV2A_PRESENT_PARAMS_MAX 64
-#define NV2A_PRESENT_OVERRIDES_MAX 256   /* over every preset */
+#define NV2A_PRESENT_OVERRIDES_MAX 256   /* over every preset and profile */
 
 struct nv2a_present_param {
     char name[64];
     char desc[96];
     float initial, min, max, step;   /* initial: the preset's value */
+    /* A profile's rows: the first stage that declares the name (-1 for a
+     * name no stage lists, 0 for a present.shader request), and shared
+     * when a later stage declares it too: one value drives both. */
+    int stage;
+    int shared;
 };
 
 /* The preset key of a request ("crt-lottes", or a path's sanitised stem)
@@ -127,19 +201,26 @@ void nv2a_present_chain_params_clear(void);
 /* Moves on every publish, clear, set and reset. */
 unsigned nv2a_present_chain_params_gen(void);
 
-/* A copy of the active table into out (cap rows) and its preset key.
- * Returns the row count; 0 with key "" when no chain is up. */
+/* A copy of the active table into out (cap rows) and its preset key (a
+ * profile's slug for a profile request). Returns the row count; 0 with key
+ * "" when no chain is up. */
 int nv2a_present_chain_params(struct nv2a_present_param *out, int cap, char *key, size_t keycap);
+
+/* 1 when the active table belongs to a profile request: its values are in
+ * the profile scope. */
+int nv2a_present_chain_params_profile(void);
 
 /* The active preset's current value of name (override or initial); the
  * value is snapped to the row's range. Returns 0 when name is not active. */
 int nv2a_present_chain_param_get(const char *name, float *out);
 
 /* Set name on the active preset (clamped to its range); equal to the
- * preset's value removes the override. Returns 0 when not active. */
+ * preset's value removes the override. A profile request's table writes the
+ * profile scope. Returns 0 when not active. */
 int nv2a_present_chain_param_set(const char *name, float v);
 
-/* Remove the overrides of preset key (NULL: of every preset). */
+/* Remove the overrides of preset key (NULL: of every preset). The preset
+ * scope only: profiles reset through nv2a_present_chain_profile_reset. */
 void nv2a_present_chain_params_reset(const char *key);
 
 /* The backend applies the parameters: when the params generation moved
@@ -155,7 +236,8 @@ void nv2a_present_chain_override_load(const char *key, const char *name, float v
 
 /* Overrides for Save: row i (from 0) while it returns 1. has: the
  * override is set (else it was removed since the last save); dirty: it
- * differs from what was loaded or saved last. */
+ * differs from what was loaded or saved last. The preset scope only, as are
+ * saved, dirty and get below: profile values go to the profile's file. */
 int nv2a_present_chain_override_at(int i, char *key, size_t keycap, char *name,
                                    size_t namecap, float *v, int *has, int *dirty);
 
@@ -168,7 +250,37 @@ int nv2a_present_chain_overrides_dirty(void);
 /* The override of name for preset key: 1 with *v set, 0 when none. */
 int nv2a_present_chain_override_get(const char *key, const char *name, float *v);
 
-/* Tests: drop the active table and every override, as a fresh start. */
+/* ---- The profile scope: values keyed by (slug, name) ---- */
+
+/* A value read from profile slug's file at start or when it is chosen. It
+ * counts as saved. */
+void nv2a_present_chain_profile_value_load(const char *slug, const char *name, float v);
+
+/* The value of name in profile slug: 1 with *v, 0 when it has none. */
+int nv2a_present_chain_profile_value_get(const char *slug, const char *name, float *v);
+
+/* The values profile slug holds now, for its file at Save: names and
+ * values into name[0..cap) and v. The count. */
+int nv2a_present_chain_profile_values(const char *slug, char (*name)[64], float *v, int cap);
+
+/* Remove profile slug's value of name (NULL: every value). Moves the
+ * params generation. */
+void nv2a_present_chain_profile_reset(const char *slug, const char *name);
+
+/* The values of profile slug (NULL: of every profile) that differ from what
+ * was loaded or saved. */
+int nv2a_present_chain_profile_dirty(const char *slug);
+
+/* Save wrote profile slug's file: its values are clean now. */
+void nv2a_present_chain_profile_saved(const char *slug);
+
+/* A rename: the values of from now belong to to (and the active table's
+ * key, when it is from's). A delete: forget slug's values, saved or not. */
+void nv2a_present_chain_profile_rekey(const char *from, const char *to);
+void nv2a_present_chain_profile_forget(const char *slug);
+
+/* Tests: drop the active table, every override and profile value, the
+ * profile request and its error, as a fresh start. */
 void nv2a_present_chain_params_reset_for_test(void);
 
 /* Forget the presenter and the library (closing it), so a test can load

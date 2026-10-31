@@ -1763,6 +1763,22 @@ translate:
 
 #endif /* _WIN32 */
 
+/* Both hosts: it only builds on the hdd root each half resolves. */
+int xbox_path_shader_cache(char *out, size_t n)
+{
+    static const char sub[] = "/ShaderCache";
+    size_t l;
+    if (n <= sizeof sub || !xbox_path_hdd_root(out, n - (sizeof sub - 1)))
+        return 0;
+    for (l = 0; out[l]; l++)
+        if (out[l] == '\\')
+            out[l] = '/';
+    while (l > 1 && out[l - 1] == '/')
+        l--;
+    memcpy(out + l, sub, sizeof sub);
+    return 1;
+}
+
 /* ======================================================================== */
 /* Saves from the shared default root
  *

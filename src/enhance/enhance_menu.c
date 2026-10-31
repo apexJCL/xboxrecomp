@@ -41,6 +41,7 @@
 #include "nv2a_present_chain.h"
 #include "nv2a_stats.h"
 #include "nv2a_tex_pack.h"
+#include "shader_profile_edit.h"
 #include "recomp_cfg.h"
 #include "recomp_env.h"
 
@@ -74,9 +75,6 @@ static const char *const k_aspect[] = { "4:3", "16:9", "16:10", "21:9", NULL };
 static const char *const k_movie[] = { "black", "fit", "fill", NULL };
 static const char *const k_surface[] = { "auto", "window", "internal", NULL };
 static const char *const k_onoff[] = { "off", "on", NULL };
-/* present.shader: "none" then nv2a_present_chain_names; a .slangp path from
- * the config shows as itself and the first press moves it to a bundled one. */
-static const char *const k_shader[] = { "none", NV2A_PRESENT_CHAIN_NAMES, NULL };
 /* input.mouse_capture in the menu's order; the enum's is focus, click, never. */
 static const char *const k_capture[] = { "click", "focus", "never", NULL };
 
@@ -132,13 +130,6 @@ static void set_filter(const struct enhance_item *it, const char *v) { (void)it;
 static void set_full(const struct enhance_item *it, const char *v) { (void)it; req(e_full, v, NV2A_OPT_FULLSCREEN); }
 static void set_overscan(const struct enhance_item *it, const char *v) { (void)it; req(e_overscan, v, NV2A_OPT_OVERSCAN); }
 static void set_movie(const struct enhance_item *it, const char *v) { (void)it; req(e_movie, v, NV2A_OPT_MOVIE); }
-
-static void set_shader(const struct enhance_item *it, const char *v)
-{
-    (void)it;
-    /* The backend rebuilds its chain at the next present. */
-    nv2a_present_chain_request(v);
-}
 
 static void set_pacing(const struct enhance_item *it, const char *v)
 {
@@ -201,13 +192,6 @@ static const char *get_filter(const struct enhance_item *it, char *b, size_t n)
     int f = nv2a_host_opts()->present_filter;
     (void)it;
     snprintf(b, n, "%s", k_filter[f >= 0 && f <= 2 ? f : 0]);
-    return b;
-}
-
-static const char *get_shader(const struct enhance_item *it, char *b, size_t n)
-{
-    (void)it;
-    nv2a_present_chain_requested(b, n);
     return b;
 }
 
@@ -300,8 +284,6 @@ static const struct enhance_item k_items[] = {
       .def = "0" },
     { ITEM("present.filter", "Scaling filter", "Render", ENHANCE_ITEM_CHOICE),
       .choices = k_filter, .set = set_filter, .get = get_filter, .def = "nearest" },
-    { ITEM("present.shader", "Shader", "Shaders", ENHANCE_ITEM_CHOICE),
-      .choices = k_shader, .set = set_shader, .get = get_shader, .def = "none" },
     { ITEM("present.fullscreen", "Fullscreen", "Render", ENHANCE_ITEM_TOGGLE), .set = set_full,
       .get = get_full, .live = ENHANCE_LIVE_FLUSH, .def = "false" },
     { ITEM("present.pacing", "Frame pacing", "Render", ENHANCE_ITEM_CHOICE),
@@ -793,7 +775,13 @@ enum row_type {
     R_CTL,              /* a mod's captured control: read only until phase D */
     R_MODRESET,         /* "Reset this mod" */
     R_PARAM,            /* a shader parameter: ref indexes s_ptab */
-    R_PRESET            /* "Reset to preset" */
+    R_PRESET,           /* "Reset to preset" */
+    R_PROFILE,          /* the Shaders page's Profile picker */
+    R_STAGE,            /* a chain stage: ref is its index */
+    R_ADD,              /* "Add shader" */
+    R_PICK,             /* a preset in the Add picker: ref indexes s_pick */
+    R_ACT,              /* a profile or stage action: ref is ACT_* */
+    R_NAME              /* "Rename": the text entry */
 };
 enum { TINT_NONE, TINT_BAD, TINT_WARN };
 
@@ -805,6 +793,7 @@ struct row {
     char value[VAL_MAX];
     int tint;           /* an info or text value's colour: TINT_* */
     const char *note;   /* dim words after the label ("while flying"), or NULL */
+    int dim;            /* a row that does nothing now (Add at the limit) */
     char help[160];     /* the footer's text while it is selected */
 };
 
@@ -815,7 +804,7 @@ static int s_sel[PAGE_COUNT];
  * 2026-10-29): no chain presenter, or librashader missing or failing to
  * load (a dll it imports is absent; the log names it). Decided at
  * each open; the reason is said once. A supported build shows it with
- * present.shader none, since the picker lives there. */
+ * the profile Off, since the picker lives there. */
 static int s_shaders_off;
 static int s_shaders_said;
 
@@ -1431,42 +1420,89 @@ static int param_decimals(const struct nv2a_present_param *p)
     return d;
 }
 
-/* The label: the preset's description, the name when it has none. */
-static void param_rows(void)
-{
-    char req[VAL_MAX];
-    int failed;
+/* The page's sub-lists (design D5): the main list, one stage's (0..7), or
+ * the Add picker. A confirm (Remove, Delete) waits on one row; a selection
+ * an action asked for is taken when the rows are built next. */
+#define SH_MAIN (-1)
+#define SH_ADD 99
+enum { ACT_NEW, ACT_DUP, ACT_DEL, ACT_UP, ACT_DOWN, ACT_REMOVE, ACT_RESET_STAGE };
+static int s_sh_sub = SH_MAIN;
+static int s_sh_conf, s_sh_conf_type, s_sh_conf_ref;
+static int s_sh_want, s_sh_want_type, s_sh_want_ref;
+static char s_pick[SHADER_PROFILE_STAGES_MAX + 64][SHADER_PROFILE_REF_MAX];
+static int s_npick;
+static char s_pnote[NV2A_PRESENT_PARAMS_MAX][32];
 
-    nv2a_present_chain_requested(req, sizeof req);
-    failed = strcmp(req, "none") && !nv2a_present_chain_wanted();
-    s_nptab = nv2a_present_chain_params(s_ptab, NV2A_PRESENT_PARAMS_MAX, s_pkey_active,
-                                        sizeof s_pkey_active);
-    if (!strcmp(req, "none")) {
-        info("Parameters", "no shader");
+/* Rename's text entry: the name being edited and the cursor, in bytes. */
+static int s_name_on;
+static char s_name[SHADER_PROFILE_NAME_MAX + 1];
+static int s_name_cur, s_name_dir;
+static uint64_t s_name_next;
+
+static const struct enhance_item k_profile_item = {
+    .label = "Profile", .kind = ENHANCE_ITEM_CHOICE, .live = ENHANCE_LIVE
+};
+
+static void sh_select(int type, int ref)
+{
+    s_sh_want = 1;
+    s_sh_want_type = type;
+    s_sh_want_ref = ref;
+}
+
+static int sh_confirming(int type, int ref)
+{
+    return s_sh_conf && s_sh_conf_type == type && s_sh_conf_ref == ref;
+}
+
+static void sh_reset_state(void)
+{
+    s_sh_sub = SH_MAIN;
+    s_sh_conf = 0;
+    s_sh_want = 0;
+}
+
+/* The edit is modal, as a capture is: the actions fire nothing meanwhile,
+ * so a typed letter never also does what it is bound to. */
+static void name_begin(const char *name)
+{
+    snprintf(s_name, sizeof s_name, "%s", name);
+    s_name_cur = (int)strlen(s_name);
+    s_name_on = 1;
+    s_name_dir = 0;
+    enhance_actions_quiet(1);
+}
+
+static void name_end(void)
+{
+    if (!s_name_on)
         return;
-    }
-    if (failed) {
-        struct row *r = row_add(R_INFO, -1, 0, "Parameters");
-        if (r) {
-            snprintf(r->value, sizeof r->value, "the shader failed to load (see the log)");
-            r->tint = TINT_BAD;
-        }
-        return;
-    }
-    if (!s_pkey_active[0]) {
-        info("Parameters", "loading");
-        return;
-    }
-    if (!s_nptab) {
-        info("Parameters", "none in this preset");
-        return;
-    }
-    header("Parameters");
+    s_name_on = 0;
+    enhance_actions_quiet(0);
+}
+
+/* The parameter rows of the table as the chain published it: every one, or
+ * those stage `only` declares (its sub-list) with the shared note. */
+/* only: a stage's own names, -1 every row, PARAMS_CHAIN the rows no stage
+ * lists (a chain's main page shows them, as no stage's list does). */
+#define PARAMS_CHAIN (-2)
+static void param_list(int only)
+{
+    int nn = 0;
+    const char (*names)[64] = only >= 0 ? shader_edit_stage_names(only, &nn) : NULL;
+    int any = 0;
     for (int i = 0; i < s_nptab; i++) {
         const struct nv2a_present_param *p = &s_ptab[i];
         struct enhance_item *it = &s_pitem[i];
         struct row *r;
         float v = p->initial;
+        int mine = only == -1 || (only == PARAMS_CHAIN && p->stage < 0);
+        for (int k = 0; k < nn && !mine; k++)
+            mine = !strcmp(names[k], p->name);
+        if (!mine)
+            continue;
+        if (!any++)
+            header("Parameters");
         memset(it, 0, sizeof *it);
         it->key = p->name;
         it->label = p->desc[0] ? p->desc : p->name;
@@ -1475,6 +1511,23 @@ static void param_rows(void)
         it->hi = p->max;
         it->step = param_step(p);
         it->live = ENHANCE_LIVE;
+        /* One value per name across the chain (decision 1): the note names
+         * the first other stage that declares it. */
+        s_pnote[i][0] = 0;
+        if (only >= 0 && p->shared) {
+            const struct shader_edit_entry *e = shader_edit_entry(shader_edit_active());
+            for (int t = 0; e && t < e->nstages && !s_pnote[i][0]; t++) {
+                int tn = 0;
+                const char (*tnames)[64] = t == only ? NULL : shader_edit_stage_names(t, &tn);
+                for (int k = 0; k < tn; k++)
+                    if (!strcmp(tnames[k], p->name)) {
+                        snprintf(s_pnote[i], sizeof s_pnote[i], "shared with stage %d", t + 1);
+                        break;
+                    }
+            }
+            if (s_pnote[i][0])
+                it->note = s_pnote[i];
+        }
         r = row_add(R_PARAM, i, 1, it->label);
         if (!r)
             break;
@@ -1485,7 +1538,223 @@ static void param_rows(void)
         snprintf(r->help, sizeof r->help, "%s \xC2\xB7 %g..%g \xC2\xB7 preset %g", p->name,
                  p->min, p->max, p->initial);
     }
-    row_add(R_PRESET, -1, 1, "Reset to preset");
+    if (!any && s_pkey_active[0] && only != PARAMS_CHAIN)
+        info("Parameters", "none in this %s", only >= 0 ? "stage" : "preset");
+}
+
+static struct row *act_row(int act, const char *label, const char *help)
+{
+    struct row *r = row_add(R_ACT, act, 1, label);
+    if (r && help)
+        snprintf(r->help, sizeof r->help, "%s", help);
+    return r;
+}
+
+/* A chain edit an env var refuses: dimmed, the help names the var. */
+static void forced_dim(struct row *r, const char *forced)
+{
+    if (!r || !forced)
+        return;
+    r->dim = 1;
+    snprintf(r->help, sizeof r->help, "Set by %s", forced);
+}
+
+/* A row that asks again, as the Save page's Reset does. */
+static struct row *confirm_row(int type, int ref, const char *label, const char *ask,
+                               const char *help)
+{
+    struct row *r;
+    char l[64];
+    if (sh_confirming(type, ref))
+        snprintf(l, sizeof l, "%s? A / Enter: yes", ask);
+    else
+        snprintf(l, sizeof l, "%s", label);
+    r = row_add(type, ref, 1, l);
+    if (!r)
+        return NULL;
+    if (sh_confirming(type, ref))
+        snprintf(r->value, sizeof r->value, "B / Esc: no");
+    if (help)
+        snprintf(r->help, sizeof r->help, "%s", help);
+    return r;
+}
+
+static void stage_rows(const struct shader_edit_entry *e, int st)
+{
+    char path[1024], err[SHADER_PROFILE_ERR_MAX], ask[64];
+    const char *forced = shader_edit_forced();
+    struct row *r;
+    header(e->stage[st]);
+    info("Preset", "%s", e->stage[st]);
+    r = row_add(R_INFO, -1, 0, "Path");
+    if (r) {
+        if (shader_profile_stage_path(e->stage[st], shader_profile_root(), NULL, path,
+                                      sizeof path, err, sizeof err) > 0) {
+            snprintf(r->value, sizeof r->value, "%s", path);
+        } else {
+            snprintf(r->value, sizeof r->value, "%s", err);
+            r->tint = TINT_BAD;
+        }
+    }
+    if (s_pkey_active[0])
+        param_list(st);
+    header("Stage");
+    r = act_row(ACT_UP, "Move up", st == 0 ? "It is the first stage" : "One place earlier");
+    if (r)
+        r->dim = st == 0;
+    forced_dim(r, forced);
+    r = act_row(ACT_DOWN, "Move down",
+                st == e->nstages - 1 ? "It is the last stage" : "One place later");
+    if (r)
+        r->dim = st == e->nstages - 1;
+    forced_dim(r, forced);
+    snprintf(ask, sizeof ask, "Remove %.40s", e->stage[st]);
+    forced_dim(confirm_row(R_ACT, ACT_REMOVE, "Remove", ask,
+                           e->nstages == 1 ? "The last stage stays: pick Off instead" : NULL),
+               forced);
+    act_row(ACT_RESET_STAGE, "Reset this stage", "The values this stage declares first");
+}
+
+static void add_rows(void)
+{
+    header("Add shader");
+    s_npick = shader_edit_presets(s_pick, (int)(sizeof s_pick / sizeof s_pick[0]));
+    for (int i = 0; i < s_npick; i++) {
+        struct row *r = row_add(R_PICK, i, 1, s_pick[i]);
+        if (r)
+            snprintf(r->help, sizeof r->help, "A adds it as the last stage \xC2\xB7 B back");
+    }
+}
+
+/* The Shaders page (design D5). */
+static void shader_rows(void)
+{
+    const struct shader_edit_entry *e = shader_edit_entry(shader_edit_active());
+    const char *forced = shader_edit_forced();
+    struct shader_profile_compose ci;
+    char ierr[SHADER_PROFILE_ERR_MAX], perr[SHADER_PROFILE_ERR_MAX], req[VAL_MAX], lim[96];
+    int ok, user = e->kind == SHADER_EDIT_USER;
+    struct row *r;
+
+    s_nptab = nv2a_present_chain_params(s_ptab, NV2A_PRESENT_PARAMS_MAX, s_pkey_active,
+                                        sizeof s_pkey_active);
+    if (e->kind == SHADER_EDIT_OFF || e->state != SHADER_PROFILE_OK)
+        s_sh_sub = SH_MAIN;
+    if (s_sh_sub >= e->nstages && s_sh_sub != SH_ADD)
+        s_sh_sub = SH_MAIN;
+    if (s_sh_sub == SH_ADD) {
+        add_rows();
+        return;
+    }
+    if (s_sh_sub >= 0) {
+        stage_rows(e, s_sh_sub);
+        return;
+    }
+    r = row_add(R_PROFILE, -1, 1, "Profile");
+    if (r) {
+        snprintf(r->value, sizeof r->value, "%s", e->name);
+        r->tint = e->state != SHADER_PROFILE_OK ? TINT_BAD : TINT_NONE;
+        if (forced)
+            snprintf(r->help, sizeof r->help, "Set by %s", forced);
+        else
+            snprintf(r->help, sizeof r->help, "Left / Right pick a profile");
+    }
+    if (e->kind == SHADER_EDIT_OFF) {
+        info("Parameters", "no shader");
+        return;
+    }
+    if (e->state != SHADER_PROFILE_OK) {
+        r = row_add(R_HEADER, -1, 0, "Chain");
+        if (r) {
+            snprintf(r->value, sizeof r->value, "%s", e->err);
+            r->tint = TINT_BAD;
+        }
+        if (user)
+            forced_dim(confirm_row(R_ACT, ACT_DEL, "Delete", "Delete this profile",
+                                   "Removes the file now, not at Save"),
+                       forced);
+        return;
+    }
+    /* The header says why the chain shows stock, else how far it got. */
+    ok = shader_edit_info(&ci, ierr, sizeof ierr);
+    nv2a_present_chain_requested(req, sizeof req);
+    r = row_add(R_HEADER, -1, 0, "Chain");
+    if (r) {
+        if (nv2a_present_chain_profile_error_get(perr, sizeof perr)) {
+            snprintf(r->value, sizeof r->value, "%s", perr);
+            r->tint = TINT_BAD;
+        } else if (!ok && ierr[0]) {
+            snprintf(r->value, sizeof r->value, "%s", ierr);
+            r->tint = TINT_BAD;
+        } else if (strcmp(req, "none") && !nv2a_present_chain_wanted()) {
+            snprintf(r->value, sizeof r->value, "the shader failed to load (see the log)");
+            r->tint = TINT_BAD;
+        } else if (!s_pkey_active[0]) {
+            snprintf(r->value, sizeof r->value, "building");
+        } else if (ok) {
+            snprintf(r->value, sizeof r->value, "%d pass%s", ci.passes,
+                     ci.passes == 1 ? "" : "es");
+        }
+    }
+    for (int st = 0; st < e->nstages; st++) {
+        char l[64], ask[64];
+        snprintf(l, sizeof l, "%d  %.56s", st + 1, e->stage[st]);
+        snprintf(ask, sizeof ask, "Remove %.40s", e->stage[st]);
+        if (sh_confirming(R_STAGE, st)) {
+            confirm_row(R_STAGE, st, l, ask, NULL);
+            continue;
+        }
+        r = row_add(R_STAGE, st, 1, l);
+        if (!r)
+            break;
+        if (shader_edit_stage_missing(st)) {
+            snprintf(r->value, sizeof r->value, "missing");
+            r->tint = TINT_BAD;
+        }
+        if (ok && (ci.stage[st].flags & SHADER_PROFILE_ORIGINAL))
+            r->note = "reads the game frame";
+        else if (ok && (ci.stage[st].flags & SHADER_PROFILE_SCALED))
+            r->note = "sees the scaled picture";
+        if (forced)
+            snprintf(r->help, sizeof r->help, "A options \xC2\xB7 Set by %s", forced);
+        else
+            snprintf(r->help, sizeof r->help, "%s",
+                     e->nstages == 1
+                         ? "A options \xC2\xB7 X remove"
+                         : "A options \xC2\xB7 Left / Right move it \xC2\xB7 X remove");
+    }
+    r = row_add(R_ADD, -1, 1, "Add shader");
+    if (r) {
+        r->dim = shader_edit_add_full(lim, sizeof lim);
+        snprintf(r->help, sizeof r->help, "%s", r->dim ? lim : "A picks a preset to add");
+    }
+    if (s_pkey_active[0])
+        param_list(e->nstages == 1 ? -1 : PARAMS_CHAIN);
+    header("Actions");
+    forced_dim(act_row(ACT_NEW, "Save as new", "A copy of this chain and its values, as Profile N"),
+               forced);
+    if (user) {
+        r = row_add(R_NAME, -1, 1, "Rename");
+        if (r) {
+            if (s_name_on) {
+                snprintf(r->value, sizeof r->value, "%.*s|%s", s_name_cur, s_name,
+                         s_name + s_name_cur);
+                r->tint = TINT_WARN;
+            } else {
+                snprintf(r->value, sizeof r->value, "%s", e->name);
+            }
+            snprintf(r->help, sizeof r->help, "A types a new name");
+        }
+        forced_dim(r, forced);
+    }
+    forced_dim(act_row(ACT_DUP, "Duplicate", "As Save as new, named \"<name> copy\""), forced);
+    if (user)
+        forced_dim(confirm_row(R_ACT, ACT_DEL, "Delete", "Delete this profile",
+                               "Removes the file now, not at Save"),
+                   forced);
+    r = row_add(R_PRESET, -1, 1, "Reset to preset");
+    if (r)
+        snprintf(r->help, sizeof r->help, "Every stage's values back to the presets'");
 }
 
 /* Left and right by a step, snapped to the step's grid from the minimum so
@@ -1556,7 +1825,7 @@ static void build_rows(void)
     }
     case PAGE_SHADERS:
         slot_rows(PAGE_SHADERS, -1);
-        param_rows();
+        shader_rows();
         break;
     case PAGE_GAME:
         slot_rows(PAGE_GAME, -1);
@@ -1670,6 +1939,14 @@ static void build_rows(void)
     /* The selection on a selectable row, the first one when it is gone. */
     {
         int *sel = &s_sel[s_page];
+        if (s_page == PAGE_SHADERS && s_sh_want) {
+            s_sh_want = 0;
+            for (int i = 0; i < s_nrow; i++)
+                if (s_row[i].type == s_sh_want_type && s_row[i].ref == s_sh_want_ref) {
+                    *sel = i;
+                    break;
+                }
+        }
         if (*sel >= s_nrow)
             *sel = s_nrow - 1;
         if (*sel < 0)
@@ -1690,8 +1967,9 @@ static void build_rows(void)
 /* + 2 * REWRITES_MAX: each user-file alias the mods read is written once
  * under its current key, the alias removed (D4). */
 #define REWRITES_MAX 64
+/* + 2: the profile choice, present.profile and present.shader (D5). */
 #define PENDING_MAX (SLOTS_MAX + ENHANCE_ACTIONS_MAX + MODS_MAX + 2 * REWRITES_MAX \
-                     + NV2A_PRESENT_OVERRIDES_MAX)
+                     + NV2A_PRESENT_OVERRIDES_MAX + 2)
 static char s_pkey[PENDING_MAX][96];
 static char s_pval[PENDING_MAX][VAL_MAX * 4];
 static int s_pnull[PENDING_MAX];
@@ -1873,6 +2151,15 @@ static int collect(void)
         float_literal(v, s_pval[n], sizeof s_pval[n]);
         s_pnull[n++] = !has;
     }
+    {
+        const char *ck[2], *cv[2];
+        int k = shader_edit_config(ck, cv, 2);
+        for (int i = 0; i < k && n < PENDING_MAX; i++, n++) {
+            snprintf(s_pkey[n], sizeof s_pkey[n], "%s", ck[i]);
+            snprintf(s_pval[n], sizeof s_pval[n], "%s", cv[i] ? cv[i] : "");
+            s_pnull[n] = !cv[i];
+        }
+    }
     s_rw_staged = 0;
     if (!s_rw_done)
         n = rewrites(n);
@@ -1897,7 +2184,7 @@ int enhance_menu_unsaved(void)
             n++;
     for (int id = 0; id < ENHANCE_ACTIONS_MAX; id++)
         n += s_adirty[id] != 0;
-    return n + nv2a_present_chain_overrides_dirty();
+    return n + nv2a_present_chain_overrides_dirty() + shader_edit_unsaved();
 }
 
 /* Every missing directory above `path`, outermost first: a user config
@@ -1939,14 +2226,24 @@ static void save(void)
     char err[2048];
     /* The status counts what the player changed; the renamed keys D4
      * writes along are named apart, since the player made none of them. */
-    int edits = enhance_menu_unsaved(), n, rc, renamed;
+    int edits = enhance_menu_unsaved(), n, rc, renamed, wrote;
     if (!path) {
         status("Save is off (RECOMP_CONFIG=none)");
         return;
     }
+    /* The profiles first: the config may name one that has no file yet. */
+    wrote = shader_edit_save(err, sizeof err);
+    if (wrote < 0) {
+        status("Save failed: %s", err);
+        fprintf(stderr, LOGP "menu: saving a shader profile failed: %s\n", err);
+        return;
+    }
     n = enhance_menu_pending(keys, vals, (int)(sizeof keys / sizeof keys[0]));
     if (!n) {
-        status("Nothing to save");
+        if (wrote)
+            status("Saved %d change%s", edits, edits == 1 ? "" : "s");
+        else
+            status("Nothing to save");
         return;
     }
     renamed = s_rw_staged;
@@ -1964,6 +2261,7 @@ static void save(void)
         memcpy(s_slot[i].base, s_slot[i].cur, sizeof s_slot[i].base);
     memset(s_adirty, 0, sizeof s_adirty);
     nv2a_present_chain_overrides_saved();
+    shader_edit_config_saved();
     s_rw_done = 1;
     if (rc > 0) {
         fprintf(stderr, LOGP "menu: saved to %s, %d key%s left out: %s\n", path, rc,
@@ -2014,6 +2312,9 @@ static void reset_all(void)
 {
     reset_scope(-1);
     nv2a_present_chain_params_reset(NULL);
+    /* The picker to Off; the profile files stay (D5). */
+    shader_edit_reset_defaults();
+    sh_reset_state();
     status("Reset to defaults; Save keeps it");
 }
 
@@ -2055,6 +2356,11 @@ int enhance_menu_open(uint64_t now_ms)
     s_state = ST_OPEN;
     s_confirm = 0;
     cap_phase(CAP_OFF);
+    name_end();
+    sh_reset_state();
+    /* The profiles folder is read when the page shows, never before. */
+    if (s_page == PAGE_SHADERS)
+        shader_edit_refresh();
     /* One new number for the released pad, far from the real sequence: a
      * pad that changed once while the menu was open would otherwise come
      * back on this same number, and a title that skips a repeated number
@@ -2074,6 +2380,7 @@ void enhance_menu_close(void)
     s_state = ST_CLOSING;
     s_close_t = s_now;
     cap_phase(CAP_OFF);
+    name_end();
     s_confirm = 0;
     snapshot_use(0);
     stats_page_use();
@@ -2095,6 +2402,10 @@ static void page_to(int p)
     s_page = p;
     s_mod_sub = -1;
     s_confirm = 0;
+    name_end();
+    sh_reset_state();
+    if (p == PAGE_SHADERS)
+        shader_edit_refresh();
     stats_page_use();
 }
 
@@ -2171,6 +2482,171 @@ static void clear_binding(int id)
     status("%s: unbound", enhance_action_label(id));
 }
 
+/* After a chain edit: a bundled preset or a path forked into a profile
+ * of its own, which the status names; a refusal says why. */
+static void sh_after(int rc, int kind_before, const char *msg)
+{
+    const struct shader_edit_entry *e = shader_edit_entry(shader_edit_active());
+    if (rc < 0) {
+        if (msg[0])
+            status("%s", msg);
+        return;
+    }
+    if (kind_before != SHADER_EDIT_USER && e && e->kind == SHADER_EDIT_USER)
+        status("Now editing %s; Save writes it", e->name);
+}
+
+static void sh_action(int act, int stage)
+{
+    const struct shader_edit_entry *e = shader_edit_entry(shader_edit_active());
+    int kind = e ? e->kind : SHADER_EDIT_OFF, rc;
+    char msg[SHADER_PROFILE_ERR_MAX * 2];
+    msg[0] = 0;
+    switch (act) {
+    case ACT_NEW:
+    case ACT_DUP:
+        rc = shader_edit_new(act == ACT_DUP, msg, sizeof msg);
+        if (rc < 0 && msg[0]) {
+            status("%s", msg);
+        } else if (rc >= 0) {
+            e = shader_edit_entry(shader_edit_active());
+            status("%s: new, Save writes it", e->name);
+            sh_select(R_PROFILE, -1);
+        }
+        break;
+    case ACT_DEL:
+        shader_edit_delete(msg, sizeof msg);
+        if (msg[0])
+            status("%s", msg);
+        sh_select(R_PROFILE, -1);
+        break;
+    case ACT_UP:
+    case ACT_DOWN:
+        rc = shader_edit_move(stage, act == ACT_UP ? -1 : 1, msg, sizeof msg);
+        sh_after(rc, kind, msg);
+        if (rc >= 0) {
+            int to = stage + (act == ACT_UP ? -1 : 1);
+            e = shader_edit_entry(shader_edit_active());
+            if (to >= 0 && to < e->nstages)
+                s_sh_sub = to;
+        }
+        break;
+    case ACT_REMOVE:
+        rc = shader_edit_remove(stage, msg, sizeof msg);
+        sh_after(rc, kind, msg);
+        if (rc >= 0) {
+            e = shader_edit_entry(shader_edit_active());
+            s_sh_sub = SH_MAIN;
+            sh_select(R_STAGE, stage < e->nstages ? stage : e->nstages - 1);
+            if (kind == SHADER_EDIT_USER)
+                status("Stage removed; Save keeps it");
+        }
+        break;
+    case ACT_RESET_STAGE:
+        shader_edit_reset_stage(stage);
+        status("%s: preset values; Save keeps it", e->stage[stage]);
+        break;
+    default:
+        break;
+    }
+}
+
+/* One Shaders page row's Left, Right or OK: 1 when it was one. */
+static int sh_event(const struct row *r, int dir, int ok)
+{
+    const struct shader_edit_entry *e = shader_edit_entry(shader_edit_active());
+    char msg[SHADER_PROFILE_ERR_MAX * 2];
+    int kind = e->kind, rc;
+    msg[0] = 0;
+    switch (r->type) {
+    case R_PROFILE:
+        if (shader_edit_step(dir, msg, sizeof msg) < 0 && msg[0])
+            status("%s", msg);
+        sh_reset_state();
+        return 1;
+    case R_STAGE:
+        if (ok && sh_confirming(R_STAGE, r->ref)) {
+            s_sh_conf = 0;
+            sh_action(ACT_REMOVE, r->ref);
+        } else if (ok) {
+            s_sh_sub = r->ref;
+            s_sel[PAGE_SHADERS] = 0;
+            s_scroll[PAGE_SHADERS] = 0;
+        } else {
+            int to = r->ref + dir;
+            if (to < 0 || to >= e->nstages)
+                return 1;
+            rc = shader_edit_move(r->ref, dir, msg, sizeof msg);
+            sh_after(rc, kind, msg);
+            if (rc >= 0)
+                sh_select(R_STAGE, to);
+        }
+        return 1;
+    case R_ADD:
+        if (!ok)
+            return 1;
+        if (shader_edit_add_full(msg, sizeof msg)) {
+            status("%s", msg);
+            return 1;
+        }
+        s_sh_sub = SH_ADD;
+        s_sel[PAGE_SHADERS] = 0;
+        s_scroll[PAGE_SHADERS] = 0;
+        return 1;
+    case R_PICK:
+        if (!ok || r->ref < 0 || r->ref >= s_npick)
+            return 1;
+        rc = shader_edit_add(s_pick[r->ref], msg, sizeof msg);
+        sh_after(rc, kind, msg);
+        if (rc >= 0) {
+            e = shader_edit_entry(shader_edit_active());
+            s_sh_sub = SH_MAIN;
+            sh_select(R_STAGE, e->nstages - 1);
+            if (kind == SHADER_EDIT_USER)
+                status("%s added; Save keeps it", s_pick[r->ref]);
+        }
+        return 1;
+    case R_ACT:
+        if (!ok)
+            return 1;
+        if (r->dim) {
+            /* The help names the var; the status repeats it at the press. */
+            if (shader_edit_forced())
+                status("Set by %s", shader_edit_forced());
+            return 1;
+        }
+        if (r->ref == ACT_DEL || r->ref == ACT_REMOVE) {
+            if (!sh_confirming(R_ACT, r->ref)) {
+                if (r->ref == ACT_REMOVE && e->nstages <= 1) {
+                    status("The last stage stays: pick Off instead");
+                    return 1;
+                }
+                s_sh_conf = 1;
+                s_sh_conf_type = R_ACT;
+                s_sh_conf_ref = r->ref;
+                return 1;
+            }
+            s_sh_conf = 0;
+        }
+        sh_action(r->ref, s_sh_sub);
+        return 1;
+    case R_NAME:
+        if (ok && shader_edit_forced())
+            status("Set by %s", shader_edit_forced());
+        else if (ok)
+            name_begin(e->name);
+        return 1;
+    case R_PRESET:
+        if (ok) {
+            shader_edit_reset_values();
+            status("%s: preset values; Save keeps it", e->name);
+        }
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
 {
     struct row *r;
@@ -2187,6 +2663,11 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
         if (ev == ENHANCE_EV_BACK)
             return 1;
     }
+    if (s_sh_conf && !(r && sh_confirming(r->type, r->ref) && ev == ENHANCE_EV_OK)) {
+        s_sh_conf = 0;
+        if (ev == ENHANCE_EV_BACK)
+            return 1;
+    }
     switch (ev) {
     case ENHANCE_EV_UP: move_sel(-1); break;
     case ENHANCE_EV_DOWN: move_sel(1); break;
@@ -2195,7 +2676,14 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
     case ENHANCE_EV_SAVE: save(); break;
     case ENHANCE_EV_CLOSE: enhance_menu_close(); break;
     case ENHANCE_EV_BACK:
-        if (s_mod_sub >= 0) {
+        if (s_page == PAGE_SHADERS && s_sh_sub != SH_MAIN) {
+            /* Back to the row the sub-list opened from. */
+            if (s_sh_sub == SH_ADD)
+                sh_select(R_ADD, -1);
+            else
+                sh_select(R_STAGE, s_sh_sub);
+            s_sh_sub = SH_MAIN;
+        } else if (s_mod_sub >= 0) {
             s_sel[PAGE_MODS] = s_mod_sub;
             s_mod_sub = -1;
         } else {
@@ -2205,12 +2693,26 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
     case ENHANCE_EV_CLEAR:
         if (r && r->type == R_BIND)
             clear_binding(r->ref);
+        if (r && r->type == R_STAGE) {
+            const struct shader_edit_entry *e = shader_edit_entry(shader_edit_active());
+            if (shader_edit_forced()) {
+                status("Set by %s", shader_edit_forced());
+            } else if (e->nstages <= 1) {
+                status("The last stage stays: pick Off instead");
+            } else {
+                s_sh_conf = 1;
+                s_sh_conf_type = R_STAGE;
+                s_sh_conf_ref = r->ref;
+            }
+        }
         break;
     case ENHANCE_EV_LEFT:
     case ENHANCE_EV_RIGHT:
     case ENHANCE_EV_OK: {
         int dir = ev == ENHANCE_EV_LEFT ? -1 : 1, ok = ev == ENHANCE_EV_OK;
         if (!r)
+            break;
+        if (sh_event(r, dir, ok))
             break;
         switch (r->type) {
         case R_SLOT:
@@ -2241,12 +2743,6 @@ int enhance_menu_event(enum enhance_menu_event ev, uint64_t now_ms)
             break;
         case R_PARAM:
             change_param(r->ref, dir, ok);
-            break;
-        case R_PRESET:
-            if (ok) {
-                nv2a_present_chain_params_reset(s_pkey_active);
-                status("%s: preset values; Save keeps it", s_pkey_active);
-            }
             break;
         case R_MODRESET:
             if (ok) {
@@ -2510,6 +3006,162 @@ static void keys_latch(void)
         s_kprev[vk] = xbox_FramebufferKeyDown(vk) != 0;
 }
 
+/* ---- the name editor -------------------------------------------------------
+ * Rename types into s_name: the keyboard as a US layout (the menu reads
+ * virtual keys, not text), the pad by cycling the character under the
+ * cursor. Enter or A keeps it, Esc or B drops it. */
+
+static const char k_name_cycle[] =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 -_";
+
+static void name_insert(char c)
+{
+    size_t len = strlen(s_name);
+    if (len >= SHADER_PROFILE_NAME_MAX)
+        return;
+    memmove(s_name + s_name_cur + 1, s_name + s_name_cur, len - (size_t)s_name_cur + 1);
+    s_name[s_name_cur++] = c;
+}
+
+/* The UTF-8 character before or at the cursor: its start and length. */
+static int name_prev(int at)
+{
+    if (at <= 0)
+        return 0;
+    at--;
+    while (at > 0 && ((unsigned char)s_name[at] & 0xC0) == 0x80)
+        at--;
+    return at;
+}
+
+static int name_next(int at)
+{
+    int len = (int)strlen(s_name);
+    if (at >= len)
+        return len;
+    at++;
+    while (at < len && ((unsigned char)s_name[at] & 0xC0) == 0x80)
+        at++;
+    return at;
+}
+
+static void name_cut(int from, int to)
+{
+    if (to <= from)
+        return;
+    memmove(s_name + from, s_name + to, strlen(s_name + to) + 1);
+    s_name_cur = from;
+}
+
+static void name_cycle(int dir)
+{
+    const int n = (int)sizeof k_name_cycle - 1;
+    char c = s_name[s_name_cur];
+    const char *p = c ? strchr(k_name_cycle, c) : NULL;
+    if (!c) {
+        name_insert(dir > 0 ? 'A' : '_');
+        s_name_cur--;
+        return;
+    }
+    if (!p || ((unsigned char)c & 0x80)) {
+        /* Not in the cycle (a non-ASCII character): it becomes the first. */
+        name_cut(s_name_cur, name_next(s_name_cur));
+        name_insert(k_name_cycle[0]);
+        s_name_cur--;
+        return;
+    }
+    s_name[s_name_cur] = k_name_cycle[((int)(p - k_name_cycle) + dir + n) % n];
+}
+
+static void name_keep(void)
+{
+    char msg[SHADER_PROFILE_ERR_MAX * 2];
+    msg[0] = 0;
+    if (shader_edit_rename(s_name, msg, sizeof msg) < 0) {
+        status("%s", msg[0] ? msg : "That name is refused");
+        return;
+    }
+    name_end();
+    status("Renamed to %s; Save writes it", s_name);
+}
+
+/* One step of the name editor: 1 while it owns the input. */
+static int name_step(uint32_t held, uint32_t press, uint64_t now)
+{
+    int shift = xbox_FramebufferKeyDown(XBOX_VK_SHIFT) != 0, dir = 0;
+    if (!s_name_on)
+        return 0;
+    if (key_edge(0x1B) || (press & (1u << INPUT_SRC_EAST))) {
+        s_kbd = key_edge(0x1B);
+        name_end();
+        status("Rename cancelled");
+        return 1;
+    }
+    if (key_edge(0x0D) || (press & (1u << INPUT_SRC_SOUTH))) {
+        s_kbd = key_edge(0x0D);
+        name_keep();
+        return 1;
+    }
+    if (key_edge(0x08)) {
+        name_cut(name_prev(s_name_cur), s_name_cur);
+        s_kbd = 1;
+    }
+    if (key_edge(0x2E) || (press & (1u << INPUT_SRC_WEST))) {
+        s_kbd = key_edge(0x2E);
+        name_cut(s_name_cur, name_next(s_name_cur));
+    }
+    for (int vk = 'A'; vk <= 'Z'; vk++)
+        if (key_edge(vk)) {
+            name_insert((char)(shift ? vk : vk - 'A' + 'a'));
+            s_kbd = 1;
+        }
+    for (int vk = '0'; vk <= '9'; vk++)
+        if (key_edge(vk)) {
+            name_insert(shift && vk == '9' ? '(' : shift && vk == '0' ? ')' : (char)vk);
+            s_kbd = 1;
+        }
+    for (int vk = 0x60; vk <= 0x69; vk++)   /* the numpad digits */
+        if (key_edge(vk)) {
+            name_insert((char)('0' + vk - 0x60));
+            s_kbd = 1;
+        }
+    {
+        static const struct { int vk; char c, sc; } k_punct[] = {
+            { 0x20, ' ', ' ' }, { 0xBD, '-', '_' }, { 0xBE, '.', '.' },
+            { 0x6D, '-', '-' }, { 0x6E, '.', '.' },
+        };
+        for (unsigned i = 0; i < sizeof k_punct / sizeof k_punct[0]; i++)
+            if (key_edge(k_punct[i].vk)) {
+                name_insert(shift ? k_punct[i].sc : k_punct[i].c);
+                s_kbd = 1;
+            }
+    }
+    /* Directions repeat as on the rows; the menu's own s_dir follows them
+     * so nothing fires when the editor lets go. */
+    if ((held & k_up) || xbox_FramebufferKeyDown(0x26))
+        dir = ENHANCE_EV_UP;
+    else if ((held & k_down) || xbox_FramebufferKeyDown(0x28))
+        dir = ENHANCE_EV_DOWN;
+    else if ((held & k_left) || xbox_FramebufferKeyDown(0x25))
+        dir = ENHANCE_EV_LEFT;
+    else if ((held & k_right) || xbox_FramebufferKeyDown(0x27))
+        dir = ENHANCE_EV_RIGHT;
+    if (dir != s_name_dir || (dir && now >= s_name_next)) {
+        s_name_next = now + (dir != s_name_dir ? REPEAT_FIRST : REPEAT_NEXT);
+        s_name_dir = dir;
+        switch (dir) {
+        case ENHANCE_EV_UP: name_cycle(1); break;
+        case ENHANCE_EV_DOWN: name_cycle(-1); break;
+        case ENHANCE_EV_LEFT: s_name_cur = name_prev(s_name_cur); break;
+        case ENHANCE_EV_RIGHT: s_name_cur = name_next(s_name_cur); break;
+        default: break;
+        }
+    }
+    s_dir = dir;
+    s_dir_next = now + REPEAT_FIRST;
+    return 1;
+}
+
 static void input_step(uint64_t now)
 {
     uint32_t held = 0, press;
@@ -2521,7 +3173,7 @@ static void input_step(uint64_t now)
             s_extra_t[src] = now ? now : 1;
     press = held & ~s_prev_held;
 
-    if (capture_step(held, now)) {
+    if (capture_step(held, now) || name_step(held, press, now)) {
         s_need_draw = 1;
         s_prev_held = held;
         keys_latch();
@@ -2642,8 +3294,10 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
     int pad = nv2a_ovl_px(s, t->pad), th = nv2a_ovl_text_height(fb);
     int ty = r.y + (r.h - th) / 2, x = r.x + pad, right = r.x + r.w - pad;
     const struct slot *sl = rw->type == R_SLOT ? &s_slot[rw->ref] : NULL;
-    const struct enhance_item *it = sl ? sl->it : rw->type == R_PARAM ? &s_pitem[rw->ref] : NULL;
-    int ro = sl && sl->env;
+    const struct enhance_item *it = sl ? sl->it : rw->type == R_PARAM ? &s_pitem[rw->ref]
+                                  : rw->type == R_PROFILE ? &k_profile_item : NULL;
+    const char *envname = sl ? sl->envname : rw->type == R_PROFILE ? shader_edit_forced() : NULL;
+    int ro = (sl && sl->env) || (rw->type == R_PROFILE && envname);
     mu_Color tint = rw->tint == TINT_BAD ? t->bad : rw->tint == TINT_WARN ? t->warn : t->text_dim;
     char cut[VAL_MAX * 2], forced[96], uv[VAL_MAX + 32];
     const char *v, *unit = NULL;
@@ -2656,9 +3310,14 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
     if (rw->type == R_HEADER) {
         int hs = nv2a_ovl_text_height(fs), hy = r.y + r.h - hs - nv2a_ovl_px(s, 4);
         mu_draw_text(ctx, fs, rw->label, -1, mu_vec2(x, hy), t->accent);
-        if (rw->value[0])
-            mu_draw_text(ctx, fs, rw->value, -1, mu_vec2(right - text_w(fs, rw->value), hy),
-                         t->text_dim);
+        /* Cut to the room the label leaves: the Chain header's error holds
+         * a path, and drawn whole it ran over the label and out of the
+         * panel. */
+        if (rw->value[0]) {
+            v = fit(fs, rw->value, right - x - text_w(fs, rw->label) - nv2a_ovl_px(s, 12), cut,
+                    sizeof cut);
+            mu_draw_text(ctx, fs, v, -1, mu_vec2(right - text_w(fs, v), hy), tint);
+        }
         return;
     }
     if (rw->type == R_TEXT) {
@@ -2675,13 +3334,13 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
     }
     /* The label, then its class: a dot for a change that shows now, words
      * for one that waits. */
-    mu_draw_text(ctx, fb, rw->label, -1, mu_vec2(x, ty), ro ? t->text_dim : t->text);
+    mu_draw_text(ctx, fb, rw->label, -1, mu_vec2(x, ty), ro || rw->dim ? t->text_dim : t->text);
     x += text_w(fb, rw->label) + nv2a_ovl_px(s, 8);
     if (it && it->kind != ENHANCE_ITEM_INFO) {
         int fsh = nv2a_ovl_text_height(fs), fy = r.y + (r.h - fsh) / 2;
         if (ro) {
-            if (sl->envname)
-                snprintf(forced, sizeof forced, "set by %s", sl->envname);
+            if (envname)
+                snprintf(forced, sizeof forced, "set by %s", envname);
             else
                 snprintf(forced, sizeof forced, "(environment)");
             mu_draw_text(ctx, fs, forced, -1, mu_vec2(x, fy), t->text_dim);
@@ -2754,7 +3413,7 @@ static void draw_row(mu_Context *ctx, const struct row *rw, mu_Rect r, int selec
         int vw = text_w(fb, uv);
         mu_draw_text(ctx, fb, ">", -1, mu_vec2(right - aw, ty), t->text_dim);
         mu_draw_text(ctx, fb, uv, -1, mu_vec2(right - aw - sp - vw, ty),
-                     ro ? t->text_dim : t->text);
+                     ro ? t->text_dim : rw->tint ? tint : t->text);
         mu_draw_text(ctx, fb, "<", -1, mu_vec2(right - 2 * aw - 2 * sp - vw, ty), t->text_dim);
         return;
     }
@@ -2855,6 +3514,12 @@ void enhance_menu_draw(uint64_t now_ms)
                 continue;
             mu_draw_text(ctx, fb, s_page_name[p], -1, mu_vec2(xx, y),
                          p == s_page ? t->text : t->text_dim);
+            /* The chosen profile has edits Save has not written. */
+            if (p == PAGE_SHADERS && shader_edit_dirty(shader_edit_active())) {
+                int d = nv2a_ovl_px(s, 5);
+                nv2a_ovl_ui_rrect(ctx, mu_rect(xx + tw[p] + nv2a_ovl_px(s, 3), y, d, d), d / 2,
+                                  1.0f, t->warn);
+            }
             if (p == s_page)
                 mu_draw_rect(ctx, mu_rect(xx, y + tabh + nv2a_ovl_px(s, 2), tw[p], nv2a_ovl_px(s, 3)),
                              t->accent);
@@ -2908,12 +3573,16 @@ void enhance_menu_draw(uint64_t now_ms)
                         : cur && cur->type == R_MOD
                             ? live_tag(xbox_mod_has_on_enable(cur->ref) ? ENHANCE_LIVE
                                                                        : ENHANCE_LIVE_RESTART)
-                        : cur && (cur->type == R_BIND || cur->type == R_PARAM) ? "live" : "";
+                        : cur && (cur->type == R_BIND || cur->type == R_PARAM
+                                  || cur->type == R_PROFILE || cur->type == R_STAGE) ? "live" : "";
         /* The selected row's help stands in for the controls while no
          * status shows (D5): the status line still wins. */
         int news = s_status[0] && s_status_t && now_ms - s_status_t < STATUS_MS;
         if (cur && cur->sel && cur->help[0] && !news)
             hint = cur->help;
+        if (s_name_on)
+            hint = s_kbd ? "Type a name \xC2\xB7 Enter keep \xC2\xB7 Esc cancel"
+                         : "Up/Down letter \xC2\xB7 Left/Right move \xC2\xB7 X delete \xC2\xB7 A keep \xC2\xB7 B cancel";
         if (news)
             snprintf(right, sizeof right, "%s", s_status);
         else if (un)
@@ -3103,7 +3772,8 @@ int enhance_menu_row(int i, char *label, size_t ln, char *value, size_t vn, int 
 
 int enhance_menu_row_live(int i)
 {
-    if (i >= 0 && i < s_nrow && s_row[i].type == R_PARAM)
+    if (i >= 0 && i < s_nrow && (s_row[i].type == R_PARAM || s_row[i].type == R_PROFILE
+                                 || s_row[i].type == R_STAGE))
         return ENHANCE_LIVE;
     if (i < 0 || i >= s_nrow || s_row[i].type != R_SLOT)
         return -1;
@@ -3142,6 +3812,10 @@ void enhance_menu_reset_for_test(void)
     memset(s_scroll, 0, sizeof s_scroll);
     s_mod_sub = -1;
     s_confirm = 0;
+    shader_edit_reset_for_test();
+    sh_reset_state();
+    s_name_on = 0;
+    s_npick = 0;
     s_status[0] = 0;
     s_status_t = s_now = 0;
     s_nrow = 0;

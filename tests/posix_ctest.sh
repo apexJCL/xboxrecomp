@@ -63,6 +63,9 @@ build_one() {
     # defaults ON. apu_dsp_link fills the cache before the parallel
     # phase, which then only reads it (its stamp matches).
     set -- "$@" "-DXBOXRECOMP_DSP56300_CACHE=$B/_deps/dsp56300"
+    # The same for the librashader release: present_chain_lrs is the one
+    # suite project that fetches it for this host.
+    set -- "$@" "-DXBOXRECOMP_LIBRASHADER_CACHE=$B/_deps/librashader"
     if ! cmake -S "$d" -B "$B/$t" ${gen[@]+"${gen[@]}"} -DCMAKE_BUILD_TYPE=Release "$@" \
             >"$log" 2>&1; then
         # n/a only when the one error is the harness's own refusal: an error

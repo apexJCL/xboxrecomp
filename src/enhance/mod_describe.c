@@ -19,6 +19,7 @@
 #include "enhance_menu.h"
 #include "nv2a_present_chain.h"
 #include "recomp_env.h"
+#include "shader_profile.h"
 
 #define LOGP "[MOD] "
 
@@ -333,12 +334,73 @@ static int shader_preset(FILE *f, int *any, const char *request)
     return 1;
 }
 
+static void profile(FILE *f, int *any, const char *name, const char *slug, const char *file,
+                    int nstages, const char (*stage)[SHADER_PROFILE_REF_MAX], int builtin,
+                    int state)
+{
+    int first = 1;
+    fputs(*any ? ",\n    {" : "\n    {", f);
+    *any = 1;
+    jkey(f, &first, "name");
+    jstr(f, name);
+    jkey(f, &first, "slug");
+    jstr(f, slug);
+    jkey(f, &first, "file");
+    jstr(f, file);
+    jkey(f, &first, "stages");
+    fputc('[', f);
+    for (int s = 0; s < nstages; s++) {
+        if (s)
+            fputs(", ", f);
+        jstr(f, stage[s]);
+    }
+    fputc(']', f);
+    jkey(f, &first, "builtin");
+    fputs(builtin ? "true" : "false", f);
+    jkey(f, &first, "state");
+    jstr(f, state == SHADER_PROFILE_OK ? "ok" : state == SHADER_PROFILE_NEWER ? "newer" : "broken");
+    fputc('}', f);
+}
+
+/* "profiles" (design D5): each bundled preset the library read (have[i])
+ * as a one-stage profile, then the profile files in the folder;
+ * "active_profile" is the one the start chose ("none" when it chose none). */
+static void profiles(FILE *f, const unsigned char *have)
+{
+    static struct shader_profile_entry l[SHADER_PROFILE_LIST_MAX];
+    char slug[SHADER_PROFILE_REF_MAX], dir[1024], file[SHADER_PROFILE_NAME_MAX + 8];
+    char one[1][SHADER_PROFILE_REF_MAX];
+    int any = 0, n = 0;
+
+    if (!shader_profile_start_slug(slug, sizeof slug))
+        snprintf(slug, sizeof slug, "none");
+    fputs(", \"active_profile\": ", f);
+    jstr(f, slug);
+    fputs(", \"profiles\": [", f);
+    for (int i = 0; nv2a_present_chain_names[i]; i++) {
+        if (i >= 64 || !have[i])
+            continue;
+        snprintf(one[0], sizeof one[0], "%s", nv2a_present_chain_names[i]);
+        profile(f, &any, one[0], one[0], "", 1, (const char (*)[SHADER_PROFILE_REF_MAX])one, 1,
+                SHADER_PROFILE_OK);
+    }
+    if (shader_profile_dir(dir, sizeof dir))
+        n = shader_profile_list(dir, l, SHADER_PROFILE_LIST_MAX);
+    for (int i = 0; i < n; i++) {
+        snprintf(file, sizeof file, "%s.toml", l[i].slug);
+        profile(f, &any, l[i].name, l[i].slug, file, l[i].nstages,
+                (const char (*)[SHADER_PROFILE_REF_MAX])l[i].stage, 0, l[i].state);
+    }
+    fputs(any ? "\n  ]" : "]", f);
+}
+
 /* "shaders": the request in force and every bundled preset's parameters,
- * plus the requested one when it is a path. Without the library the list
- * is empty: a reader shows no Shaders settings. */
+ * plus the requested one when it is a path, then the profiles. Without the
+ * library the preset list is empty: a reader shows no Shaders settings. */
 static void shaders(FILE *f)
 {
     char req[512];
+    unsigned char have[64] = { 0 };
     int any = 0, bundled = 0;
 
     nv2a_present_chain_requested(req, sizeof req);
@@ -346,12 +408,16 @@ static void shaders(FILE *f)
     jstr(f, req);
     fputs(", \"presets\": [", f);
     for (int i = 0; nv2a_present_chain_names[i]; i++) {
-        shader_preset(f, &any, nv2a_present_chain_names[i]);
+        int got = shader_preset(f, &any, nv2a_present_chain_names[i]);
+        if (i < (int)sizeof have)
+            have[i] = (unsigned char)got;
         bundled |= !strcmp(req, nv2a_present_chain_names[i]);
     }
     if (!bundled && strcmp(req, "none"))
         shader_preset(f, &any, req);
-    fputs(any ? "\n  ]}" : "]}", f);
+    fputs(any ? "\n  ]" : "]", f);
+    profiles(f, have);
+    fputc('}', f);
 }
 
 int xbox_mod_describe_wanted(void)

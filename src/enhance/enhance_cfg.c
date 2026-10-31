@@ -39,6 +39,7 @@ static recomp_cfg *s_file[ENHANCE_FILES];
 static unsigned char *s_flags[ENHANCE_FILES];
 /* The file a writer (the menu's Save) targets; empty under none. */
 static char s_user_path[CFG_PATH_MAX];
+static char s_user_dir[CFG_PATH_MAX];   /* enhance_cfg_user_dir */
 
 static void bind_builtins(void)
 {
@@ -62,6 +63,7 @@ static void bind_builtins(void)
     enhance_cfg_bind_env("present.surface", RENV_PRESENT_SURFACE);
     enhance_cfg_bind_env("present.shader", RENV_PRESENT_SHADER);
     enhance_cfg_bind_env("present.shader_lib", RENV_PRESENT_SHADER_LIB);
+    enhance_cfg_bind_env("present.profile", RENV_PRESENT_PROFILE);
     enhance_cfg_bind_env("textures.pack", RENV_TEXTURES_PACK);
     enhance_cfg_bind_env("textures.font", RENV_TEXTURES_FONT);
     enhance_cfg_bind_env("textures.text", RENV_TEXTURES_TEXT);
@@ -138,6 +140,7 @@ void enhance_cfg_shutdown(void)
         s_flags[i] = NULL;
     }
     s_user_path[0] = 0;
+    s_user_dir[0] = 0;
 }
 
 /* Whether `path` names anything. stat, not a trial fopen: a file the
@@ -313,6 +316,7 @@ int enhance_cfg_init(const char *root, const char *title)
 
     if (over && *over) {
         snprintf(s_user_path, sizeof s_user_path, "%s", over);
+        dir_of(over, s_user_dir, sizeof s_user_dir);
         if (migrate(over) == 0)
             write_header(over, title);
         r = load_slot(SLOT_USER, over, 0);
@@ -328,6 +332,7 @@ int enhance_cfg_init(const char *root, const char *title)
             mt = migrate(tpath);
         }
         snprintf(upath, sizeof upath, "%s/config/config.toml", root);
+        snprintf(s_user_dir, sizeof s_user_dir, "%s/config", root);
         mu = migrate(upath);
         /* One header, on the file a writer would target. */
         snprintf(path, sizeof path, "%s/%s", root, have_title ? title : "");
@@ -372,6 +377,14 @@ env_lines:
 const char *enhance_cfg_user_path(void)
 {
     return s_user_path[0] ? s_user_path : NULL;
+}
+
+int enhance_cfg_user_dir(char *out, size_t n)
+{
+    if (!s_user_dir[0] || !n)
+        return 0;
+    snprintf(out, n, "%s", s_user_dir);
+    return 1;
 }
 
 const recomp_cfg *enhance_cfg_defaults(void)

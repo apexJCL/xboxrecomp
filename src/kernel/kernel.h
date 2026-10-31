@@ -592,6 +592,11 @@ int xbox_path_adopt_legacy_saves(const char *legacy_root, const char *root,
  * it does not fit in n. */
 int xbox_path_hdd_root(char *out, size_t n);
 
+/* <HDD root>/ShaderCache with '/' on every host (Win32 takes it): the
+ * host-side shader caches, the D3D11 dxbc folder and the composed shader
+ * profile presets (slangp/). 0 as xbox_path_hdd_root. */
+int xbox_path_shader_cache(char *out, size_t n);
+
 /*
  * Character type of a translated host path. The Win32 file APIs take wide
  * chars; POSIX takes bytes. kernel_path.c and kernel_file.c are split on

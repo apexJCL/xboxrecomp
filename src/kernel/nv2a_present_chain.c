@@ -27,6 +27,17 @@ static char s_req[512] = "none";
 static char s_lib_path[512];
 static atomic_uint s_gen;
 static atomic_int s_wanted;
+/* A profile request: its slug ("" for a present.shader request) and the
+ * stages' parameter names publish tags rows by. Under s_lock. */
+static char s_req_slug[64];
+static struct nv2a_present_stage s_stages[NV2A_PRESENT_STAGES_MAX];
+static int s_nstages;
+static char s_profile_err[NV2A_PRESENT_PROFILE_ERR_MAX];
+/* A start request that composes later (request_pending): run once, by the
+ * first nv2a_present_chain_gen() after it. s_pending is the cheap test the
+ * backends' per-present gen() read pays; s_prepare is under s_lock. */
+static atomic_int s_pending;
+static void (*s_prepare)(void);
 
 static struct nv2a_lrs s_lrs;
 static int s_lib_state;             /* 0 not tried, 1 loaded, -1 failed */
@@ -77,9 +88,167 @@ void nv2a_present_chain_request(const char *shader)
 {
     lock();
     snprintf(s_req, sizeof s_req, "%s", is_none(shader) ? "none" : shader);
+    s_req_slug[0] = 0;
+    s_nstages = 0;
+    s_profile_err[0] = 0;
+    s_prepare = NULL;
+    atomic_store(&s_pending, 0);
     atomic_store(&s_wanted, !is_none(shader));
     atomic_fetch_add(&s_gen, 1);
     unlock();
+}
+
+/* The profile request under the lock; with `at`, only while the generation
+ * is still *at (no request came since): 1 stored, 0 dropped. */
+static int store_profile(const unsigned *at, const char *slug, const char *path,
+                         const struct nv2a_present_stage *stages, int nstages)
+{
+    int i;
+    if (nstages > NV2A_PRESENT_STAGES_MAX) {
+        fprintf(stderr, LOGP "profile %s: %d stages, the first %d kept\n", slug, nstages,
+                NV2A_PRESENT_STAGES_MAX);
+        nstages = NV2A_PRESENT_STAGES_MAX;
+    }
+    lock();
+    if (at && atomic_load(&s_gen) != *at) {
+        unlock();
+        return 0;
+    }
+    snprintf(s_req, sizeof s_req, "%s", path);
+    snprintf(s_req_slug, sizeof s_req_slug, "%s", slug);
+    s_nstages = 0;
+    for (i = 0; stages && i < nstages; i++) {
+        s_stages[i] = stages[i];
+        if (s_stages[i].nnames > NV2A_PRESENT_PARAMS_MAX)
+            s_stages[i].nnames = NV2A_PRESENT_PARAMS_MAX;
+        if (s_stages[i].nnames < 0)
+            s_stages[i].nnames = 0;
+        s_nstages++;
+    }
+    s_profile_err[0] = 0;
+    s_prepare = NULL;
+    atomic_store(&s_pending, 0);
+    atomic_store(&s_wanted, 1);
+    atomic_fetch_add(&s_gen, 1);
+    unlock();
+    return 1;
+}
+
+void nv2a_present_chain_request_profile(const char *slug, const char *path,
+                                        const struct nv2a_present_stage *stages, int nstages)
+{
+    if (is_none(path) || !slug || !*slug) {
+        nv2a_present_chain_request("none");
+        return;
+    }
+    store_profile(NULL, slug, path, stages, nstages);
+}
+
+unsigned nv2a_present_chain_request_gen(void)
+{
+    return atomic_load(&s_gen);
+}
+
+int nv2a_present_chain_request_profile_at(unsigned gen, const char *slug, const char *path,
+                                          const struct nv2a_present_stage *stages, int nstages,
+                                          const char *err)
+{
+    if (!slug || !*slug)
+        return 0;
+    if (!is_none(path))
+        return store_profile(&gen, slug, path, stages, nstages);
+    /* Stock with the error, as a failed request_profile leaves it: one
+     * lock, so a menu request cannot land between the two. */
+    lock();
+    if (atomic_load(&s_gen) != gen) {
+        unlock();
+        return 0;
+    }
+    snprintf(s_req, sizeof s_req, "none");
+    s_req_slug[0] = 0;
+    s_nstages = 0;
+    snprintf(s_profile_err, sizeof s_profile_err, "%s", err ? err : "");
+    s_prepare = NULL;
+    atomic_store(&s_pending, 0);
+    atomic_store(&s_wanted, 0);
+    atomic_fetch_add(&s_gen, 1);
+    unlock();
+    return 1;
+}
+
+void nv2a_present_chain_request_pending(const char *slug, void (*prepare)(void))
+{
+    if (!prepare || !slug || !*slug) {
+        nv2a_present_chain_request("none");
+        return;
+    }
+    lock();
+    /* No path yet: a preset read now finds none and builds nothing. */
+    snprintf(s_req, sizeof s_req, "none");
+    snprintf(s_req_slug, sizeof s_req_slug, "%s", slug);
+    s_nstages = 0;
+    s_profile_err[0] = 0;
+    s_prepare = prepare;
+    atomic_store(&s_pending, 1);
+    atomic_store(&s_wanted, 1);
+    atomic_fetch_add(&s_gen, 1);
+    unlock();
+}
+
+int nv2a_present_chain_request_rearm(unsigned gen, void (*prepare)(void))
+{
+    int ok;
+    lock();
+    ok = prepare && atomic_load(&s_gen) == gen && s_req_slug[0];
+    if (ok) {
+        s_prepare = prepare;
+        atomic_store(&s_pending, 1);
+    }
+    unlock();
+    return ok;
+}
+
+/* Take the pending prepare and run it, outside the lock: it composes and
+ * makes the real request, which takes the lock itself. */
+static void run_pending(void)
+{
+    void (*fn)(void);
+    lock();
+    fn = s_prepare;
+    s_prepare = NULL;
+    atomic_store(&s_pending, 0);
+    unlock();
+    if (fn)
+        fn();
+}
+
+int nv2a_present_chain_requested_profile(char *out, size_t cap)
+{
+    int on;
+    lock();
+    on = s_req_slug[0] != 0;
+    if (cap)
+        snprintf(out, cap, "%s", s_req_slug);
+    unlock();
+    return on;
+}
+
+void nv2a_present_chain_profile_error_set(const char *msg)
+{
+    lock();
+    snprintf(s_profile_err, sizeof s_profile_err, "%s", msg ? msg : "");
+    unlock();
+}
+
+int nv2a_present_chain_profile_error_get(char *out, size_t cap)
+{
+    int on;
+    lock();
+    on = s_profile_err[0] != 0;
+    if (cap)
+        snprintf(out, cap, "%s", s_profile_err);
+    unlock();
+    return on;
 }
 
 void nv2a_present_chain_set_lib(const char *path)
@@ -98,6 +267,8 @@ void nv2a_present_chain_requested(char *out, size_t cap)
 
 unsigned nv2a_present_chain_gen(void)
 {
+    if (atomic_load_explicit(&s_pending, memory_order_relaxed))
+        run_pending();
     return atomic_load(&s_gen);
 }
 
@@ -129,9 +300,23 @@ void nv2a_present_chain_failed(unsigned gen)
 {
     lock();
     /* Only the generation that failed: a request that arrived meanwhile
-     * gets its own try. */
-    if (gen == atomic_load(&s_gen)) {
+     * gets its own try. A start still waiting to compose (rearmed) has no
+     * preset to build yet, which is not a failure: the backend keeps
+     * asking while it is wanted, and that read is what runs the wait. */
+    if (gen == atomic_load(&s_gen) && !atomic_load(&s_pending)) {
         atomic_store(&s_wanted, 0);
+        /* The backend said why in the log; librashader seldom names the
+         * pass, so the menu's line points there and at the composed file. */
+        if (s_req_slug[0]) {
+            const char *f = s_req, *c;
+            for (c = s_req; *c; c++)
+                if (*c == '/' || *c == '\\')
+                    f = c + 1;
+            /* The file's name: the log has the full path, and the menu's
+             * row has no room for it. */
+            snprintf(s_profile_err, sizeof s_profile_err,
+                     "the chain did not build: see the log (%s)", f);
+        }
     }
     unlock();
 }
@@ -513,15 +698,18 @@ void nv2a_present_chain_error(void *err, char *out, size_t cap)
  * menu's. A row is kept after its override is removed, so Save can delete
  * the key it once wrote. */
 #define OVR_MAX NV2A_PRESENT_OVERRIDES_MAX
+#define SCOPE_PRESET 0   /* keyed by preset key, saved to the config */
+#define SCOPE_PROFILE 1  /* keyed by profile slug, saved to its file */
 struct ovr {
     char key[64], name[64];
     float v, saved_v;
-    unsigned char has, saved_has;
+    unsigned char has, saved_has, scope;
 };
 
 static struct nv2a_present_param s_params[NV2A_PRESENT_PARAMS_MAX];
 static int s_nparams;
 static char s_params_key[64];
+static int s_params_scope;
 static atomic_uint s_pgen;
 static struct ovr s_ovr[OVR_MAX];
 static int s_novr;
@@ -575,6 +763,9 @@ int nv2a_present_chain_params_read(void *preset, struct nv2a_present_param *out,
         fprintf(stderr, LOGP "preset parameters unreadable: %s\n", why);
         return 0;
     }
+    if (list.length > (uint64_t)cap)
+        fprintf(stderr, LOGP "preset declares %llu parameters, the first %d kept\n",
+                (unsigned long long)list.length, cap);
     for (i = 0; i < list.length && n < cap; i++) {
         const libra_preset_param_t *p = &list.parameters[i];
         struct nv2a_present_param *d = &out[n];
@@ -586,25 +777,28 @@ int nv2a_present_chain_params_read(void *preset, struct nv2a_present_param *out,
         d->min = p->minimum;
         d->max = p->maximum > p->minimum ? p->maximum : p->minimum;
         d->step = p->step > 0 ? p->step : 0;
+        d->stage = 0;
+        d->shared = 0;
         n++;
     }
     fr(list);
     return n;
 }
 
-static struct ovr *ovr_find(const char *key, const char *name)
+static struct ovr *ovr_find(int scope, const char *key, const char *name)
 {
     int i;
     for (i = 0; i < s_novr; i++)
-        if (!strcmp(s_ovr[i].key, key) && !strcmp(s_ovr[i].name, name))
+        if (s_ovr[i].scope == scope && !strcmp(s_ovr[i].key, key)
+            && !strcmp(s_ovr[i].name, name))
             return &s_ovr[i];
     return NULL;
 }
 
-static struct ovr *ovr_add(const char *key, const char *name)
+static struct ovr *ovr_add(int scope, const char *key, const char *name)
 {
     static int s_full_said;
-    struct ovr *o = ovr_find(key, name);
+    struct ovr *o = ovr_find(scope, key, name);
     int i;
     if (o)
         return o;
@@ -627,6 +821,7 @@ static struct ovr *ovr_add(const char *key, const char *name)
         }
     }
     memset(o, 0, sizeof *o);
+    o->scope = (unsigned char)scope;
     snprintf(o->key, sizeof o->key, "%s", key);
     snprintf(o->name, sizeof o->name, "%s", name);
     return o;
@@ -650,8 +845,42 @@ static float clampf(float v, float lo, float hi)
  * hand-edited config can hold anything), or the preset's own. */
 static float active_value(const struct nv2a_present_param *p)
 {
-    const struct ovr *o = ovr_find(s_params_key, p->name);
+    const struct ovr *o = ovr_find(s_params_scope, s_params_key, p->name);
     return o && o->has ? clampf(o->v, p->min, p->max) : p->initial;
+}
+
+static int stage_declares(const struct nv2a_present_stage *st, const char *name)
+{
+    int i;
+    for (i = 0; i < st->nnames; i++)
+        if (!strcmp(st->name[i], name))
+            return 1;
+    return 0;
+}
+
+/* A profile's rows by name: the first stage whose list holds it owns it;
+ * shared when a later one holds it too. Under s_lock. */
+static void tag_rows(struct nv2a_present_param *t, int n)
+{
+    int i, s, owner;
+    for (i = 0; i < n; i++) {
+        owner = -1;
+        /* -1: no stage lists it (a stage changed on disk since the
+         * compose); the chain owns it, not stage 1. */
+        t[i].stage = -1;
+        t[i].shared = 0;
+        for (s = 0; s < s_nstages; s++) {
+            if (!stage_declares(&s_stages[s], t[i].name))
+                continue;
+            if (owner < 0) {
+                owner = s;
+                t[i].stage = s;
+            } else {
+                t[i].shared = 1;
+                break;
+            }
+        }
+    }
 }
 
 void nv2a_present_chain_params_publish(void *preset, unsigned gen)
@@ -662,8 +891,15 @@ void nv2a_present_chain_params_publish(void *preset, unsigned gen)
 
     lock();
     if (gen == atomic_load(&s_gen)) {
-        snprintf(req, sizeof req, "%s", s_req);
-        nv2a_present_chain_preset_key(req, key, sizeof key);
+        if (s_req_slug[0]) {
+            snprintf(key, sizeof key, "%s", s_req_slug);
+            tag_rows(t, n);
+            s_params_scope = SCOPE_PROFILE;
+        } else {
+            snprintf(req, sizeof req, "%s", s_req);
+            nv2a_present_chain_preset_key(req, key, sizeof key);
+            s_params_scope = SCOPE_PRESET;
+        }
         memcpy(s_params, t, (size_t)n * sizeof t[0]);
         s_nparams = n;
         snprintf(s_params_key, sizeof s_params_key, "%s", key);
@@ -678,6 +914,7 @@ void nv2a_present_chain_params_clear(void)
     if (s_nparams || s_params_key[0]) {
         s_nparams = 0;
         s_params_key[0] = 0;
+        s_params_scope = SCOPE_PRESET;
         atomic_fetch_add(&s_pgen, 1);
     }
     unlock();
@@ -699,6 +936,15 @@ int nv2a_present_chain_params(struct nv2a_present_param *out, int cap, char *key
         snprintf(key, keycap, "%s", s_params_key);
     unlock();
     return n;
+}
+
+int nv2a_present_chain_params_profile(void)
+{
+    int on;
+    lock();
+    on = s_params_key[0] && s_params_scope == SCOPE_PROFILE;
+    unlock();
+    return on;
 }
 
 int nv2a_present_chain_param_get(const char *name, float *out)
@@ -728,11 +974,11 @@ int nv2a_present_chain_param_set(const char *name, float v)
     /* Within a thousandth of a step of the preset's value is the preset's
      * value: menu steps add up in floats. */
     eps = p->step > 0 ? p->step * 0.001f : 1e-6f;
-    o = ovr_find(s_params_key, name);
+    o = ovr_find(s_params_scope, s_params_key, name);
     if (v > p->initial - eps && v < p->initial + eps) {
         if (o)
             o->has = 0;
-    } else if ((o = ovr_add(s_params_key, name)) != NULL) {
+    } else if ((o = ovr_add(s_params_scope, s_params_key, name)) != NULL) {
         o->v = v;
         o->has = 1;
     }
@@ -746,7 +992,7 @@ void nv2a_present_chain_params_reset(const char *key)
     int i;
     lock();
     for (i = 0; i < s_novr; i++)
-        if (!key || !strcmp(s_ovr[i].key, key))
+        if (s_ovr[i].scope == SCOPE_PRESET && (!key || !strcmp(s_ovr[i].key, key)))
             s_ovr[i].has = 0;
     atomic_fetch_add(&s_pgen, 1);
     unlock();
@@ -779,7 +1025,7 @@ void nv2a_present_chain_override_load(const char *key, const char *name, float v
 {
     struct ovr *o;
     lock();
-    if ((o = ovr_add(key, name)) != NULL) {
+    if ((o = ovr_add(SCOPE_PRESET, key, name)) != NULL) {
         o->v = o->saved_v = v;
         o->has = o->saved_has = 1;
         atomic_fetch_add(&s_pgen, 1);
@@ -795,11 +1041,15 @@ static int ovr_dirty(const struct ovr *o)
 int nv2a_present_chain_override_at(int i, char *key, size_t keycap, char *name,
                                    size_t namecap, float *v, int *has, int *dirty)
 {
-    int ok;
+    int ok = 0, j;
+    const struct ovr *o = NULL;
     lock();
-    ok = i >= 0 && i < s_novr;
+    /* The i-th preset-scope row: profile rows go to their own files. */
+    for (j = 0; j < s_novr && i >= 0; j++)
+        if (s_ovr[j].scope == SCOPE_PRESET && i-- == 0)
+            o = &s_ovr[j];
+    ok = o != NULL;
     if (ok) {
-        const struct ovr *o = &s_ovr[i];
         if (key && keycap)
             snprintf(key, keycap, "%s", o->key);
         if (name && namecap)
@@ -820,6 +1070,8 @@ void nv2a_present_chain_overrides_saved(void)
     int i;
     lock();
     for (i = 0; i < s_novr; i++) {
+        if (s_ovr[i].scope != SCOPE_PRESET)
+            continue;
         s_ovr[i].saved_v = s_ovr[i].v;
         s_ovr[i].saved_has = s_ovr[i].has;
     }
@@ -831,7 +1083,8 @@ int nv2a_present_chain_overrides_dirty(void)
     int i, d = 0;
     lock();
     for (i = 0; i < s_novr; i++)
-        d += ovr_dirty(&s_ovr[i]);
+        if (s_ovr[i].scope == SCOPE_PRESET)
+            d += ovr_dirty(&s_ovr[i]);
     unlock();
     return d;
 }
@@ -841,7 +1094,7 @@ int nv2a_present_chain_override_get(const char *key, const char *name, float *v)
     const struct ovr *o;
     int has;
     lock();
-    o = ovr_find(key, name);
+    o = ovr_find(SCOPE_PRESET, key, name);
     has = o && o->has;
     if (has && v)
         *v = o->v;
@@ -849,12 +1102,138 @@ int nv2a_present_chain_override_get(const char *key, const char *name, float *v)
     return has;
 }
 
+/* ---- The profile scope ---- */
+
+/* No value now and none on disk: ovr_add may reuse the row, and its empty
+ * key matches no slug. */
+static void ovr_free(struct ovr *o)
+{
+    o->has = o->saved_has = 0;
+    o->key[0] = 0;
+}
+
+void nv2a_present_chain_profile_value_load(const char *slug, const char *name, float v)
+{
+    struct ovr *o;
+    lock();
+    if ((o = ovr_add(SCOPE_PROFILE, slug, name)) != NULL) {
+        o->v = o->saved_v = v;
+        o->has = o->saved_has = 1;
+        atomic_fetch_add(&s_pgen, 1);
+    }
+    unlock();
+}
+
+int nv2a_present_chain_profile_value_get(const char *slug, const char *name, float *v)
+{
+    const struct ovr *o;
+    int has;
+    lock();
+    o = ovr_find(SCOPE_PROFILE, slug, name);
+    has = o && o->has;
+    if (has && v)
+        *v = o->v;
+    unlock();
+    return has;
+}
+
+int nv2a_present_chain_profile_values(const char *slug, char (*name)[64], float *v, int cap)
+{
+    int i, n = 0;
+    lock();
+    for (i = 0; i < s_novr && n < cap; i++) {
+        const struct ovr *o = &s_ovr[i];
+        if (o->scope != SCOPE_PROFILE || !o->has || strcmp(o->key, slug))
+            continue;
+        memcpy(name[n], o->name, sizeof name[n]);
+        v[n++] = o->v;
+    }
+    unlock();
+    return n;
+}
+
+void nv2a_present_chain_profile_reset(const char *slug, const char *name)
+{
+    int i;
+    lock();
+    for (i = 0; i < s_novr; i++) {
+        struct ovr *o = &s_ovr[i];
+        if (o->scope == SCOPE_PROFILE && !strcmp(o->key, slug)
+            && (!name || !strcmp(o->name, name)))
+            o->has = 0;
+    }
+    atomic_fetch_add(&s_pgen, 1);
+    unlock();
+}
+
+int nv2a_present_chain_profile_dirty(const char *slug)
+{
+    int i, d = 0;
+    lock();
+    for (i = 0; i < s_novr; i++)
+        if (s_ovr[i].scope == SCOPE_PROFILE && (!slug || !strcmp(s_ovr[i].key, slug)))
+            d += ovr_dirty(&s_ovr[i]);
+    unlock();
+    return d;
+}
+
+void nv2a_present_chain_profile_saved(const char *slug)
+{
+    int i;
+    lock();
+    for (i = 0; i < s_novr; i++) {
+        struct ovr *o = &s_ovr[i];
+        if (o->scope != SCOPE_PROFILE || strcmp(o->key, slug))
+            continue;
+        o->saved_v = o->v;
+        o->saved_has = o->has;
+    }
+    unlock();
+}
+
+void nv2a_present_chain_profile_rekey(const char *from, const char *to)
+{
+    int i;
+    lock();
+    /* A row of to left from an older profile of that slug would shadow
+     * the renamed one's: forget it first. */
+    for (i = 0; i < s_novr; i++)
+        if (s_ovr[i].scope == SCOPE_PROFILE && !strcmp(s_ovr[i].key, to))
+            ovr_free(&s_ovr[i]);
+    for (i = 0; i < s_novr; i++)
+        if (s_ovr[i].scope == SCOPE_PROFILE && !strcmp(s_ovr[i].key, from))
+            snprintf(s_ovr[i].key, sizeof s_ovr[i].key, "%s", to);
+    if (s_params_scope == SCOPE_PROFILE && !strcmp(s_params_key, from))
+        snprintf(s_params_key, sizeof s_params_key, "%s", to);
+    if (!strcmp(s_req_slug, from))
+        snprintf(s_req_slug, sizeof s_req_slug, "%s", to);
+    atomic_fetch_add(&s_pgen, 1);
+    unlock();
+}
+
+void nv2a_present_chain_profile_forget(const char *slug)
+{
+    int i;
+    lock();
+    for (i = 0; i < s_novr; i++)
+        if (s_ovr[i].scope == SCOPE_PROFILE && !strcmp(s_ovr[i].key, slug))
+            ovr_free(&s_ovr[i]);
+    atomic_fetch_add(&s_pgen, 1);
+    unlock();
+}
+
 void nv2a_present_chain_params_reset_for_test(void)
 {
     lock();
     s_nparams = 0;
     s_params_key[0] = 0;
+    s_params_scope = SCOPE_PRESET;
     s_novr = 0;
+    s_req_slug[0] = 0;
+    s_nstages = 0;
+    s_profile_err[0] = 0;
+    s_prepare = NULL;
+    atomic_store(&s_pending, 0);
     atomic_fetch_add(&s_pgen, 1);
     unlock();
 }

@@ -16,13 +16,20 @@
 #   mod_describe.c the descriptor dump (RECOMP_MODS_DESCRIBE=json)
 #   enhance_menu.c the in-game menu (menu.enabled): items, pages, Save
 #                  (enhance_menu.h)
+#   shader_profile.c shader profiles: the profile files, the composer (one
+#                  .slangp from a chain of presets; shader_profile.h)
+#   shader_profile_req.c a profile as the chain's request, the start's
+#                  present.profile / present.shader choice
+#   shader_profile_edit.c the Shaders page's profiles: picker, chain edits,
+#                  Save (shader_profile_edit.h)
 # docs/runtime/config.md has the file format and the keys.
 #
 # The layer links the runtime (xbox_kernel, for nv2a_host_opts_set), never
 # the other way round: with the layer off the options stay zero (stock).
 
 add_library(xbox_enhance STATIC recomp_cfg.c enhance_cfg.c enhance.c enhance_input.c
-    enhance_actions.c mod.c hud_anchor.c hud_capture.c mod_describe.c enhance_menu.c)
+    enhance_actions.c mod.c hud_anchor.c hud_capture.c mod_describe.c enhance_menu.c
+    shader_profile.c shader_profile_req.c shader_profile_edit.c)
 target_include_directories(xbox_enhance PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(xbox_enhance PUBLIC recomp_env xbox_kernel xbox_input)
 if(NOT MSVC)

@@ -165,6 +165,7 @@ the stock settings, `present.pacing = "spin"` included.
 | `present.filter` | string | `"nearest"`, `"linear"`, `"integer"` | `"nearest"` | `RECOMP_PRESENT_FILTER` |
 | `present.fullscreen` | bool | borderless fullscreen at start | `false` | `RECOMP_PRESENT_FULLSCREEN` |
 | `present.pacing` | string | `"sleep"`, `"spin"` (stock, the console-original timing): how a lowered guest busy-wait waits | `"sleep"` | `RECOMP_PRESENT_PACING` |
+| `present.profile` | string | `"none"` or a shader profile's slug, its file `config/shader-profiles/<slug>.toml`: a chain of slang presets run in place of the final present, on Metal and D3D11 ([shader profiles](#shaderprofiles)); in the layer that sets it, it wins over `present.shader` | `"none"` | `RECOMP_PRESENT_PROFILE` |
 | `present.shader` | string | `"none"`, `"crt-lottes"`, `"crt-lottes-fast"`, `"crt-hyllian"`, `"fsr"`, or a `.slangp` path: a RetroArch slang preset run by librashader in place of the final present, on Metal and D3D11 ([present.shader](#presentshader)) | `"none"` | `RECOMP_PRESENT_SHADER` |
 | `present.shader_params.<preset>.<param>` | number | a slang preset's runtime parameter, per preset: `<preset>` is the bundled name or a path's file stem, `<param>` a `#pragma parameter` name. Clamped to the parameter's range ([shader parameters](#shaderparams)) | the preset's own value | none |
 | `present.shader_lib` | string | the librashader library; relative to the executable's directory. Loaded as given, with no hash check (the sha256 pin covers only the build's own copy) | `librashader.dll` beside the executable; macOS `librashader.dylib` beside it, then `../Frameworks/librashader.dylib` | `RECOMP_PRESENT_SHADER_LIB` |
@@ -470,8 +471,8 @@ same requests at given flips, to check a switch without the menu.
   path the player names, as any library they put there would. A missing
   library, one with another ABI, or (Windows) a library whose import is
   missing (named in the line, error 126) gives one `[SHADER]` line and
-  the stock present. The menu's *Shader* row
-  (Shaders page) switches it live: the next present builds the new chain,
+  the stock present. The menu's *Profile* row
+  (Shaders page, see [Shader profiles](#shaderprofiles)) switches it live: the next present builds the new chain,
   and a preset that fails to build is not retried until the next change.
   The menu leaves the Shaders page out where no shader can run: no chain
   presenter (the SDL renderer, or the CPU rasteriser's window on Windows),
@@ -498,8 +499,9 @@ same requests at given flips, to check a switch without the menu.
 - **Shader parameters.** <a id="shaderparams"></a>A slang preset declares
   runtime parameters (`#pragma parameter`: a name, a label, a range and a
   step). librashader reads them when the chain is built, and the menu's
-  **Shaders** page lists the active preset's under its *Shader* row, one
-  range row each: the label, the value at the step's decimals, and the
+  **Shaders** page lists the active chain's: under the stage row for a
+  one-stage chain, else in each stage's options (that stage's own names;
+  a name an earlier stage declares is listed there). One range row each: the label, the value at the step's decimals, and the
   name, range and preset in the footer. A change applies at the next
   present on Metal and D3D11; *Reset to preset* drops the active preset's
   overrides, and the Save page's *Reset to defaults* drops every preset's.
@@ -550,6 +552,151 @@ same requests at given flips, to check a switch without the menu.
   1 ms timeout. A site whose loops keep leaving on the timeout (more than
   5% of exits) has a writer the kernel never signals; timeouts in the
   middle of a loop are normal.
+
+### Shader profiles
+
+<a id="shaderprofiles"></a>A shader profile is a named chain of 1 to 8
+slang presets, run as one chain in place of the present
+(`src/enhance/shader_profile.h`). Each is one file,
+`<root>/config/shader-profiles/<slug>.toml`, beside the user's
+`config.toml` whatever title file the layers read, so a game with several
+titles keeps one set. With `RECOMP_CONFIG=<file>` the folder is
+`shader-profiles/` beside that file; with `RECOMP_CONFIG=none` there are no
+profiles. The file name is the profile's slug: its name with ASCII letters
+lowered, digits, `-` and `_` kept, and every other run of bytes one `-`
+(`Soft CRT` is `soft-crt.toml`). A file whose stem is not a slug is skipped
+with one line.
+
+```toml
+# xboxrecomp shader profile (docs/runtime/config.md, "Shader profiles")
+version = 1
+name = "Soft CRT"
+stages = ["fsr", "crt-lottes"]
+
+[params.fsr]
+FSR_SHARPENING = 0.2
+
+[params.crt-lottes]
+warpX = 0.0
+maskDark = 0.6
+```
+
+- `version` (integer, required): 1. A higher one is listed read-only as a
+  newer format and never written; a missing one, or one that is not an
+  integer of at least 1, makes the file broken.
+- `name` (string, at most 48 bytes of UTF-8, cut at a character boundary
+  with one line): the display name; the slug when absent.
+- `stages` (array of strings, 1 to 8; past 8 the first 8 are taken with one
+  line): the chain, first stage first. A stage is a bundled name
+  (`crt-lottes`, `crt-lottes-fast`, `crt-hyllian`, `fsr`), `user:<stem>`
+  for `<root>/shaders/<stem>.slangp`, an absolute `.slangp` path, or a
+  relative one, looked up in `<root>/shaders/` and then beside the
+  executable. A file in `<root>/shaders/` named like a bundled preset is
+  refused, so `fsr` always means the bundled one.
+- `[params.<preset key>]`: parameter values, keyed by the stage's preset
+  key (the bundled name, or the file stem as for
+  `present.shader_params`), so a reorder changes only `stages`. A value
+  that is not a number is skipped with one line. librashader keeps one
+  value per parameter name over the whole chain, so a name two stages
+  declare is saved once, under the first stage that declares it; a value
+  found under another stage's table is read and moved there at the next
+  save.
+
+Unknown keys and tables are reported (`[SHADER] <file>:<line>: unknown key
+<key>`) and kept: a save changes only `version`, `name`, `stages` and the
+`[params]` values, through `recomp_cfg_patch`, so comments and other lines
+stay. A file that does not parse is listed broken, with its error, and is
+never written.
+
+**Composing.** librashader builds a chain only from one preset file, and a
+preset can `#reference` only one other, so a profile of two or more stages
+is composed into one `.slangp` at
+`<save root>/ShaderCache/slangp/<slug>.slangp` (`~unsaved.slangp` for a
+chain not saved yet), rewritten through a temporary at every compose and
+never read back. A one-stage profile runs its preset as it is. The
+composer follows each stage's `#reference` chain (16 deep, cycles refused;
+the referencing file's lines win), renumbers the passes in stage order,
+copies every per-pass key through, writes every shader and texture path
+absolute, quoted and with forward slashes, merges the `parameters` lists
+(duplicates dropped) and takes each preset-level value from the earliest
+stage that sets it. A stage that is not the last and whose last pass sets
+no `scale_type` gets `scale_type = "viewport"` there, the size it had on
+its own (an unset last pass is viewport-sized only at the end of a chain).
+The compose is refused, with a `[SHADER] profile <slug>: ...` line, for a
+missing or unreadable preset, an alias or texture name two stages declare,
+`PassOutputN`, `PassOutputSizeN`, `PassFeedbackN` or `PassFeedbackSizeN`
+in a stage after the first (renumbering moves the pass they name), and
+more than 16 passes in all.
+
+**Which one runs at start.** `present.profile` names the profile;
+`present.shader` stays the short form of a one-stage chain. They are
+resolved as a pair, in this order:
+
+1. `RECOMP_PRESENT_SHADER` set: that preset, as before profiles (benches
+   and debugging), with a `present.profile=<slug> ignored` line when a
+   profile is set too;
+2. `RECOMP_PRESENT_PROFILE` set, and not `none`: that profile;
+3. the highest file that sets either key (the per-title file, then
+   `config/config.toml`, then `config.default.toml`) decides alone: its
+   `present.profile` unless `none`, else its `present.shader` unless
+   `none`, else stock. A lower file's keys are not consulted, so a
+   per-title `present.shader = "fsr"` is not overridden by a profile in
+   the shared `config.toml`, and `"none"` in a file stops a lower file's
+   choice;
+4. stock.
+
+A chosen profile is named on an `[ENHANCE] present.profile=<slug>` line
+(none at a stock start, as for `present.shader`), which the golden check
+reads. A chosen profile that is missing, broken or of a newer format logs one
+line and presents stock; it never falls back to `present.shader`. Only that
+one file is read, and a stock start reads none. A one-stage profile is
+requested at once. A chain is composed at the first present, since the
+shader cache folder is set up after the config is read; a compose failure
+then logs its line and the present stays stock.
+
+**The Shaders page.** The menu's Shaders page edits the profiles; nothing
+under `config/shader-profiles/` is read before the page first opens, and
+the folder is read again each time it opens, so a file added or removed
+outside the game shows up then.
+
+- *Profile* (Left / Right): Off, the bundled presets, the configured
+  preset when it is a path, then the folder's profiles by name. A broken
+  or newer-format profile is listed red with its error and skipped by the
+  picker. The choice is live; with `RECOMP_PRESENT_SHADER` or
+  `RECOMP_PRESENT_PROFILE` set the row is read only and says which.
+- *Chain*: how the chain stands (`2 passes`, `building`, or why it shows
+  stock: a missing stage, a clash, a limit, a failed build).
+- One row per stage. Left / Right moves it, X (Delete) removes it after a
+  confirm, A opens its options: its preset and path, its parameters, Move
+  up, Move down, Remove and *Reset this stage* (the values it declares
+  first). The last stage stays; pick Off instead. A stage that reads the
+  game frame (`Original`) or sees the scaled picture is noted.
+- *Add shader*: the bundled presets, then `user:<stem>` for each
+  `.slangp` in `<root>/shaders/`. A preset is added as the last stage only
+  when it is found, parses and composes with the chain; past 8 stages or
+  16 passes the row is dimmed with the limit.
+- *Save as new* (a copy named `Profile N`), *Duplicate* (`<name> copy`),
+  *Rename* (a text entry: keyboard, or the pad's Up / Down to cycle a
+  character), *Delete* (after a confirm; the file and a `present.profile`
+  naming it go at once, not at Save) and *Reset to preset*.
+
+The first chain edit on a bundled preset or a path forks it into an
+unsaved `<name> custom` profile and says so. Every edit is live; Save
+writes each changed profile to its file (a rename moves the file) and
+`present.profile`, or `present.shader` for a bundled preset, in the user
+`config.toml`, and the unsaved count on the Save page includes them. The
+Save page's *Reset to defaults* sets the picker to Off and leaves the
+files. When the game runs from its own folder (`<root>` is the
+executable's directory), `<root>/shaders/` is the bundled folder itself:
+the bundled presets there are not listed twice and raise no name clash.
+
+A later stage sees the earlier one's output, so a CRT preset after `fsr`
+or another CRT draws its scanlines per output line; that is allowed, as in
+RetroArch. `Original` and `OriginalSize` stay the game frame in every
+pass, so a later stage whose shaders read them (crt-hyllian does) mixes
+the game frame's size with the scaled picture and may look wrong; that is
+allowed too, and flagged. A declaration alone (every bundled shader
+declares `OriginalSize` in its uniform block) is not a read.
 
 ### Texture packs
 
@@ -1851,6 +1998,22 @@ with its parameters parsed from the preset file, without a GPU:
 `default` is the preset's value and `value` the one this run resolved
 (an override, or the default). `presets` is empty when the library is
 missing, and a preset that is not there or does not parse is left out.
+
+After `presets` come the [shader profiles](#shaderprofiles):
+
+```json
+"active_profile": "soft-crt", "profiles": [
+  {"name": "fsr", "slug": "fsr", "file": "", "stages": ["fsr"],
+   "builtin": true, "state": "ok"},
+  {"name": "Soft CRT", "slug": "soft-crt", "file": "soft-crt.toml",
+   "stages": ["fsr", "crt-lottes"], "builtin": false, "state": "ok"}]
+```
+
+`active_profile` is the profile the start chose, `none` when it chose
+none (a `present.shader` choice shows in `active` only). `profiles` lists
+each bundled preset that is in `presets` as a one-stage `builtin`
+profile, then the folder's files by name, with `state` `ok`, `broken` or
+`newer`. Schema stays 1: the fields are additions.
 
 `tests/mod_desc/expected.json` is the full dump of the test table.
 

@@ -1016,6 +1016,10 @@ void xbox_PacingSetMode(int mode) { s_pacing_mode = mode; }
 static int s_ram_cache = -1;
 void xbox_RamCacheEnable(int on);
 void xbox_RamCacheEnable(int on) { s_ram_cache = on; }
+/* kernel_path.c: no save root in this test, so a chain profile cannot
+ * compose (shader_profile_req.c). */
+int xbox_path_shader_cache(char *out, size_t n);
+int xbox_path_shader_cache(char *out, size_t n) { (void)out; (void)n; return 0; }
 /* mod.c and enhance_input.c's links into the runtime; no mods run here
  * (tests/enhance_mod has them). */
 ptrdiff_t xbox_GetMemoryOffset(void);
@@ -1171,6 +1175,26 @@ static void test_enhance_init(void)
         out = capture_end();
         CHECK(strstr(out, "render.aniso=-1 out of range 0..16; using 0") != NULL);
         recomp_env_set(RENV_RENDER_ANISO, NULL);
+    }
+
+    /* present.profile: logged on an [ENHANCE] line only when chosen (the
+     * golden check's stock value is its absence), even when the profile
+     * then fails: here there is no profiles folder under RECOMP_CONFIG=none. */
+    {
+        const char *out;
+
+        capture_begin();
+        CHECK(xbox_enhance_init(".", NULL) == 0);
+        out = capture_end();
+        CHECK(strstr(out, "present.profile=") == NULL);
+        recomp_env_set(RENV_PRESENT_PROFILE, "soft-crt");
+        capture_begin();
+        CHECK(xbox_enhance_init(".", NULL) == 0);
+        out = capture_end();
+        CHECK(strstr(out, "[ENHANCE] present.profile=soft-crt\n") != NULL);
+        CHECK(strstr(out, "[SHADER] profile soft-crt: no profiles under RECOMP_CONFIG=none")
+              != NULL);
+        recomp_env_set(RENV_PRESENT_PROFILE, NULL);
     }
 
     /* render.snap_2d: off unless asked (the stock line does not name it),

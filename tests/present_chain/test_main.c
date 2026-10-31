@@ -33,7 +33,7 @@ static int s_fail;
 
 static void requested_is(const char *want)
 {
-    char b[64];
+    char b[1024];
     nv2a_present_chain_requested(b, sizeof b);
     if (strcmp(b, want)) {
         fprintf(stderr, "FAIL requested \"%s\", want \"%s\"\n", b, want);
@@ -219,7 +219,8 @@ static void case_params(const char *dir)
     struct nv2a_present_param t[NV2A_PRESENT_PARAMS_MAX];
     char key[64];
     unsigned applied = 0, g, pg;
-    int preset = 0, has = 0, dirty = 0;
+    void *preset = NULL;    /* the fake's fixed table */
+    int has = 0, dirty = 0;
     float v = 0;
 
     load_params_lib(dir);
@@ -378,6 +379,203 @@ static void case_describe(const char *dir, int nolib)
     remove(broken);
 }
 
+/* A preset handle from the stand-in, as a backend's libra_preset_create
+ * gives it; the fake picks its table by the file's name. */
+static void *fake_preset(const char *path)
+{
+    void *(*create)(const char *, void **) =
+        (void *(*)(const char *, void **))nv2a_present_chain_lib()->sym("libra_preset_create");
+    void *h = NULL;
+    CHECK(create && !create(path, &h));
+    return h;
+}
+
+/* A stage of a profile request: its preset key and what it declares, from
+ * the GPU-free parse, as the profile module fills it at compose time. */
+static void stage_of(struct nv2a_present_stage *st, const char *path)
+{
+    static struct nv2a_present_param t[NV2A_PRESENT_PARAMS_MAX];
+    int n = nv2a_present_chain_describe(path, t, NV2A_PRESENT_PARAMS_MAX);
+    memset(st, 0, sizeof *st);
+    nv2a_present_chain_preset_key(path, st->key, sizeof st->key);
+    CHECK(n > 0);
+    for (int i = 0; i < n; i++)
+        snprintf(st->name[st->nnames++], sizeof st->name[0], "%s", t[i].name);
+}
+
+static const struct nv2a_present_param *row(const struct nv2a_present_param *t, int n,
+                                            const char *name)
+{
+    for (int i = 0; i < n; i++)
+        if (!strcmp(t[i].name, name))
+            return &t[i];
+    return NULL;
+}
+
+/* A profile request: its slug and stage lists, the rows tagged by stage and
+ * shared flag, its values in the profile scope apart from the per-preset
+ * overrides, the profile error, and a rename and a delete. */
+static void case_profile(const char *dir)
+{
+    static struct nv2a_present_stage st[NV2A_PRESENT_STAGES_MAX + 1];
+    static struct nv2a_present_param t[NV2A_PRESENT_PARAMS_MAX];
+    const struct nv2a_present_param *r;
+    char a[1024], b[1024], comp[1024], key[64], err[NV2A_PRESENT_PROFILE_ERR_MAX];
+    char names[8][64];
+    float vals[8], v = 0;
+    unsigned applied = 0, g;
+    void *h;
+    int n, has, dirty;
+
+    load_params_lib(dir);
+    snprintf(a, sizeof a, "%s/pc_stage_a.slangp", recomp_exe_dir());
+    snprintf(b, sizeof b, "%s/pc_stage_b.slangp", recomp_exe_dir());
+    snprintf(comp, sizeof comp, "%s/pc_composed.slangp", recomp_exe_dir());
+    write_file(a);
+    write_file(b);
+    write_file(comp);
+    stage_of(&st[0], a);
+    stage_of(&st[1], b);
+    CHECK(!strcmp(st[0].key, "pc_stage_a") && st[0].nnames == 2 && st[1].nnames == 2);
+
+    /* The profile's file says SHARED 0.8; a per-preset override under the
+     * composed file's own key must not leak into the profile. */
+    nv2a_present_chain_profile_value_load("soft", "SHARED", 0.8f);
+    nv2a_present_chain_override_load("pc_composed", "SHARED", 0.1f);
+    CHECK(nv2a_present_chain_profile_dirty(NULL) == 0);
+    CHECK(!nv2a_present_chain_override_get("soft", "SHARED", NULL));
+
+    nv2a_present_chain_profile_error_set("stage 2 (x) is missing");
+    CHECK(nv2a_present_chain_profile_error_get(err, sizeof err));
+    CHECK(!nv2a_present_chain_requested_profile(key, sizeof key) && key[0] == 0);
+    nv2a_present_chain_request_profile("soft", comp, st, 2);
+    CHECK(!nv2a_present_chain_profile_error_get(err, sizeof err) && err[0] == 0);
+    CHECK(nv2a_present_chain_requested_profile(key, sizeof key) && !strcmp(key, "soft"));
+    CHECK(nv2a_present_chain_wanted());
+    requested_is(comp);
+    {
+        unsigned pg;
+        char out[1024];
+        CHECK(nv2a_present_chain_preset(out, sizeof out, &pg) == 1 && !strcmp(out, comp));
+    }
+
+    h = fake_preset(comp);
+    nv2a_present_chain_params_publish(&h, nv2a_present_chain_gen());
+    n = nv2a_present_chain_params(t, NV2A_PRESENT_PARAMS_MAX, key, sizeof key);
+    CHECK(n == 4 && !strcmp(key, "soft") && nv2a_present_chain_params_profile());
+    CHECK((r = row(t, n, "A1")) && r->stage == 0 && !r->shared);
+    CHECK((r = row(t, n, "SHARED")) && r->stage == 0 && r->shared);
+    CHECK((r = row(t, n, "B1")) && r->stage == 1 && !r->shared);
+    CHECK((r = row(t, n, "ORPHAN")) && r->stage == -1 && !r->shared);
+
+    /* The backend runs the profile's value, not the preset override. */
+    s_nset = 0;
+    nv2a_present_chain_params_apply(&applied, record_set, &s_nset);
+    CHECK(s_nset == 4 && near(set_value("SHARED"), 0.8f) && near(set_value("B1"), 3.0f));
+
+    /* The menu's change goes to the profile scope; the config's overrides
+     * and their dirty count do not see it. */
+    CHECK(nv2a_present_chain_param_set("B1", 2.0f));
+    CHECK(nv2a_present_chain_profile_value_get("soft", "B1", &v) && near(v, 2.0f));
+    CHECK(!nv2a_present_chain_override_get("soft", "B1", NULL));
+    CHECK(!override_row("soft", "B1", &v, &has, &dirty));
+    CHECK(nv2a_present_chain_overrides_dirty() == 0);
+    CHECK(nv2a_present_chain_profile_dirty("soft") == 1);
+    CHECK(nv2a_present_chain_profile_dirty("other") == 0);
+    CHECK(nv2a_present_chain_profile_dirty(NULL) == 1);
+    n = nv2a_present_chain_profile_values("soft", names, vals, 8);
+    CHECK(n == 2 && row(t, 4, names[0]) && row(t, 4, names[1]));
+    nv2a_present_chain_profile_saved("soft");
+    CHECK(nv2a_present_chain_profile_dirty(NULL) == 0);
+
+    /* Reset to preset of the built-ins leaves profiles alone; a profile's
+     * stage reset removes its names only. */
+    nv2a_present_chain_params_reset(NULL);
+    CHECK(nv2a_present_chain_profile_value_get("soft", "SHARED", &v) && near(v, 0.8f));
+    nv2a_present_chain_profile_reset("soft", "B1");
+    CHECK(!nv2a_present_chain_profile_value_get("soft", "B1", NULL));
+    CHECK(nv2a_present_chain_profile_dirty("soft") == 1);
+    CHECK(nv2a_present_chain_param_get("B1", &v) && near(v, 3.0f));
+
+    /* A rename carries the values, the table's key and the request. */
+    nv2a_present_chain_profile_rekey("soft", "soft-2");
+    CHECK(nv2a_present_chain_profile_value_get("soft-2", "SHARED", &v) && near(v, 0.8f));
+    CHECK(!nv2a_present_chain_profile_value_get("soft", "SHARED", NULL));
+    CHECK(nv2a_present_chain_requested_profile(key, sizeof key) && !strcmp(key, "soft-2"));
+    nv2a_present_chain_params(t, NV2A_PRESENT_PARAMS_MAX, key, sizeof key);
+    CHECK(!strcmp(key, "soft-2"));
+    CHECK(nv2a_present_chain_param_get("SHARED", &v) && near(v, 0.8f));
+    nv2a_present_chain_profile_forget("soft-2");
+    CHECK(!nv2a_present_chain_profile_value_get("soft-2", "SHARED", NULL));
+    CHECK(nv2a_present_chain_profile_dirty(NULL) == 0);
+
+    /* A build failure of an older generation says nothing; of this one, the
+     * profile error names the composed file. The next request clears it. */
+    g = nv2a_present_chain_gen();
+    nv2a_present_chain_failed(g - 1);
+    CHECK(!nv2a_present_chain_profile_error_get(err, sizeof err));
+    nv2a_present_chain_failed(g);
+    CHECK(!nv2a_present_chain_wanted());
+    CHECK(nv2a_present_chain_profile_error_get(err, sizeof err) && strstr(err, "pc_composed"));
+    nv2a_present_chain_request("crt-lottes");
+    CHECK(!nv2a_present_chain_profile_error_get(err, sizeof err));
+    CHECK(!nv2a_present_chain_requested_profile(key, sizeof key));
+    /* A present.shader failure sets no profile error. */
+    nv2a_present_chain_failed(nv2a_present_chain_gen());
+    CHECK(!nv2a_present_chain_profile_error_get(err, sizeof err));
+
+    /* A plain request's table is the preset scope, untagged (the reset
+     * above dropped the override). */
+    nv2a_present_chain_override_load("pc_composed", "SHARED", 0.1f);
+    nv2a_present_chain_request(comp);
+    nv2a_present_chain_params_publish(&h, nv2a_present_chain_gen());
+    n = nv2a_present_chain_params(t, NV2A_PRESENT_PARAMS_MAX, key, sizeof key);
+    CHECK(n == 4 && !strcmp(key, "pc_composed") && !nv2a_present_chain_params_profile());
+    CHECK((r = row(t, n, "SHARED")) && !r->shared && r->stage == 0);
+    CHECK(nv2a_present_chain_param_get("SHARED", &v) && near(v, 0.1f));
+
+    /* Nine stages: the first eight kept. B1 is in the ninth only, so no
+     * kept stage lists it. */
+    for (int i = 2; i < NV2A_PRESENT_STAGES_MAX; i++)
+        st[i] = st[0];
+    st[NV2A_PRESENT_STAGES_MAX] = st[1];
+    memcpy(&st[1], &st[0], sizeof st[0]);
+    nv2a_present_chain_request_profile("nine", comp, st, NV2A_PRESENT_STAGES_MAX + 1);
+    nv2a_present_chain_params_publish(&h, nv2a_present_chain_gen());
+    n = nv2a_present_chain_params(t, NV2A_PRESENT_PARAMS_MAX, key, sizeof key);
+    CHECK((r = row(t, n, "B1")) && r->stage == -1 && !r->shared);
+    CHECK((r = row(t, n, "A1")) && r->stage == 0 && r->shared);
+
+    /* No path or no slug: stock. */
+    nv2a_present_chain_request_profile("soft", NULL, st, 1);
+    CHECK(!nv2a_present_chain_wanted() && !nv2a_present_chain_requested_profile(key, sizeof key));
+    nv2a_present_chain_request_profile("", comp, st, 1);
+    CHECK(!nv2a_present_chain_wanted());
+
+    remove(a);
+    remove(b);
+    remove(comp);
+    nv2a_present_chain_params_reset_for_test();
+}
+
+/* A preset past the table: its first 128 rows. */
+static void case_params_cap(const char *dir)
+{
+    static struct nv2a_present_param t[NV2A_PRESENT_PARAMS_MAX + 8];
+    char key[64];
+    void *h;
+
+    load_params_lib(dir);
+    h = fake_preset("pc_many.slangp");
+    nv2a_present_chain_request("pc_many.slangp");
+    nv2a_present_chain_params_publish(&h, nv2a_present_chain_gen());
+    CHECK(nv2a_present_chain_params(t, NV2A_PRESENT_PARAMS_MAX + 8, key, sizeof key)
+          == NV2A_PRESENT_PARAMS_MAX);
+    CHECK(!strcmp(t[0].name, "m0") && !strcmp(t[NV2A_PRESENT_PARAMS_MAX - 1].name, "m127"));
+    CHECK(nv2a_present_chain_param_set("m127", 0.5f));
+    CHECK(!nv2a_present_chain_param_set("m128", 0.5f));
+}
+
 int main(int argc, char **argv)
 {
     const char *c = argc > 1 ? argv[1] : "";
@@ -397,6 +595,10 @@ int main(int argc, char **argv)
         refused(p);
     } else if (!strcmp(c, "params")) {
         case_params(dir);
+    } else if (!strcmp(c, "profile")) {
+        case_profile(dir);
+    } else if (!strcmp(c, "params_cap")) {
+        case_params_cap(dir);
     } else if (!strcmp(c, "params_key")) {
         case_params_key();
     } else if (!strcmp(c, "describe") || !strcmp(c, "describe_nolib")) {

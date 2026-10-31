@@ -106,6 +106,12 @@ const recomp_cfg *enhance_cfg_file(int i);
 const char *enhance_cfg_user_path(void);
 const recomp_cfg *enhance_cfg_defaults(void);
 
+/* The per-game user folder, <root>/config, whatever file the layers read
+ * (a per-title file lives elsewhere; shader profiles do not follow it), or
+ * the RECOMP_CONFIG file's directory. 0 under RECOMP_CONFIG=none or before
+ * init. */
+int enhance_cfg_user_dir(char *out, size_t n);
+
 /* A key read by mod-settings precedence (design D4): the key with its
  * aliases (old spellings), user files over the defaults file, and in each
  * the key over its aliases. enhance_cfg_layered fills `out` with every file

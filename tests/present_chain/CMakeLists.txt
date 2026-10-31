@@ -2,7 +2,9 @@
 # (src/kernel/nv2a_present_chain.c): a missing library, a library with the
 # wrong ABI, a stand-in with the right one, the preset lookup beside the
 # executable, and the runtime-parameter store (present.shader_params) with
-# its overrides, save state and the descriptor dump's preset parse. The stand-ins export only librashader's two version calls, so
+# its overrides, save state and the descriptor dump's preset parse, and
+# profile requests (present.profile): rows tagged by stage, the profile
+# scope and the profile error. The stand-ins export only librashader's two version calls, so
 # the test needs neither the real library nor a GPU. Pure C:
 #   cmake -S tests/present_chain -B build/present_chain
 #   cmake --build build/present_chain && ctest --test-dir build/present_chain
@@ -49,7 +51,7 @@ if(NOT MSVC)
 endif()
 enable_testing()
 foreach(c request rate preset missing bad_abi old_api no_exports good params params_key
-        describe describe_nolib)
+        describe describe_nolib profile params_cap)
     add_test(NAME present_chain_${c} COMMAND present_chain_test ${c}
              $<TARGET_FILE_DIR:fake_lrs_good>
              WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})

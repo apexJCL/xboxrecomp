@@ -19,6 +19,12 @@
  *   snapshot  the pack's miss ring copied at the flip only while shown
  *   shaders   the Shaders page: the picker, the active preset's parameters
  *             live, Save as differences, the next start, Reset to preset
+ *   profiles  the profile picker (broken and newer skipped), the chain
+ *             rows, a stage's sub-list, Add, Move, Remove with its confirm,
+ *             the fork of a bundled preset, Rename on keyboard and pad,
+ *             Save as new, Duplicate, Delete, Save writing the files and
+ *             present.profile, the list read when the page opens, Reset to
+ *             defaults leaving the files
  *   shaders_hidden  no chain presenter, or no library: the page is left out
  *             of the tab strip and the paging, and why is said once
  *   pages     each page's draw list at 1920x1080 against a pinned sum
@@ -44,6 +50,7 @@
 #include "nv2a_tex_pack.h"
 #include "pad_map.h"
 #include "recomp_env.h"
+#include "shader_profile_edit.h"
 
 #include <fcntl.h>
 #include <stdarg.h>
@@ -85,6 +92,17 @@ void xbox_PacingSetMode(int mode) { s_pacing = mode; }
 /* kernel_ramfs.c's switch, which this test does not link. */
 void xbox_RamCacheEnable(int on);
 void xbox_RamCacheEnable(int on) { (void)on; }
+/* kernel_path.c: the shader cache root a chain profile composes under
+ * (shader_profile_req.c); NULL: none yet, as before the save root is up. */
+static const char *s_cache_root;
+int xbox_path_shader_cache(char *out, size_t n);
+int xbox_path_shader_cache(char *out, size_t n)
+{
+    if (!s_cache_root)
+        return 0;
+    snprintf(out, n, "%s", s_cache_root);
+    return 1;
+}
 
 ptrdiff_t xbox_GetMemoryOffset(void);
 ptrdiff_t xbox_GetMemoryOffset(void) { return 0; }
@@ -1255,7 +1273,7 @@ static void test_controls_groups(void)
  * step 0.05), as Metal and D3D11 do before their chain create. */
 static void chain_built(void)
 {
-    int preset = 0;
+    void *preset = NULL;    /* the fake's fixed table */
     CHECK(nv2a_present_chain_lib() != NULL);
     nv2a_present_chain_params_publish(&preset, nv2a_present_chain_gen());
 }
@@ -1270,7 +1288,7 @@ static void test_shaders(void)
     start_with(ARMED, NULL);
     open_menu();
     CHECK(enhance_menu_set_page("Shaders"));
-    CHECK(row_value("Shader") && !strcmp(row_value("Shader"), "none"));
+    CHECK(row_value("Profile") && !strcmp(row_value("Profile"), "Off"));
     CHECK(row_value("Parameters") && !strcmp(row_value("Parameters"), "no shader"));
     CHECK(!enhance_menu_select_row("Reset to preset"));
     open_menu();
@@ -1282,7 +1300,8 @@ static void test_shaders(void)
                "[present.shader_params.fsr]\nFSR_SHARPENING = 0.1\n", NULL);
     open_menu();
     CHECK(enhance_menu_set_page("Shaders"));
-    CHECK(row_value("Parameters") && !strcmp(row_value("Parameters"), "loading"));
+    CHECK(row_value("Profile") && !strcmp(row_value("Profile"), "crt-lottes"));
+    CHECK(row_value("Chain") && !strcmp(row_value("Chain"), "building"));
     chain_built();
     flip();
     CHECK(row_value("warpX") && !strcmp(row_value("warpX"), "0.01"));
@@ -1372,6 +1391,631 @@ static void test_shaders(void)
     nv2a_present_chain_params_clear();
 }
 
+/* ---- 7c. shader profiles (design D5, D10) ------------------------------ */
+
+#define ONE_PASS "shaders = 1\nshader0 = \"x.slang\"\n"
+#define PROFILES "config/shader-profiles"
+#define CACHE "composed-cache"
+
+/* The bundled presets beside the exe and the player's own under the root
+ * (both the test's folder), one pass each: the edits find and compose them. */
+static void shader_files(void)
+{
+    static const char *const k_names[] = { "crt-lottes", "crt-lottes-fast", "crt-hyllian", "fsr",
+                                           "stage_a", "stage_b", "broken_one", NULL };
+    char path[128];
+    MKDIR("shaders");
+    write_file("shaders/x.slang", "#version 450\n");
+    for (int i = 0; k_names[i]; i++) {
+        snprintf(path, sizeof path, "shaders/%s.slangp", k_names[i]);
+        write_file(path, ONE_PASS);
+    }
+}
+
+static void shader_files_remove(void)
+{
+    static const char *const k_names[] = { "crt-lottes", "crt-lottes-fast", "crt-hyllian", "fsr",
+                                           "stage_a", "stage_b", "broken_one", NULL };
+    char path[128];
+    for (int i = 0; k_names[i]; i++) {
+        snprintf(path, sizeof path, "shaders/%s.slangp", k_names[i]);
+        remove(path);
+    }
+    remove("shaders/x.slang");
+    rmdir("shaders");
+}
+
+/* The backend built the chain for the request in force: its own preset
+ * file's table (a composed chain's has A1 SHARED B1 ORPHAN). */
+static void chain_up(void)
+{
+    char path[1024];
+    unsigned gen = nv2a_present_chain_gen(), g = 0;
+    void *h = NULL;
+    void *(*create)(const char *, void **) =
+        (void *(*)(const char *, void **))nv2a_present_chain_lib()->sym("libra_preset_create");
+    if (nv2a_present_chain_preset(path, sizeof path, &g) == 1)
+        create(path, &h);
+    nv2a_present_chain_params_publish(&h, gen);
+    flip();
+}
+
+/* A pad button press and release, as tap() does for a key. */
+static void press(WORD w)
+{
+    hold_btn(w, 1);
+    advance(16);
+    poll0();
+    flip();
+    hold_btn(w, 0);
+    advance(16);
+    poll0();
+    flip();
+}
+
+static void press_a(void)
+{
+    hold_a(1);
+    advance(16);
+    poll0();
+    flip();
+    hold_a(0);
+    advance(16);
+    poll0();
+    flip();
+}
+
+static void shift_tap(int vk)
+{
+    xbox_InputKeyEvent(0x10, 1);
+    tap(vk);
+    xbox_InputKeyEvent(0x10, 0);
+}
+
+#define CFG_PROF ARMED "[present]\nshader_lib = \"" FAKE_LRS_PARAMS "\"\n"
+
+static void test_profiles(void)
+{
+    const char *f;
+    int n0;
+
+    MKDIR(PROFILES);
+    MKDIR(CACHE);
+    MKDIR(CACHE "/slangp");
+    s_cache_root = CACHE;
+    write_file(PROFILES "/mine.toml", "version = 1\nname = \"Mine\"\n"
+                                      "stages = [\"user:stage_a\", \"user:stage_b\"]\n"
+                                      "[params.stage_a]\nA1 = 1.5\n");
+    write_file(PROFILES "/bad.toml", "version = 1\nname = \"Bad\"\nstages = \n");
+    write_file(PROFILES "/newer.toml", "version = 2\nname = \"Newer\"\nstages = [\"fsr\"]\n");
+
+    /* The picker: Off, the bundled, then the player's; a broken or newer
+     * profile is listed but skipped. */
+    start_with(CFG_PROF, NULL);
+    open_menu();
+    CHECK(enhance_menu_set_page("Shaders"));
+    n0 = shader_edit_count();
+    CHECK(n0 == 8);
+    CHECK(!strcmp(row_value("Profile"), "Off"));
+    CHECK(enhance_menu_select_row("Profile"));
+    CHECK(enhance_menu_row_live(enhance_menu_selected()) == ENHANCE_LIVE);
+    for (int i = 0; i < 4; i++)
+        tap(0x27);
+    CHECK(!strcmp(row_value("Profile"), "fsr"));
+    tap(0x27);
+    CHECK(!strcmp(row_value("Profile"), "Mine"));
+    tap(0x27);
+    CHECK(!strcmp(row_value("Profile"), "Off"));
+    tap(0x25);
+    CHECK(!strcmp(row_value("Profile"), "Mine"));
+
+    /* Mine's chain: its stages, its pass count once built, its value. */
+    chain_up();
+    CHECK(row_value("Chain") && !strcmp(row_value("Chain"), "2 passes"));
+    CHECK(row_value("1  user:stage_a") != NULL);
+    CHECK(row_value("2  user:stage_b") != NULL);
+    /* Two stages: the parameters live in each stage's own list, and a name
+     * no stage lists on the main page. */
+    CHECK(row_value("a one") == NULL);
+    CHECK(row_value("orphan") != NULL);
+    CHECK(row_value("Rename") && !strcmp(s_val, "Mine"));
+    CHECK(enhance_menu_unsaved() == 1);   /* the choice */
+    tap(VK_F5);
+    f = read_file("config/config.toml");
+    CHECK(strstr(f, "profile = \"mine\"") != NULL);
+    CHECK(enhance_menu_unsaved() == 0);
+
+    /* A stage's list: its preset, its parameters with the shared note,
+     * Move, Remove, Reset; B goes back to the stage row. */
+    CHECK(enhance_menu_select_row("2  user:stage_b"));
+    tap(0x0D);
+    CHECK(row_value("Preset") && !strcmp(s_val, "user:stage_b"));
+    CHECK(row_value("b one") != NULL);
+    CHECK(row_value("a one") == NULL);
+    CHECK(row_value("orphan") == NULL);
+    CHECK(row_value("shared") != NULL);
+    tap(0x1B);
+    CHECK(enhance_menu_is_open());
+    CHECK(!strcmp(selected_label(), "2  user:stage_b"));
+
+    /* Move: Left on a stage row, live; the selection follows it. */
+    tap(0x25);
+    CHECK(row_value("1  user:stage_b") != NULL && row_value("2  user:stage_a") != NULL);
+    CHECK(!strcmp(selected_label(), "1  user:stage_b"));
+    CHECK(shader_edit_dirty(shader_edit_active()));
+    tap(0x25);   /* at the top: nothing */
+    CHECK(!strcmp(selected_label(), "1  user:stage_b"));
+    /* Move down from the stage's list. */
+    tap(0x0D);
+    CHECK(enhance_menu_select_row("Move down"));
+    tap(0x0D);
+    CHECK(row_value("Preset") && !strcmp(s_val, "user:stage_b"));
+    tap(0x1B);
+    CHECK(row_value("1  user:stage_a") != NULL && row_value("2  user:stage_b") != NULL);
+    CHECK(!shader_edit_dirty(shader_edit_active()));
+
+    /* Remove asks first; Esc keeps the stage. */
+    CHECK(enhance_menu_select_row("2  user:stage_b"));
+    tap(0x2E);
+    CHECK(enhance_menu_select_row("Remove user:stage_b? A / Enter: yes"));
+    tap(0x1B);
+    CHECK(enhance_menu_is_open());
+    CHECK(row_value("2  user:stage_b") != NULL);
+    tap(0x2E);
+    CHECK(enhance_menu_select_row("Remove user:stage_b? A / Enter: yes"));
+    tap(0x0D);
+    CHECK(row_value("2  user:stage_b") == NULL);
+    chain_up();
+    /* One stage: its parameters on the main list again. */
+    CHECK(row_value("a one") && !strcmp(s_val, "1.5"));
+    CHECK(enhance_menu_select_row("1  user:stage_a"));
+    tap(0x2E);
+    CHECK(strstr(enhance_menu_status(), "The last stage stays") != NULL);
+    CHECK(row_value("1  user:stage_a") != NULL);
+
+    /* Add: a preset that does not parse is refused; one that does goes
+     * last. */
+    CHECK(enhance_menu_select_row("Add shader"));
+    tap(0x0D);
+    CHECK(enhance_menu_select_row("user:broken_one"));
+    tap(0x0D);
+    CHECK(strstr(enhance_menu_status(), "does not parse") != NULL);
+    CHECK(enhance_menu_select_row("user:stage_b"));
+    tap(0x0D);
+    CHECK(row_value("2  user:stage_b") != NULL);
+    CHECK(!strcmp(selected_label(), "2  user:stage_b"));
+    CHECK(strstr(enhance_menu_status(), "added") != NULL);
+
+    /* Save writes the file. */
+    tap(VK_F5);
+    f = read_file(PROFILES "/mine.toml");
+    CHECK(strstr(f, "user:stage_a") && strstr(f, "user:stage_b"));
+    CHECK(strstr(f, "A1 = 1.5") != NULL);
+    CHECK(enhance_menu_unsaved() == 0);
+    CHECK(read_file(CACHE "/slangp/mine.slangp")[0] != 0);
+
+    /* Rename on the keyboard: letters, Q and E, F5 type or are swallowed;
+     * Enter keeps it. */
+    CHECK(enhance_menu_select_row("Rename"));
+    tap(0x0D);
+    for (int i = 0; i < 4; i++)
+        tap(0x08);
+    shift_tap('M');
+    tap('Y');
+    tap(0x20);
+    tap('Q');
+    tap('E');
+    tap(VK_F5);
+    CHECK(!strcmp(enhance_menu_page_name(enhance_menu_page()), "Shaders"));
+    CHECK(row_value("Rename") && !strcmp(s_val, "My qe|"));
+    tap(0x25);
+    tap(0x2E);
+    CHECK(row_value("Rename") && !strcmp(s_val, "My q|"));
+    tap(0x0D);
+    CHECK(strstr(enhance_menu_status(), "Renamed to My q") != NULL);
+    CHECK(row_value("Profile") && !strcmp(s_val, "My q"));
+    /* The chain may still read the old composed file until a request
+     * names the new one; then the old one goes. */
+    CHECK(read_file(CACHE "/slangp/mine.slangp")[0] != 0);
+    tap(VK_F5);
+    f = read_file(PROFILES "/my-q.toml");
+    CHECK(strstr(f, "name = \"My q\"") != NULL);
+    CHECK(read_file(PROFILES "/mine.toml")[0] == 0);
+    CHECK(read_file(CACHE "/slangp/mine.slangp")[0] != 0);
+    CHECK(enhance_menu_select_row("Profile"));
+    tap(0x27);
+    CHECK(!strcmp(row_value("Profile"), "Off"));
+    CHECK(read_file(CACHE "/slangp/mine.slangp")[0] == 0);
+    tap(0x25);
+    chain_up();
+    CHECK(read_file(CACHE "/slangp/my-q.slangp")[0] != 0);
+    f = read_file("config/config.toml");
+    CHECK(strstr(f, "profile = \"my-q\"") != NULL);
+
+    /* Rename on the pad: Up past the end adds a letter under the cursor
+     * and cycles it; B cancels. */
+    CHECK(enhance_menu_select_row("Rename"));
+    press_a();
+    press(XBOX_GAMEPAD_DPAD_UP);
+    CHECK(row_value("Rename") && !strcmp(s_val, "My q|A"));
+    press(XBOX_GAMEPAD_DPAD_UP);
+    CHECK(row_value("Rename") && !strcmp(s_val, "My q|B"));
+    f_pad[0].Gamepad.bAnalogButtons[XBOX_BUTTON_B] = 255;
+    advance(16);
+    poll0();
+    f_pad[0].Gamepad.bAnalogButtons[XBOX_BUTTON_B] = 0;
+    advance(16);
+    poll0();
+    CHECK(strstr(enhance_menu_status(), "Rename cancelled") != NULL);
+    CHECK(enhance_menu_is_open());
+    CHECK(row_value("Profile") && !strcmp(s_val, "My q"));
+
+    /* Save as new and Duplicate: unsaved copies, chosen; Delete of an
+     * unsaved one leaves no file. */
+    CHECK(enhance_menu_select_row("Save as new"));
+    tap(0x0D);
+    CHECK(row_value("Profile") && !strcmp(s_val, "Profile 1"));
+    CHECK(enhance_menu_unsaved() > 0);
+    CHECK(enhance_menu_select_row("Duplicate"));
+    tap(0x0D);
+    CHECK(row_value("Profile") && !strcmp(s_val, "Profile 1 copy"));
+    CHECK(enhance_menu_select_row("Delete"));
+    tap(0x0D);
+    CHECK(enhance_menu_select_row("Delete this profile? A / Enter: yes"));
+    tap(0x0D);
+    CHECK(strstr(enhance_menu_status(), "Deleted Profile 1 copy") != NULL);
+    CHECK(!strcmp(row_value("Profile"), "Off"));
+
+    /* Delete a saved one: its file and present.profile go at once. */
+    CHECK(enhance_menu_select_row("Profile"));
+    tap(0x25);
+    tap(0x25);
+    CHECK(!strcmp(row_value("Profile"), "My q"));
+    CHECK(enhance_menu_select_row("Delete"));
+    tap(0x0D);
+    tap(0x0D);
+    CHECK(strstr(enhance_menu_status(), "Deleted My q") != NULL);
+    CHECK(read_file(PROFILES "/my-q.toml")[0] == 0);
+    CHECK(read_file(CACHE "/slangp/my-q.slangp")[0] == 0);
+    f = read_file("config/config.toml");
+    /* The key, not the word: shader_lib's path may hold "profile". */
+    CHECK(strstr(f, "\nprofile =") == NULL);
+
+    /* The fork: an edit on a bundled preset makes "<name> custom". */
+    CHECK(enhance_menu_select_row("Profile"));
+    for (int i = 0; i < 12 && strcmp(row_value("Profile"), "fsr"); i++)
+        tap(0x27);
+    CHECK(enhance_menu_select_row("Add shader"));
+    tap(0x0D);
+    CHECK(enhance_menu_select_row("user:stage_a"));
+    tap(0x0D);
+    CHECK(row_value("Profile") && !strcmp(s_val, "fsr custom"));
+    CHECK(strstr(enhance_menu_status(), "Now editing fsr custom") != NULL);
+    CHECK(row_value("1  fsr") && row_value("2  user:stage_a"));
+    open_menu();
+
+    /* The folder is read when the page opens: a file added meanwhile shows
+     * at the next open, and the unsaved profiles stay. */
+    write_file(PROFILES "/later.toml", "version = 1\nname = \"Later\"\nstages = [\"fsr\"]\n");
+    n0 = shader_edit_count();
+    open_menu();
+    CHECK(enhance_menu_set_page("Shaders"));
+    CHECK(shader_edit_count() == n0 + 1);
+    CHECK(!strcmp(row_value("Profile"), "fsr custom"));
+
+    /* Reset to defaults: the picker to Off, the files stay. */
+    CHECK(enhance_menu_set_page("Save"));
+    CHECK(enhance_menu_select_row("Reset to defaults"));
+    tap(0x0D);
+    CHECK(enhance_menu_select_row("Reset everything? A / Enter: yes"));
+    tap(0x0D);
+    CHECK(enhance_menu_set_page("Shaders"));
+    CHECK(!strcmp(row_value("Profile"), "Off"));
+    CHECK(read_file(PROFILES "/later.toml")[0] != 0);
+    open_menu();
+
+    remove(PROFILES "/later.toml");
+    remove(PROFILES "/bad.toml");
+    remove(PROFILES "/newer.toml");
+    remove(PROFILES "/fsr-custom.toml");
+    rmdir(PROFILES);
+    remove(CACHE "/slangp/mine.slangp");
+    remove(CACHE "/slangp/my-q.slangp");
+    remove(CACHE "/slangp/~unsaved.slangp");   /* an unsaved profile's */
+    rmdir(CACHE "/slangp");
+    rmdir(CACHE);
+    s_cache_root = NULL;
+    nv2a_present_chain_params_clear();
+}
+
+/* An env var holds the chain: every chain edit is refused, its row dimmed
+ * with the var's name, and the request and the files stay as they were. */
+static void test_profiles_forced(void)
+{
+    char req[64];
+    int i, n0;
+
+    MKDIR(PROFILES);
+    MKDIR(CACHE);
+    MKDIR(CACHE "/slangp");
+    s_cache_root = CACHE;
+    write_file(PROFILES "/mine.toml", "version = 1\nname = \"Mine\"\n"
+                                      "stages = [\"user:stage_a\", \"user:stage_b\"]\n");
+    set_env("RECOMP_PRESENT_PROFILE", "mine");
+    start_with(CFG_PROF, NULL);
+    open_menu();
+    CHECK(enhance_menu_set_page("Shaders"));
+    CHECK(row_value("Profile") && !strcmp(s_val, "Mine"));
+    n0 = shader_edit_count();
+    chain_up();
+    for (int k = 0; k < 6; k++) {
+        static const char *const rows[] = { "Save as new", "Duplicate", "Delete",
+                                            "Rename",      "Add shader", "Profile" };
+        i = row_index(rows[k]);
+        CHECK(i >= 0 && strstr(enhance_menu_row_help(i), "Set by RECOMP_PRESENT_PROFILE"));
+    }
+    /* Move, Remove, Add, Save as new, Duplicate, Delete, Rename. */
+    CHECK(enhance_menu_select_row("1  user:stage_a"));
+    tap(0x27);
+    CHECK(strstr(enhance_menu_status(), "Set by RECOMP_PRESENT_PROFILE") != NULL);
+    CHECK(row_value("1  user:stage_a") && row_value("2  user:stage_b"));
+    tap(0x2E);
+    CHECK(strstr(enhance_menu_status(), "Set by RECOMP_PRESENT_PROFILE") != NULL);
+    CHECK(!enhance_menu_select_row("Remove user:stage_a? A / Enter: yes"));
+    tap(0x0D);
+    CHECK(enhance_menu_select_row("Move down"));
+    i = enhance_menu_selected();
+    CHECK(strstr(enhance_menu_row_help(i), "Set by RECOMP_PRESENT_PROFILE") != NULL);
+    tap(0x0D);
+    CHECK(strstr(enhance_menu_status(), "Set by RECOMP_PRESENT_PROFILE") != NULL);
+    CHECK(enhance_menu_select_row("Remove"));
+    tap(0x0D);
+    CHECK(!enhance_menu_select_row("Remove user:stage_a? A / Enter: yes"));
+    tap(0x1B);
+    CHECK(row_value("1  user:stage_a") && row_value("2  user:stage_b"));
+    CHECK(enhance_menu_select_row("Add shader"));
+    tap(0x0D);
+    CHECK(strstr(enhance_menu_status(), "Set by RECOMP_PRESENT_PROFILE") != NULL);
+    CHECK(enhance_menu_select_row("Save as new"));
+    tap(0x0D);
+    CHECK(enhance_menu_select_row("Duplicate"));
+    tap(0x0D);
+    CHECK(enhance_menu_select_row("Delete"));
+    tap(0x0D);
+    tap(0x0D);
+    CHECK(enhance_menu_select_row("Rename"));
+    tap(0x0D);
+    CHECK(strstr(enhance_menu_status(), "Set by RECOMP_PRESENT_PROFILE") != NULL);
+    CHECK(row_value("Rename") && !strcmp(s_val, "Mine"));
+    CHECK(row_value("Profile") && !strcmp(s_val, "Mine"));
+    CHECK(shader_edit_count() == n0);
+    CHECK(!shader_edit_dirty(shader_edit_active()));
+    CHECK(read_file(PROFILES "/mine.toml")[0] != 0);
+    CHECK(nv2a_present_chain_requested_profile(req, sizeof req) && !strcmp(req, "mine"));
+    open_menu();
+
+    /* RECOMP_PRESENT_SHADER the same, on a bundled preset. */
+    set_env("RECOMP_PRESENT_PROFILE", NULL);
+    set_env("RECOMP_PRESENT_SHADER", "fsr");
+    start_with(CFG_PROF, NULL);
+    open_menu();
+    CHECK(enhance_menu_set_page("Shaders"));
+    CHECK(row_value("Profile") && !strcmp(s_val, "fsr"));
+    chain_up();
+    CHECK(enhance_menu_select_row("Save as new"));
+    tap(0x0D);
+    CHECK(strstr(enhance_menu_status(), "Set by RECOMP_PRESENT_SHADER") != NULL);
+    CHECK(enhance_menu_select_row("Add shader"));
+    tap(0x0D);
+    CHECK(strstr(enhance_menu_status(), "Set by RECOMP_PRESENT_SHADER") != NULL);
+    CHECK(row_value("Profile") && !strcmp(s_val, "fsr"));
+    nv2a_present_chain_requested(req, sizeof req);
+    CHECK(!strcmp(req, "fsr"));
+    open_menu();
+    set_env("RECOMP_PRESENT_SHADER", NULL);
+
+    remove(PROFILES "/mine.toml");
+    rmdir(PROFILES);
+    remove(CACHE "/slangp/mine.slangp");
+    rmdir(CACHE "/slangp");
+    rmdir(CACHE);
+    s_cache_root = NULL;
+    nv2a_present_chain_params_clear();
+}
+
+/* start_with under a per-title file, T1/config.toml over config.toml. */
+static void start_titled(const char *user, const char *title)
+{
+    MKDIR("T1");
+    write_file("T1/config.toml", title);
+    write_file("config/config.toml", user);
+    xbox_mod_shutdown();
+    enhance_menu_reset_for_test();
+    nv2a_present_chain_params_reset_for_test();
+    xbox_InputSetBackend(&k_fake);
+    xbox_InputKeysClear();
+    pad_clear();
+    xbox_mod_register_table(NULL);
+    capture_begin();
+    xbox_enhance_init(".", "T1");
+    capture_end();
+    nv2a_overlay_set_placement(0, 0, 1920, 1080);
+    poll0();
+}
+
+/* Delete takes present.profile out of every file that names the profile,
+ * not only the one Save writes; one it cannot write is named in the
+ * status. */
+static void test_profiles_delete_layers(void)
+{
+    static const char mine[] = "version = 1\nname = \"Mine\"\nstages = [\"fsr\"]\n";
+    const char *f;
+
+    MKDIR(PROFILES);
+    MKDIR(CACHE);
+    MKDIR(CACHE "/slangp");
+    s_cache_root = CACHE;
+    write_file(PROFILES "/mine.toml", mine);
+    start_titled(CFG_PROF "profile = \"mine\"\n", ARMED "[present]\nprofile = \"mine\"\n");
+    open_menu();
+    CHECK(enhance_menu_set_page("Shaders"));
+    CHECK(row_value("Profile") && !strcmp(s_val, "Mine"));
+    CHECK(enhance_menu_select_row("Delete"));
+    tap(0x0D);
+    tap(0x0D);
+    CHECK(!strcmp(enhance_menu_status(), "Deleted Mine"));
+    CHECK(read_file(PROFILES "/mine.toml")[0] == 0);
+    f = read_file("T1/config.toml");
+    CHECK(strstr(f, "profile =") == NULL);
+    f = read_file("config/config.toml");
+    CHECK(strstr(f, "\nprofile =") == NULL);
+    CHECK(strstr(f, "shader_lib") != NULL);
+    open_menu();
+
+#ifndef _WIN32
+    /* The user file under the title file, in a folder it cannot write. */
+    write_file(PROFILES "/mine.toml", mine);
+    start_titled(CFG_PROF "profile = \"mine\"\n", ARMED);
+    open_menu();
+    CHECK(enhance_menu_set_page("Shaders"));
+    CHECK(row_value("Profile") && !strcmp(s_val, "Mine"));
+    chmod("config", 0555);
+    CHECK(enhance_menu_select_row("Delete"));
+    tap(0x0D);
+    tap(0x0D);
+    chmod("config", 0755);
+    f = enhance_menu_status();
+    CHECK(strstr(f, "Deleted Mine; present.profile still names it in ") != NULL);
+    CHECK(strstr(f, "config.toml") != NULL);
+    CHECK(read_file(PROFILES "/mine.toml")[0] == 0);
+    CHECK(strstr(read_file("config/config.toml"), "\nprofile = \"mine\"") != NULL);
+    open_menu();
+#endif
+
+    remove("T1/config.toml");
+    rmdir("T1");
+    rmdir(PROFILES);
+    remove(CACHE "/slangp/mine.slangp");
+    rmdir(CACHE "/slangp");
+    rmdir(CACHE);
+    s_cache_root = NULL;
+    nv2a_present_chain_params_clear();
+}
+
+/* The start's profile request waits for the first present. The Shaders
+ * page opened before it loads the file's values at its own first request;
+ * opened after, the store's (edited) values stand. */
+static void test_profiles_early(void)
+{
+    float v = 0;
+
+    MKDIR(PROFILES);
+    MKDIR(CACHE);
+    MKDIR(CACHE "/slangp");
+    s_cache_root = CACHE;
+    write_file(PROFILES "/early.toml", "version = 1\nname = \"Early\"\n"
+                                       "stages = [\"user:stage_a\"]\n[params.stage_a]\nA1 = 1.5\n");
+    start_with(CFG_PROF "profile = \"early\"\n", NULL);
+    open_menu();
+    CHECK(enhance_menu_set_page("Shaders"));
+    CHECK(row_value("Profile") && !strcmp(s_val, "Early"));
+    CHECK(!nv2a_present_chain_profile_value_get("early", "A1", &v));
+    CHECK(enhance_menu_select_row("Add shader"));
+    tap(0x0D);
+    CHECK(enhance_menu_select_row("user:stage_b"));
+    tap(0x0D);
+    CHECK(row_value("2  user:stage_b") != NULL);
+    CHECK(nv2a_present_chain_profile_value_get("early", "A1", &v) && v == 1.5f);
+    open_menu();
+
+    /* After the first present: an edit on the page survives the next
+     * request. */
+    start_with(CFG_PROF "profile = \"early\"\n", NULL);
+    chain_up();
+    CHECK(nv2a_present_chain_profile_value_get("early", "A1", &v) && v == 1.5f);
+    nv2a_present_chain_profile_value_load("early", "A1", 2.5f);
+    open_menu();
+    CHECK(enhance_menu_set_page("Shaders"));
+    CHECK(enhance_menu_select_row("Add shader"));
+    tap(0x0D);
+    CHECK(enhance_menu_select_row("user:stage_b"));
+    tap(0x0D);
+    CHECK(row_value("2  user:stage_b") != NULL);
+    CHECK(nv2a_present_chain_profile_value_get("early", "A1", &v) && v == 2.5f);
+    open_menu();
+
+    remove(PROFILES "/early.toml");
+    rmdir(PROFILES);
+    remove(CACHE "/slangp/early.slangp");
+    remove(CACHE "/slangp/~unsaved.slangp");
+    rmdir(CACHE "/slangp");
+    rmdir(CACHE);
+    s_cache_root = NULL;
+    nv2a_present_chain_params_clear();
+}
+
+/* A long chain error on the Chain header is cut to the room the label
+ * leaves: drawn whole from the right edge, it ran over "Chain" and out of
+ * the panel (seen on Metal with a missing stage's path). */
+static uint32_t premul_of(mu_Color c)
+{
+    unsigned char b[4] = { (unsigned char)((c.r * c.a + 127) / 255),
+                           (unsigned char)((c.g * c.a + 127) / 255),
+                           (unsigned char)((c.b * c.a + 127) / 255), c.a };
+    uint32_t v;
+    memcpy(&v, b, 4);
+    return v;
+}
+
+static void test_profiles_long_error(void)
+{
+    const struct nv2a_ovl_theme *t = &nv2a_ovl_theme_default;
+    const struct nv2a_ovl_list *l;
+    uint32_t bad = premul_of(t->bad), accent = premul_of(t->accent);
+    float bad_y = 1e9f, bad_x = 1e9f, label_x = -1e9f;
+
+    MKDIR(PROFILES);
+    MKDIR(CACHE);
+    MKDIR(CACHE "/slangp");
+    s_cache_root = CACHE;
+    write_file(PROFILES "/far.toml",
+               "version = 1\nname = \"Far\"\nstages = [\"user:stage_a\", \"shaders/"
+               "MW-a-preset-named-WIDE-MMMMWWWWMMMMWWWWMMMMWWWWMMMMWWWWMMMMWWWW.slangp\"]\n");
+    start_with(CFG_PROF "profile = \"far\"\n", NULL);
+    chain_up();
+    open_menu();
+    CHECK(enhance_menu_set_page("Shaders"));
+    CHECK(row_value("Chain") && strstr(s_val, "MW-a-preset-named-WIDE") != NULL);
+    enhance_menu_draw(100000);
+    l = nv2a_overlay_acquire(NV2A_OVL_MENU);
+    CHECK(l != NULL && l->nvtx > 0);
+    for (uint32_t i = 0; l && i < l->nvtx; i++)
+        if (l->vtx[i].rgba == bad && l->vtx[i].y < bad_y)
+            bad_y = l->vtx[i].y;
+    /* The topmost red text is the header's; "Chain" sits on its line. */
+    for (uint32_t i = 0; l && i < l->nvtx; i++) {
+        const struct nv2a_ovl_vtx *v = &l->vtx[i];
+        if (v->y < bad_y - 2 || v->y > bad_y + 10)
+            continue;
+        if (v->rgba == bad && v->x < bad_x)
+            bad_x = v->x;
+        if (v->rgba == accent && v->x > label_x)
+            label_x = v->x;
+    }
+    CHECK(label_x > 0);
+    CHECK(bad_x > label_x);
+    open_menu();
+
+    remove(PROFILES "/far.toml");
+    rmdir(PROFILES);
+    remove(CACHE "/slangp/far.slangp");
+    remove(CACHE "/slangp/~unsaved.slangp");
+    rmdir(CACHE "/slangp");
+    rmdir(CACHE);
+    s_cache_root = NULL;
+    nv2a_present_chain_params_clear();
+}
+
 static uint32_t sum_of(const struct nv2a_ovl_list *l)
 {
     return nv2a_overlay_list_sum(l->vtx, l->nvtx, l->idx, l->nidx, l->cmd, l->ncmd);
@@ -1381,7 +2025,7 @@ static void test_pages(void)
 {
     /* Render, Shaders, Pack, Game, Mods, Stats, Controls, Debug, Save. */
     static const uint32_t k_sum[9] = {
-        0xC7247387u, 0x53B87B2Du, 0x14C4B84Eu, 0x9990C101u, 0x677BFFE6u,
+        0xC7247387u, 0x39B5FB95u, 0x14C4B84Eu, 0x9990C101u, 0x677BFFE6u,
         0xE26B4D93u, 0xAE5AA710u, 0x301034FDu, 0x37C23792u };
     start_with(ARMED, k_mods);
     open_menu();
@@ -1457,7 +2101,7 @@ static void test_shaders_hidden(void)
     CHECK(!enhance_menu_set_page("Shaders"));
     CHECK(!strcmp(enhance_menu_page_name(enhance_menu_page()), "Render"));
     /* The picker is not moved to Render. */
-    CHECK(row_value("Shader") == NULL);
+    CHECK(row_value("Profile") == NULL);
     tap('E');
     CHECK(!strcmp(enhance_menu_page_name(enhance_menu_page()), "Pack"));
     tap('Q');
@@ -1605,6 +2249,7 @@ int main(int argc, char **argv)
     set_env("RECOMP_TRACE", NULL);
     set_env("RECOMP_PB_BACKEND", NULL);
     shaders_supported();
+    shader_files();
     test_start();
     test_navigate();
     test_mods();
@@ -1621,6 +2266,11 @@ int main(int argc, char **argv)
     test_mouse();
     test_snapshot();
     test_shaders();
+    test_profiles();
+    test_profiles_forced();
+    test_profiles_delete_layers();
+    test_profiles_early();
+    test_profiles_long_error();
     test_pages();
     test_save_deep();   /* after the pins: its Save moves the Debug page's options gen */
     test_save_tables();
@@ -1631,6 +2281,7 @@ int main(int argc, char **argv)
     enhance_actions_reset();
     remove("config/config.toml");
     remove("menu_stderr.txt");
+    shader_files_remove();
     printf("enhance_menu: %d checks, %d failed\n", s_checks, s_fail);
     return s_fail ? 1 : 0;
 }

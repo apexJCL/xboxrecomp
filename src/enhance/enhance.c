@@ -21,6 +21,7 @@
 #include "nv2a_present_chain.h"
 #include "nv2a_tex_pack.h"
 #include "recomp_exe_dir.h"
+#include "shader_profile.h"
 
 #define LOGP "[ENHANCE] "
 #define SCALE_MAX 4
@@ -149,10 +150,10 @@ static const char *const s_movie[] = { "black", "fit", "fill", NULL };
 int xbox_enhance_init(const char *root, const char *title)
 {
     struct nv2a_host_opts o;
-    const char *aspect, *shader, *shader_lib;
+    const char *aspect, *shader_lib;
     long long scale, aniso, overscan;
     int rc, pacing, surface;
-    char surface_txt[48], overscan_txt[64] = "", hud_txt[96] = "";
+    char surface_txt[48], overscan_txt[64] = "", hud_txt[96] = "", shader[512];
 
     rc = enhance_cfg_init(root, title) < 0 ? -1 : 0;
     memset(&o, 0, sizeof o);
@@ -274,18 +275,26 @@ int xbox_enhance_init(const char *root, const char *title)
     if (o.aspect_w)
         fprintf(stderr, LOGP "display.aspect=%s display.movie=%s\n", aspect,
                 s_movie[o.movie_mode]);
-    /* A slang preset in place of the present draw (nv2a_present_chain.h).
-     * Only the request is stored here: the library loads at the first
-     * present that wants it, so "none" never touches it. */
-    shader = enhance_cfg_string("present.shader", "none");
+    /* A slang preset or a shader profile in place of the present draw
+     * (nv2a_present_chain.h, shader_profile.h). Only the request is stored
+     * here: the library loads at the first present that wants it, so a
+     * stock start never touches it, nor any profile file. */
     shader_lib = enhance_cfg_string("present.shader_lib", "");
     nv2a_present_chain_set_lib(shader_lib);
     load_shader_params();
-    nv2a_present_chain_request(shader);
-    if (shader && *shader && strcmp(shader, "none"))
+    switch (shader_profile_start(root, shader, sizeof shader)) {
+    case 1:
         fprintf(stderr, LOGP "present.shader=%s%s%s\n", shader,
                 shader_lib && *shader_lib ? " present.shader_lib=" : "",
                 shader_lib && *shader_lib ? shader_lib : "");
+        break;
+    case 2:
+        /* Logged only when chosen, as present.shader: the golden check
+         * reads "[ENHANCE] present.profile=" for its stock value. */
+        shader_profile_start_slug(shader, sizeof shader);
+        fprintf(stderr, LOGP "present.profile=%s\n", shader);
+        break;
+    }
     load_tex_pack(&o);
     enhance_input_init();
     /* The toolkit's host actions before the mods register theirs. */

@@ -64,6 +64,10 @@ void xbox_PacingSetMode(int mode) { (void)mode; }
 /* kernel_ramfs.c's switch, which this test does not link. */
 void xbox_RamCacheEnable(int on);
 void xbox_RamCacheEnable(int on) { (void)on; }
+/* kernel_path.c: no save root in this test, so a chain profile cannot
+ * compose (shader_profile_req.c). */
+int xbox_path_shader_cache(char *out, size_t n);
+int xbox_path_shader_cache(char *out, size_t n) { (void)out; (void)n; return 0; }
 int nv2a_overlay_arm(uint32_t layers, uint32_t out_h)
 {
     (void)layers;
@@ -875,7 +879,8 @@ static void test_dump(void)
     CHECK(xbox_mod_describe_write("empty.json") == 0);
     got = read_all("empty.json");
     CHECK(got && !strcmp(got, "{\"schema\": 1, \"api\": 5, \"mods\": [], \"shaders\": "
-                             "{\"active\": \"none\", \"presets\": []}}\n"));
+                             "{\"active\": \"none\", \"presets\": [], \"active_profile\": "
+                             "\"none\", \"profiles\": []}}\n"));
     free(got);
 
 #ifndef _WIN32
@@ -928,6 +933,12 @@ static void test_dump(void)
 
         remove("shaders.json");
         write_file("dump_test.slangp", "shaders = 0\n");
+        MKDIR("config/shader-profiles");
+        write_file("config/shader-profiles/duo.toml",
+                   "version = 1\nname = \"Duo\"\nstages = [\"fsr\", \"user:mine\"]\n");
+        write_file("config/shader-profiles/bad.toml", "version = 1\nstages = 3\n");
+        write_file("config/shader-profiles/later.toml",
+                   "version = 9\nname = \"Later\"\nstages = [\"fsr\"]\n");
         fflush(NULL);
         pid = fork();
         if (pid == 0) {
@@ -955,12 +966,56 @@ static void test_dump(void)
         CHECK(got && strstr(got, "{\"name\": \"maskDark\", \"label\": \"Lottes maskDark\", "
                                  "\"min\": 0, \"max\": 2, \"step\": 0.05, \"default\": 0.5, "
                                  "\"value\": 0.8, \"key\": "
-                                 "\"present.shader_params.dump_test.maskDark\"}]}\n  ]}}\n")
+                                 "\"present.shader_params.dump_test.maskDark\"}]}\n  ], ")
+                  != NULL);
+        /* The profiles: the folder's files, the broken and the newer one
+         * listed with their state (the bundled presets have no files here,
+         * so the library reads none of them). */
+        CHECK(got && strstr(got, "\"active_profile\": \"none\", \"profiles\": [\n"
+                                 "    {\"name\": \"bad\", \"slug\": \"bad\", \"file\": "
+                                 "\"bad.toml\", \"stages\": [], \"builtin\": false, \"state\": "
+                                 "\"broken\"},\n"
+                                 "    {\"name\": \"Duo\", \"slug\": \"duo\", \"file\": \"duo.toml\", "
+                                 "\"stages\": [\"fsr\", \"user:mine\"], \"builtin\": false, "
+                                 "\"state\": \"ok\"},\n"
+                                 "    {\"name\": \"Later\", \"slug\": \"later\", \"file\": "
+                                 "\"later.toml\", \"stages\": [\"fsr\"], \"builtin\": false, "
+                                 "\"state\": \"newer\"}\n  ]}}\n")
                   != NULL);
         if (got && s_fail)
             fprintf(stderr, "shaders.json:\n%s", got);
         free(got);
         remove("shaders.json");
+
+        /* active_profile: the start's choice. */
+        fflush(NULL);
+        pid = fork();
+        if (pid == 0) {
+            int fd = OPEN_TRUNC("child_stderr.txt");
+            if (fd >= 0) {
+                DUP2(fd, 2);
+                CLOSE(fd);
+            }
+            set_env("RECOMP_MODS_DESCRIBE", "json");
+            set_env("RECOMP_MODS_DESCRIBE_OUT", "shaders.json");
+            write_file("config/config.toml", "[present]\nprofile = \"duo\"\nshader_lib = \""
+                       FAKE_LRS_PARAMS "\"\n");
+            xbox_mod_register_table(NULL);
+            xbox_enhance_init(".", NULL);
+            _exit(9);
+        }
+        CHECK(pid > 0 && waitpid(pid, &st, 0) == pid);
+        CHECK(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+        got = read_all("shaders.json");
+        CHECK(got && strstr(got, "\"active_profile\": \"duo\", \"profiles\": [") != NULL);
+        if (got && s_fail)
+            fprintf(stderr, "shaders.json:\n%s", got);
+        free(got);
+        remove("shaders.json");
+        remove("config/shader-profiles/duo.toml");
+        remove("config/shader-profiles/bad.toml");
+        remove("config/shader-profiles/later.toml");
+        rmdir("config/shader-profiles");
         remove("dump_test.slangp");
         remove("config/config.toml");
     }

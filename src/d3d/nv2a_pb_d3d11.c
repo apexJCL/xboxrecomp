@@ -72,8 +72,8 @@ typedef HRESULT (WINAPI *compile_fn)(LPCVOID, SIZE_T, LPCSTR,
                                      ID3DBlob **, ID3DBlob **);
 typedef HRESULT (WINAPI *create_blob_fn)(SIZE_T, ID3DBlob **);
 
-/* kernel_path.c: the HDD root, which the shader cache sits under. */
-int xbox_path_hdd_root(char *out, size_t n);
+/* kernel_path.c: <HDD root>/ShaderCache, which the dxbc cache sits under. */
+int xbox_path_shader_cache(char *out, size_t n);
 
 /* ---- device ------------------------------------------------------------ */
 
@@ -453,9 +453,9 @@ static void shader_cache_setup(HMODULE dll)
              (unsigned long)fa.ftLastWriteTime.dwLowDateTime, dll_file_version(dll));
     if (kind == SHADER_CACHE_ENV_DIR) {
         snprintf(dir, sizeof dir, "%s", e);
-    } else if (xbox_path_hdd_root(dir, sizeof dir - 32)) {
+    } else if (xbox_path_shader_cache(dir, sizeof dir - 8)) {
         /* Beside the saves, under no name a guest path maps to. */
-        strcat(dir, "\\ShaderCache\\dxbc");
+        strcat(dir, "/dxbc");
     } else {
         fprintf(stderr, LOGP "shader cache: off (no HDD root yet)\n");
         return;
