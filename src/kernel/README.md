@@ -184,13 +184,29 @@ half save and two instances started together copy each folder once. Files
 and folders keep their times (a save's date is its folder's last write). A
 link to a file is copied as the file; a link to a folder, a junction or an
 unreadable file fails the copy, which then leaves no marker, no empty
-`UDATA` and a `.legacy-saves-failed-<UDATA|TDATA>` note. The next run tries
-again while that folder in the new root is missing or empty. Once the player
-has saved into it, it is never overwritten: each run logs that the old saves
-wait in the shared root to be copied by hand, which ends by deleting the
-note. Read-only files are copied and stay read-only. On macOS the flushes
-use `F_FULLFSYNC`, and the root is flushed before the marker. The shared
-root is never written.
+`UDATA` and a `.legacy-saves-failed-<UDATA|TDATA>` note. Every failure
+(a folder that cannot be made, a path too long) leaves the note, which says
+in words what happened, and a note that cannot be written is logged. The
+next run tries again while that folder in the new root is missing or empty.
+Once the player has saved into it, it is never overwritten: each run logs
+that the old saves wait in the shared root to be copied by hand, which ends
+by deleting the note. A note whose folder is gone from the shared root is
+removed. One whose whole `UDATA` or `TDATA` is missing there is kept, and
+no marker is written, so a run with the shared root back looks again. A
+folder that holds the copy, meaning every top-level entry of the shared
+root's folder with the same name and last write, counts as present, and a
+note next to it is removed. So a rename that meets another instance's copy,
+even one its game has saved into, takes it as present. A folder another
+instance's game made during the copy keeps its save and fails with the
+note. That test fails safe: a copy whose times were refused (logged), or
+whose top-level entries the winner's game changed, reads as not a copy and
+leaves a note, which tells the player to check before copying by hand. On
+Win32 the empty folder a copy replaces is deleted through a handle that
+shares nothing, so one held open elsewhere (a running instance, Explorer,
+a scanner) is left alone and the copy is retried next run. The warnings
+are only in the log and the note; the game shows nothing. Read-only files
+are copied and stay read-only. On macOS the flushes use `F_FULLFSYNC`, and
+the root is flushed before the marker. The shared root is never written.
 Caches and partition images start empty. A title sees only its own root, so
 another title's `UDATA` (a prequel's save that a game looks for to unlock a
 bonus) is not visible unless `RECOMP_HDD_DIR` points both at one folder. The title's own saves,

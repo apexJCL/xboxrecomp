@@ -467,7 +467,10 @@ void xbox_path_set_title_id(uint32_t title_id)
  * XFindFirstSaveGame reports a save folder's last write as the save's date.
  * Its top folder must not exist yet: a leftover of the same name (another
  * pid namespace reusing our pid) fails the copy rather than mix into it.
- * host_rename moves a folder onto a name that is absent or an empty folder.
+ * host_rename moves a folder onto a name that is absent or an empty folder,
+ * and fails when that folder has entries or (Win32) another process holds it
+ * open. host_holds_copy is nonzero when dst has every entry at the top of
+ * src, with the same name and last write (a copy, perhaps with more saves).
  * host_clear_stale removes the <prefix> and <prefix>.<pid> entries in dir
  * whose process is gone (or is this one: Wine reuses process ids), the
  * partial copies a crash left behind. */
@@ -480,6 +483,7 @@ static void host_rmdir(const char *p);
 static int host_copy_tree(const char *src, const char *dst);
 static int host_remove_tree(const char *p);
 static int host_rename(const char *from, const char *to);
+static int host_holds_copy(const char *dst, const char *src);
 static void host_sync_dir(const char *p);
 static int host_write_new(const char *p, const char *text);
 static unsigned long host_pid(void);
@@ -604,21 +608,30 @@ static void host_rmdir(const char *p)
         RemoveDirectoryW(w);   /* only when empty */
 }
 
-/* dst's creation, access and write times set to src's. */
+/* dst's creation, access and write times set to src's. A failure is logged
+ * and the copy goes on: the times date the save, and a folder without them
+ * reads as not a copy to an instance that loses the rename to it. */
 static void copy_times_w(const WCHAR *src, const WCHAR *dst)
 {
     WIN32_FILE_ATTRIBUTE_DATA a;
     HANDLE h;
+    BOOL ok;
 
-    if (!GetFileAttributesExW(src, GetFileExInfoStandard, &a))
+    if (!GetFileAttributesExW(src, GetFileExInfoStandard, &a)) {
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "%S: times not kept (error %lu)",
+                 dst, GetLastError());
         return;
+    }
     h = CreateFileW(dst, FILE_WRITE_ATTRIBUTES,
                     FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                     NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
-    if (h == INVALID_HANDLE_VALUE)
-        return;
-    SetFileTime(h, &a.ftCreationTime, &a.ftLastAccessTime, &a.ftLastWriteTime);
-    CloseHandle(h);
+    ok = h != INVALID_HANDLE_VALUE
+      && SetFileTime(h, &a.ftCreationTime, &a.ftLastAccessTime, &a.ftLastWriteTime);
+    if (!ok)
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "%S: times not kept (error %lu)",
+                 dst, GetLastError());
+    if (h != INVALID_HANDLE_VALUE)
+        CloseHandle(h);
 }
 
 /* What CopyFileW wrote, on the disk before the rename names it. CopyFileW
@@ -740,16 +753,77 @@ static int host_remove_tree(const char *p)
     return widen(p, w) ? remove_tree_w(w) : -1;
 }
 
+/* MoveFileExW does not replace a folder, as POSIX rename does an empty one,
+ * so the empty one goes first, through a handle that shares nothing. A
+ * running instance whose game made that folder at boot and holds it open
+ * makes the open fail, and the copy fails and is tried next run.
+ * RemoveDirectoryW would instead mark the folder for deletion, and it would
+ * vanish from under that instance once it closed its handle. Only a plain
+ * empty folder is deleted: one with entries refuses the delete, and a file
+ * or a junction is never touched. A process that makes the folder again
+ * between the delete and the move fails the move, which is retried next
+ * run as well. */
 static int host_rename(const char *from, const char *to)
 {
     WCHAR f[MAX_PATH], t[MAX_PATH];
+    FILE_DISPOSITION_INFO del;
+    BY_HANDLE_FILE_INFORMATION info;
+    HANDLE h;
+    BOOL ok;
 
     if (!widen(from, f) || !widen(to, t))
         return -1;
-    /* MoveFileExW does not replace a folder, as POSIX rename does an empty
-     * one; RemoveDirectoryW removes only an empty one. */
-    RemoveDirectoryW(t);
+    h = CreateFileW(t, DELETE | FILE_READ_ATTRIBUTES, 0, NULL, OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD err = GetLastError();
+        if (err == ERROR_SHARING_VIOLATION)
+            xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH,
+                     "%S: open elsewhere (another instance, Explorer, a "
+                     "scanner); not replaced this run", t);
+        if (err != ERROR_FILE_NOT_FOUND && err != ERROR_PATH_NOT_FOUND)
+            return -1;
+    } else {
+        ok = GetFileInformationByHandle(h, &info)
+          && (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+          && !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT);
+        if (ok) {
+            del.DeleteFile = TRUE;
+            ok = SetFileInformationByHandle(h, FileDispositionInfo, &del, sizeof del);
+        }
+        CloseHandle(h);
+        if (!ok)
+            return -1;
+    }
     return MoveFileExW(f, t, 0) ? 0 : -1;
+}
+
+static int host_holds_copy(const char *dst, const char *src)
+{
+    WCHAR d[MAX_PATH], s[MAX_PATH], pat[MAX_PATH], a[MAX_PATH], b[MAX_PATH];
+    WIN32_FILE_ATTRIBUTE_DATA x, y;
+    WIN32_FIND_DATAW fd;
+    HANDLE f;
+    int held = 1;
+
+    if (!widen(dst, d) || !widen(src, s) || !wjoin(pat, s, L"*"))
+        return 0;
+    f = FindFirstFileW(pat, &fd);
+    if (f == INVALID_HANDLE_VALUE)
+        return 0;
+    do {
+        if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L".."))
+            continue;
+        held = wjoin(a, s, fd.cFileName) && wjoin(b, d, fd.cFileName)
+            && GetFileAttributesExW(a, GetFileExInfoStandard, &x)
+            && GetFileAttributesExW(b, GetFileExInfoStandard, &y)
+            && x.ftLastWriteTime.dwLowDateTime == y.ftLastWriteTime.dwLowDateTime
+            && x.ftLastWriteTime.dwHighDateTime == y.ftLastWriteTime.dwHighDateTime;
+    } while (held && FindNextFileW(f, &fd));
+    if (held && GetLastError() != ERROR_NO_MORE_FILES)
+        held = 0;
+    FindClose(f);
+    return held;
 }
 
 /* NTFS journals its metadata; a folder handle cannot be flushed without
@@ -1295,9 +1369,6 @@ static void host_rmdir(const char *p)
 #define ST_MTIM(st) ((st).st_mtim)
 #endif
 
-/* Copies src (st, from stat) to the new file dst with its mode and times,
- * and flushes it, so the rename after the copy never names an empty file
- * after a power loss. */
 /* fsync on macOS leaves the data in the drive's cache; F_FULLFSYNC flushes
  * it. Cheap here: a handful of save files, once per title. */
 static int host_fsync(int fd)
@@ -1309,6 +1380,9 @@ static int host_fsync(int fd)
     return fsync(fd);
 }
 
+/* Copies src (st, from stat) to the new file dst with its mode and times,
+ * and flushes it, so the rename after the copy never names an empty file
+ * after a power loss. */
 static int copy_file(const char *src, const char *dst, const struct stat *st)
 {
     char buf[65536];
@@ -1462,10 +1536,40 @@ static int host_remove_tree(const char *p)
     return rmdir(p);
 }
 
-/* rename replaces an empty folder and refuses one with entries. */
+/* rename replaces an empty folder and refuses one with entries. Another
+ * instance holding the empty one open keeps a handle on a removed folder;
+ * its paths reach the copy. */
 static int host_rename(const char *from, const char *to)
 {
     return rename(from, to);
+}
+
+static int host_holds_copy(const char *dst, const char *src)
+{
+    DIR *d = opendir(src);
+    struct dirent *e;
+    int held = 1;
+
+    if (!d)
+        return 0;
+    errno = 0;
+    while (held && (e = readdir(d)) != NULL) {
+        char a[MAX_PATH * 2], b[MAX_PATH * 2];
+        struct stat x, y;
+
+        if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, ".."))
+            continue;
+        held = (size_t)snprintf(a, sizeof a, "%s/%s", src, e->d_name) < sizeof a
+            && (size_t)snprintf(b, sizeof b, "%s/%s", dst, e->d_name) < sizeof b
+            && stat(a, &x) == 0 && stat(b, &y) == 0
+            && ST_MTIM(x).tv_sec == ST_MTIM(y).tv_sec
+            && ST_MTIM(x).tv_nsec == ST_MTIM(y).tv_nsec;
+        errno = 0;
+    }
+    if (held && errno)
+        held = 0;
+    closedir(d);
+    return held;
 }
 
 static void host_unlink(const char *p)
@@ -1818,11 +1922,32 @@ int xbox_path_shader_cache(char *out, size_t n)
  *
  * An empty folder under the real name counts as absent: the game makes an
  * empty TDATA/<tid> at boot, so a run after a failed copy would otherwise
- * find it and give up. A failed copy leaves .legacy-saves-failed-<folder>
- * in the root. While that folder in the root stays empty, the next run
- * copies again; once the player has saved into it, it is never overwritten,
- * and each run logs that the saves in the shared root wait for a copy by
- * hand (then delete the note).
+ * find it and give up. Every failed folder leaves .legacy-saves-failed-<folder>
+ * in the root, which says in words what happened. While that folder in the
+ * root stays empty, the next run copies again; once the player has saved
+ * into it, it is never overwritten, and each run logs that the saves in the
+ * shared root wait for a copy by hand (then delete the note). Without the
+ * note such a folder would count as present and the marker would leave the
+ * old saves behind unreported, so a note that cannot be written is logged.
+ * A note whose folder is gone from a shared root still in place is removed:
+ * nothing is left to copy. One whose whole <NAME> folder is missing there
+ * (a root that is unmounted or unreadable for now) is kept and fails this
+ * run, so no marker is written and a run with the root back copies again.
+ *
+ * A rename that loses to a folder with entries, or a note next to one, asks
+ * whether that folder holds the copy: every entry at the top of the shared
+ * root's folder, with the same name and last write, since a copy keeps the
+ * times. Another instance's copy does, even after its game added a save; a
+ * folder another instance's game made during the copy does not, and fails
+ * this folder with the note, since the old saves were not copied. Names
+ * alone would not tell them apart: a game with fixed slot names makes the
+ * same ones. A folder that holds the copy counts as present, and an
+ * earlier note for it is removed. An empty source folder is held by any
+ * folder: nothing in it is left to copy. Only the times are compared, so
+ * the test fails safe: a copy on a file system with coarser times than
+ * the shared root's, a linked entry on Win32 (its own time is read, not its
+ * target's), or a .DS_Store, desktop.ini or Thumbs.db that a file browser
+ * rewrote in the shared root all read as not a copy and leave the note.
  *
  * The marker is written once both folders are in place (copied now, or
  * already there) and stops later runs from copying again, so a save the
@@ -1833,6 +1958,31 @@ int xbox_path_shader_cache(char *out, size_t n)
 
 #define LEGACY_SAVES_MARKER ".legacy-saves"
 #define LEGACY_SAVES_FAILED ".legacy-saves-failed-"
+
+/* Leaves the note that copying <legacy_root>/<name>/<tid> failed (see above);
+ * one from an earlier run is kept as it is. */
+static void write_failed_note(const char *failnote, const char *legacy_root,
+                              const char *root, const char *name, uint32_t tid)
+{
+    char text[MAX_PATH * 6];
+
+    snprintf(text, sizeof text,
+             "The saves in %s%c%s%c%08x were not copied to %s%c%s%c%08x (the "
+             "log says why). They are still in the shared root. While the new "
+             "folder is missing or empty, the next run copies them again. Once "
+             "a save is made there, check whether it already holds them; if "
+             "not, copy the old ones by hand without replacing newer saves, "
+             "then delete this file.", legacy_root, XBOX_HOST_SEP, name,
+             XBOX_HOST_SEP, (unsigned)tid, root, XBOX_HOST_SEP, name,
+             XBOX_HOST_SEP, (unsigned)tid);
+    if (host_write_new(failnote, text) != 0 && !host_exists(failnote))
+        xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH,
+                 "%s: cannot write the note. If a save is made in %s%c%s%c%08x "
+                 "before a later run copies the old one, the saves in "
+                 "%s%c%s%c%08x are no longer reported: copy them by hand",
+                 failnote, root, XBOX_HOST_SEP, name, XBOX_HOST_SEP, (unsigned)tid,
+                 legacy_root, XBOX_HOST_SEP, name, XBOX_HOST_SEP, (unsigned)tid);
+}
 
 int xbox_path_adopt_legacy_saves(const char *legacy_root, const char *root,
                                  uint32_t title_id)
@@ -1863,6 +2013,20 @@ int xbox_path_adopt_legacy_saves(const char *legacy_root, const char *root,
         int made_parent = 0;
 
         snprintf(stale, sizeof stale, "%08x.copying", (unsigned)title_id);
+        /* The note first: a failure further down can then leave it. Its
+         * length depends on the root alone, so a root too long for it fails
+         * every run the same way, before any copy or marker. */
+        if ((size_t)snprintf(failnote, sizeof failnote, "%s%c" LEGACY_SAVES_FAILED
+                             "%s", root, XBOX_HOST_SEP, names[k]) >= sizeof failnote
+            || strlen(failnote) >= MAX_PATH) {
+            xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH,
+                     "%s: path too long; %s%c%s%c%08x is not copied",
+                     root, legacy_root, XBOX_HOST_SEP, names[k], XBOX_HOST_SEP,
+                     (unsigned)title_id);
+            failed = 1;
+            continue;
+        }
+        /* tmp holds the pid, so a later run may fit where this one did not. */
         if ((size_t)snprintf(src, sizeof src, "%s%c%s%c%08x", legacy_root,
                              XBOX_HOST_SEP, names[k], XBOX_HOST_SEP,
                              (unsigned)title_id) >= sizeof src
@@ -1872,21 +2036,39 @@ int xbox_path_adopt_legacy_saves(const char *legacy_root, const char *root,
                                 XBOX_HOST_SEP, (unsigned)title_id) >= sizeof dst
             || (size_t)snprintf(tmp, sizeof tmp, "%s%c%s.%lu", parent,
                                 XBOX_HOST_SEP, stale, host_pid()) >= sizeof tmp
-            || (size_t)snprintf(failnote, sizeof failnote, "%s%c" LEGACY_SAVES_FAILED
-                                "%s", root, XBOX_HOST_SEP, names[k]) >= sizeof failnote
-            || strlen(tmp) >= MAX_PATH || strlen(failnote) >= MAX_PATH) {
+            || strlen(tmp) >= MAX_PATH) {
             xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH,
                      "%s: path too long; %s%c%s%c%08x is not copied this run",
                      root, legacy_root, XBOX_HOST_SEP, names[k], XBOX_HOST_SEP,
                      (unsigned)title_id);
+            write_failed_note(failnote, legacy_root, root, names[k], title_id);
             failed = 1;
             continue;
         }
-        if (!host_is_dir(src))
+        if (!host_is_dir(src)) {
+            char lname[MAX_PATH * 2];
+            /* Nothing left to copy, unless the whole folder is missing for
+             * now (an unmounted root): then the note stays, and so does the
+             * retry, which a marker would end. */
+            if ((size_t)snprintf(lname, sizeof lname, "%s%c%s", legacy_root,
+                                 XBOX_HOST_SEP, names[k]) < sizeof lname
+                && host_is_dir(lname))
+                host_unlink(failnote);
+            else if (host_exists(failnote)) {
+                xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH,
+                         "%s: missing, so %s stays and the next run looks "
+                         "again", lname, failnote);
+                failed = 1;
+            }
             continue;
+        }
         if (host_exists(dst) && !host_dir_empty(dst)) {
             host_clear_stale(parent, stale);
-            if (host_exists(failnote)) {
+            if (host_exists(failnote) && host_holds_copy(dst, src)) {
+                /* An earlier run lost the rename to another instance's
+                 * copy, or the player copied by hand: the note is stale. */
+                host_unlink(failnote);
+            } else if (host_exists(failnote)) {
                 /* Saved into after an earlier copy failed: the player's
                  * now, never overwritten. */
                 xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH,
@@ -1907,6 +2089,7 @@ int xbox_path_adopt_legacy_saves(const char *legacy_root, const char *root,
             if (host_mkdir(parent) != 0 && !host_is_dir(parent)) {
                 xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH, "%s: cannot create it; "
                          "%s is not copied this run", parent, src);
+                write_failed_note(failnote, legacy_root, root, names[k], title_id);
                 failed = 1;
                 continue;
             }
@@ -1929,16 +2112,30 @@ int xbox_path_adopt_legacy_saves(const char *legacy_root, const char *root,
         }
         host_remove_tree(tmp);
         if (host_exists(dst) && !host_dir_empty(dst)) {
-            /* Another instance's copy got there first. */
-            host_unlink(failnote);
-            pused += (size_t)snprintf(present + pused, sizeof present - pused,
-                                      " %s%c%08x", names[k], XBOX_HOST_SEP,
-                                      (unsigned)title_id);
+            if (host_holds_copy(dst, src)) {
+                /* Another instance's copy got there first. */
+                host_unlink(failnote);
+                pused += (size_t)snprintf(present + pused, sizeof present - pused,
+                                          " %s%c%08x", names[k], XBOX_HOST_SEP,
+                                          (unsigned)title_id);
+                continue;
+            }
+            /* Not a copy: another instance's game saved there while this
+             * one copied, or its copy lost the times or had an entry
+             * replaced since (see above). */
+            write_failed_note(failnote, legacy_root, root, names[k], title_id);
+            xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH,
+                     "%s does not hold a copy of %s (another instance's game "
+                     "saved there, or its copy lost the times), so it is not "
+                     "overwritten. Check whether it already holds the saves in "
+                     "%s; if not, copy them by hand, then delete %s",
+                     dst, src, src, failnote);
+            failed = 1;
             continue;
         }
         if (made_parent)
             host_rmdir(parent);
-        host_write_new(failnote, src);   /* already there after an earlier failure */
+        write_failed_note(failnote, legacy_root, root, names[k], title_id);
         xbox_log(XBOX_LOG_WARN, XBOX_LOG_PATH,
                  "copying the saves %s to %s failed; they are still in %s. "
                  "The next run tries again while %s is missing or empty; once "
