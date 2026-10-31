@@ -115,6 +115,50 @@ static struct nv2a_stage stage(int mode, uint32_t color, uint32_t filter)
     return t;
 }
 
+/* The host x (axis 0) or y (1) of guest screen coordinate g of a vertex
+ * with clip w (or rhw) w, as the MSL and HLSL epilogues place it (snap, tie
+ * shift for w 1 only, NDC, viewport of size hs), unrounded. */
+static float host_raw(const struct nv2a_vp_consts *c, int axis, float g, float w, uint32_t hs)
+{
+    float p = truncf(g * 16.0f) / 16.0f, ndc;
+    if (p - floorf(p) == 0.5f && w == 1.0f)
+        p -= c->c[6 + axis];
+    ndc = p * c->c[axis] + c->c[4 + axis];
+    return axis ? (1.0f - ndc) * 0.5f * (float)hs : (ndc + 1.0f) * 0.5f * (float)hs;
+}
+
+/* host_raw on the 1/256-pixel grid a host rasteriser snaps to: only a stock
+ * tie (the NV2A's own, left on a host centre at 1x) depends on it, float
+ * NDC leaving 2/480 a hair off. Always w 1, a flat vertex the shift moves. */
+static float host_of(const struct nv2a_vp_consts *c, int axis, float g, uint32_t hs)
+{
+    return roundf(host_raw(c, axis, g, 1.0f, hs) * 256.0f) / 256.0f;
+}
+
+/* How far host edge e is from the nearest host pixel centre. */
+static float centre_gap(float e)
+{
+    return fabsf(e - 0.5f - floorf(e));
+}
+
+/* The host pixels a span from guest a to b covers under the top-left rule
+ * (a centre on the first edge is in, on the second out): *lo..*hi. */
+static int host_span(const struct nv2a_vp_consts *c, int axis, float a, float b, uint32_t hs,
+                     int *lo, int *hi)
+{
+    float e0 = host_of(c, axis, a, hs), e1 = host_of(c, axis, b, hs);
+    int j;
+    *lo = -1; *hi = -2;
+    for (j = 0; j < (int)hs; j++) {
+        if ((float)j + 0.5f >= e0 && (float)j + 0.5f < e1) {
+            if (*lo < 0)
+                *lo = j;
+            *hi = j;
+        }
+    }
+    return *lo >= 0;
+}
+
 int main(void)
 {
     struct nv2a_rect r;
@@ -1242,6 +1286,93 @@ int main(void)
             nv2a_occ_init(&oc, &ops, (uint8_t *)mem);
             CHECK(oc.scale == 3);
         }
+    }
+
+    /* ---- ties on guest pixel centres (nv2a_vp_tie_fill) ----
+     * KUF's full-screen passes run 0..640 in D3D terms, 0.5..640.5 after
+     * the XDK bias and the snap: at 1x the top-left rule keeps row and
+     * column 0. Scaled, or stretched by hor+, that edge cut the first guest
+     * pixel's host block and left host row/column 0 uncovered. */
+    {
+        struct nv2a_host_opts o;
+        struct nv2a_pb_vsh v;
+        struct nv2a_vp_consts c;
+        uint32_t pad;
+        int lo, hi;
+        unsigned n;
+        memset(&o, 0, sizeof o);
+        memset(&v, 0, sizeof v);
+        nv2a_host_opts_set(&o);
+        /* Stock 1x 4:3: no shift, the NV2A's coverage. */
+        nv2a_vp_consts_fill(&v, 0x128, 640, 480, 0, &c);
+        nv2a_vp_tie_fill(&c, 640, 480);
+        CHECK(c.c[6] == 0.0f && c.c[7] == 0.0f);
+        CHECK(host_span(&c, 0, 0.53125f, 640.53125f, 640, &lo, &hi) && lo == 0 && hi == 639);
+        CHECK(host_span(&c, 1, 0.53125f, 480.53125f, 480, &lo, &hi) && lo == 0 && hi == 479);
+        for (n = 2; n <= 4; n++) {
+            nv2a_vp_consts_fill(&v, 0x128, 640, 480, 0, &c);
+            nv2a_vp_tie_fill(&c, 640 * n, 480 * n);
+            /* A tie quad covers every host pixel, as the guest covers every
+             * guest pixel; without the shift row and column 0 were out. */
+            CHECK(host_span(&c, 0, 0.53125f, 640.53125f, 640 * n, &lo, &hi) && lo == 0
+                  && hi == (int)(640 * n) - 1);
+            CHECK(host_span(&c, 1, 0.53125f, 480.53125f, 480 * n, &lo, &hi) && lo == 0
+                  && hi == (int)(480 * n) - 1);
+            /* The shifted edges sit a quarter host pixel from any centre:
+             * no host tie, nothing left to the rasteriser's grid. */
+            CHECK(fabsf(centre_gap(host_raw(&c, 0, 0.53125f, 1.0f, 640 * n)) - 0.25f) < 1e-3f);
+            CHECK(fabsf(centre_gap(host_raw(&c, 1, 480.53125f, 1.0f, 480 * n)) - 0.25f) < 1e-3f);
+            /* A perspective (w != 1) vertex on a tie keeps its place, so 3D
+             * edges never step as they move. */
+            CHECK(fabsf(host_raw(&c, 0, 100.5f, 2.0f, 640 * n) - 100.5f * (float)n) < 1e-3f);
+            CHECK(fabsf(host_raw(&c, 1, 100.5f, 0.5f, 480 * n) - 100.5f * (float)n) < 1e-3f);
+            /* An edge on pixel corners (D3D's -0.5 quad) does not move. */
+            CHECK(host_span(&c, 0, 0.03125f, 640.03125f, 640 * n, &lo, &hi) && lo == 0
+                  && hi == (int)(640 * n) - 1);
+            CHECK(host_of(&c, 0, 100.25f, 640 * n) == 100.25f * (float)n);
+            /* A tie inside: guest pixels 100..199, host blocks 100n..200n-1. */
+            CHECK(host_span(&c, 0, 100.5f, 200.5f, 640 * n, &lo, &hi) && lo == (int)(100 * n)
+                  && hi == (int)(200 * n) - 1);
+        }
+        /* Hor+ 16:10, stretched: 0.5 * 768/640 was 0.6, column 0 out at 1x. */
+        o.aspect_w = 16; o.aspect_h = 10;
+        nv2a_host_opts_set(&o);
+        pad = nv2a_host_pad(640, 480);
+        CHECK(pad == 64);
+        for (n = 1; n <= 3; n++) {
+            uint32_t pw = (640 + 2 * pad) * n;
+            nv2a_vp_consts_fill(&v, 0x128, 640, 480, pad, &c);
+            nv2a_aspect_map(&c, 640, 480, pad, NV2A_PLACE_STRETCH);
+            nv2a_vp_tie_fill(&c, pw, 480 * n);
+            CHECK(host_span(&c, 0, 0.53125f, 640.53125f, pw, &lo, &hi) && lo == 0
+                  && hi == (int)pw - 1);
+            CHECK(host_span(&c, 1, 0.53125f, 480.53125f, 480 * n, &lo, &hi) && lo == 0
+                  && hi == (int)(480 * n) - 1);
+            /* 1.2 host px a guest px at 1x: still clear of the centres. */
+            CHECK(centre_gap(host_raw(&c, 0, 0.53125f, 1.0f, pw)) > 0.2f);
+            CHECK(centre_gap(host_raw(&c, 0, 640.53125f, 1.0f, pw)) > 0.2f);
+        }
+        /* display.movie=fill covers the width and crops y: a tie quad still
+         * covers every host pixel, 1x to 3x. */
+        for (n = 1; n <= 3; n++) {
+            uint32_t pw = (640 + 2 * pad) * n;
+            nv2a_vp_consts_fill(&v, 0x128, 640, 480, pad, &c);
+            nv2a_aspect_map(&c, 640, 480, pad, NV2A_PLACE_COVER);
+            nv2a_vp_tie_fill(&c, pw, 480 * n);
+            CHECK(c.c[6] > 0.0f && c.c[7] > 0.0f);
+            CHECK(host_span(&c, 0, 0.53125f, 640.53125f, pw, &lo, &hi) && lo == 0
+                  && hi == (int)pw - 1);
+            CHECK(host_span(&c, 1, 0.53125f, 480.53125f, 480 * n, &lo, &hi) && lo == 0
+                  && hi == (int)(480 * n) - 1);
+        }
+        /* Centred on the pads at 3x: the columns start at pad * 3. */
+        nv2a_vp_consts_fill(&v, 0x128, 640, 480, pad, &c);
+        nv2a_aspect_map(&c, 640, 480, pad, NV2A_PLACE_CENTRE);
+        nv2a_vp_tie_fill(&c, (640 + 2 * pad) * 3, 480 * 3);
+        CHECK(host_span(&c, 0, 0.53125f, 640.53125f, (640 + 2 * pad) * 3, &lo, &hi)
+              && lo == (int)pad * 3 && hi == (int)(pad + 640) * 3 - 1);
+        memset(&o, 0, sizeof o);
+        nv2a_host_opts_set(&o);
     }
 
     printf("render_scale: all passed\n");

@@ -40,7 +40,9 @@ int d3d8_vsh_generate_hlsl(const NV2AVshProgram *program,
  *   SV_POSITION = float4(ndc * oPos.w, oPos.w)
  *
  * For a W x H surface with depth range zmax: vp_scale = (2/W, -2/H, 1/zmax),
- * vp_off = (-1, 1) (plus any pixel-centre offset, in NDC).
+ * vp_off.xy = (-1, 1) (plus any pixel-centre offset, in NDC); vp_off.zw is
+ * the tie shift in guest pixels, subtracted before the NDC map from a w 1
+ * coordinate on a pixel centre (nv2a_vp_tie_fill), 0 at stock.
  */
 #define NV2A_VSH_HLSL_SCREEN_SPACE 0x1
 

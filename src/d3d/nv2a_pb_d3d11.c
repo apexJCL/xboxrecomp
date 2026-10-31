@@ -534,24 +534,8 @@ static ID3D11Buffer *make_buffer(UINT size, UINT bind)
 static const char s_ps_src[] = NV2A_HLSL_PS_BASIC;
 static const char s_ps_snap_src[] = NV2A_HLSL_PS_BASIC_SNAP;
 
-/* Batches without a vertex program: attribute 0 is already in surface pixels
- * (x, y, z, rhw), snapped to the NV2A's 1/16-pixel grid (nv2a_screen_snap);
- * 3 and 4 are the diffuse and specular colours, 9..12 the texture
- * coordinates. */
-static const char s_vs_passthrough_src[] =
-    "cbuffer VSH_Viewport : register(b2) { float4 vp_scale; float4 vp_off; };\n"
-    "struct VS_IN { float4 v0 : ATTR0; float4 v3 : ATTR3; float4 v4 : ATTR4;\n"
-    "               float4 v9 : ATTR9; float4 v10 : ATTR10; float4 v11 : ATTR11;\n"
-    "               float4 v12 : ATTR12; };\n"
-    VS_OUT_DECL
-    "VS_OUT main(VS_IN i) {\n"
-    "    VS_OUT o = (VS_OUT)0;\n"
-    "    o.oPos = float4((trunc(i.v0.xy * 16.0) / 16.0) * vp_scale.xy + vp_off.xy,\n"
-    "                    saturate(i.v0.z * vp_scale.z), 1.0);\n"
-    "    o.oD0 = i.v3; o.oD1 = i.v4; o.oFog = 1.0;\n"
-    "    o.oT0 = i.v9; o.oT1 = i.v10; o.oT2 = i.v11; o.oT3 = i.v12;\n"
-    "    return o;\n"
-    "}\n";
+/* Batches without a vertex program (nv2a_basic_hlsl.h). */
+static const char s_vs_passthrough_src[] = NV2A_HLSL_VS_PASS;
 
 static void create_black_texture(void);
 
@@ -3410,6 +3394,7 @@ static void set_vp(const struct nv2a_pb_vsh *v, const struct nv2a_pb_gpu *g,
 
     nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, rt->pad, &vc);
     nv2a_aspect_map(&vc, rt->w, rt->h, rt->pad, place);
+    nv2a_vp_tie_fill(&vc, rt->hw, rt->hh);
     memcpy(vp, vc.c, sizeof vc.c);
     memcpy(vp + sizeof vc.c, vc.u, sizeof vc.u);
     if (memo_on() && vp_ok && !memcmp(vp_shadow, vp, sizeof vp)) {

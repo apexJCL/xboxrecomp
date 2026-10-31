@@ -33,6 +33,29 @@
     "    float4 oB1  : TEXCOORD5;\n" \
     "};\n"
 
+/* Batches without a vertex program: attribute 0 is already in surface pixels
+ * (x, y, z, rhw), snapped to the NV2A's 1/16-pixel grid (nv2a_screen_snap),
+ * flat (rhw 1) ties moved by vp_off.zw (nv2a_vp_tie_fill);
+ * 3 and 4 are the diffuse and specular colours, 9..12 the texture
+ * coordinates. Here so tests/basic_shaders pins it, as vs_pass in
+ * nv2a_basic_msl.h. */
+#define NV2A_HLSL_VS_PASS \
+    "cbuffer VSH_Viewport : register(b2) { float4 vp_scale; float4 vp_off; };\n" \
+    "struct VS_IN { float4 v0 : ATTR0; float4 v3 : ATTR3; float4 v4 : ATTR4;\n" \
+    "               float4 v9 : ATTR9; float4 v10 : ATTR10; float4 v11 : ATTR11;\n" \
+    "               float4 v12 : ATTR12; };\n" \
+    VS_OUT_DECL \
+    "VS_OUT main(VS_IN i) {\n" \
+    "    VS_OUT o = (VS_OUT)0;\n" \
+    "    float2 p = trunc(i.v0.xy * 16.0) / 16.0;\n" \
+    "    p -= vp_off.zw * (float2)(frac(p) == 0.5) * (float)(i.v0.w == 1.0);\n" \
+    "    o.oPos = float4(p * vp_scale.xy + vp_off.xy,\n" \
+    "                    saturate(i.v0.z * vp_scale.z), 1.0);\n" \
+    "    o.oD0 = i.v3; o.oD1 = i.v4; o.oFog = 1.0;\n" \
+    "    o.oT0 = i.v9; o.oT1 = i.v10; o.oT2 = i.v11; o.oT3 = i.v12;\n" \
+    "    return o;\n" \
+    "}\n"
+
 /* Batches without register combiners: the CPU path's MODULATE, oD0 * T0
  * when stage 0 is on, a CLIPPLANE stage 0's kill, then the alpha test
  * (D3DCMP numbering, on the 8-bit values the way the CPU compares them).

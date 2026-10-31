@@ -345,6 +345,10 @@ int d3d8_vsh_generate_msl(const NV2AVshProgram *program, unsigned flags,
          * divide gives perspective-correct interpolation. */
         sb_append(&sb,
             "    oPos.xy = trunc(oPos.xy * 16.0) / 16.0;\n"
+            /* A flat (w 1) tie on a guest pixel centre into its host
+             * block (nv2a_vp_tie_fill); 0 at stock. */
+            "    oPos.xy -= vp.vp_off.zw * float2(fract(oPos.xy) == 0.5)\n"
+            "             * float(oPos.w == 1.0);\n"
             "    float  pw = (oPos.w == 0.0) ? 1.0 : oPos.w;\n"
             "    o.pos = float4((oPos.xy * vp.vp_scale.xy + vp.vp_off.xy) * pw,\n"
             "                   oPos.z * vp.vp_scale.z * pw, pw);\n"

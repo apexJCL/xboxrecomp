@@ -1239,6 +1239,24 @@ void nv2a_aspect_map(struct nv2a_vp_consts *o, uint32_t w, uint32_t h, uint32_t 
     }
 }
 
+/* The tie shift (nv2a_backend_common.h) moves content, not only coverage:
+ * a flat vertex carries its texcoords with it, so above 1.01 host pixels a
+ * guest pixel every flat full-screen pass lands 0.5 - 0.25 / s guest pixels
+ * up and left of its source (0.375 at 2x, about 0.29 under the 1x hor+
+ * stretch). Chained bilinear passes (bloom, blur ping-pong) and frame
+ * feedback can add that per pass. No vertex shift avoids it: covering host
+ * pixel 0 takes at least 0.5 - 0.5 / s. The proper fix is a matching
+ * texcoord correction, still to do. */
+void nv2a_vp_tie_fill(struct nv2a_vp_consts *o, uint32_t hw, uint32_t hh)
+{
+    /* Host pixels a guest pixel: the NDC scale times half the viewport. */
+    float sx = o->c[0] * (float)hw * 0.5f, sy = -o->c[1] * (float)hh * 0.5f;
+
+    /* Scales within 1% of 1 are stock (rounding leaves 1x a hair off). */
+    o->c[6] = sx > 1.01f ? 0.5f - 0.25f / sx : 0.0f;
+    o->c[7] = sy > 1.01f ? 0.5f - 0.25f / sy : 0.0f;
+}
+
 /* The HUD layer's state (hud_anchor.h), for the backends: 0 while the
  * layer's active flag is clear, else bit 32 and the canvas's target size,
  * w << 16 | h. One word, so a backend never sees the flag with another

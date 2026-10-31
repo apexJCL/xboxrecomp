@@ -1868,6 +1868,28 @@ int nv2a_aspect_flat(const uint32_t prog[][4], uint32_t start, float c[][4], con
 void nv2a_aspect_map(struct nv2a_vp_consts *o, uint32_t w, uint32_t h, uint32_t pad,
                      int place);
 
+/* The tie shift, vp_off.zw (c[6], c[7]), of constants already mapped
+ * (nv2a_vp_consts_fill, nv2a_aspect_map) onto a hw x hh host viewport.
+ *
+ * A screen coordinate that the snap leaves on a guest pixel centre (a
+ * fraction of exactly 0.5, the XDK's 0.53125 bias on a D3D pixel-aligned
+ * edge, nv2a_screen_snap) is a tie the NV2A's top-left rule settles: the
+ * first row or column is kept, the last dropped. Scaled by s host pixels a
+ * guest pixel, the same edge cuts that guest pixel's host block, and the
+ * host pixels before it stay uncovered: every full-screen pass drawn at
+ * 0.5 left host row and column 0 (render.scale 2 and up) or column 0
+ * (a hor+ stretch at 1x, 768/640 moving 0.5 to 0.6) showing what lay
+ * under it, the "1 px line" on the top and left. Moving a tie by
+ * 0.5 - 0.25 / s guest pixels puts it a quarter host pixel into its block,
+ * between two host centres rather than on one, so the host covers exactly
+ * the guest pixels the NV2A does without a host tie of its own (s need not
+ * be whole: 1.2 under the stretch). An edge off the centres keeps its
+ * place, and so does any vertex with w != 1: the shaders move only flat
+ * screen-space ones, so perspective 3D edges never step (shimmer, cracks
+ * at T-junctions). Scales within 1% of 1 are stock, both shifts 0, so 1x
+ * 4:3 is unchanged. */
+void nv2a_vp_tie_fill(struct nv2a_vp_consts *o, uint32_t hw, uint32_t hh);
+
 /* The host scissor of a batch placed `place` on a guest w x h target padded
  * by pad and made n times larger (host (w + 2 pad) n x h n), from its guest
  * surface-clip box (nv2a_draw_box). The clip box is in the batch's own

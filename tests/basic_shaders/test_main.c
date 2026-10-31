@@ -7,7 +7,10 @@
  *              toolkit 6385aaf8, before render.snap_2d: a stock run
  *              draws with the base shaders, which the JSRF dogenzaka
  *              D3D11 golden showed to matter. A deliberate
- *              change to them updates the checksums here
+ *              change to them updates the checksums here: vs_pass took
+ *              the upscale tie shift, which is 0 at 1x, so a
+ *              stock run still places every vertex where 6385aaf8 did;
+ *              the D3D11 pass-through (s_vs_pass) took the same shift
  *   snap       the render.snap_2d variants sample with the 1x gradients
  *              (SampleGrad, gradient2d) and the stock ones do not
  *   compile    on macOS, s_msl's fs_basic, vs_pass and fs_clear and the
@@ -48,17 +51,24 @@ static const char s_ps_src[] = NV2A_HLSL_PS_BASIC;
 static const char s_ps_snap_src[] = NV2A_HLSL_PS_BASIC_SNAP;
 static const char s_msl[] = NV2A_MSL_BASIC;
 static const char s_msl_snap[] = NV2A_MSL_BASIC_SNAP;
+static const char s_vs_pass[] = NV2A_HLSL_VS_PASS;
 
 int main(void)
 {
     check("stock HLSL is 6385aaf8's", strlen(s_ps_src) == 2325
           && fnv64(s_ps_src) == 0x7ca2bcd0dede08fdull);
-    check("stock MSL is 6385aaf8's", strlen(s_msl) == 3285
-          && fnv64(s_msl) == 0xfcdefef996a63e72ull);
+    check("stock MSL is 6385aaf8's plus the tie shift", strlen(s_msl) == 3371
+          && fnv64(s_msl) == 0x1730838980e6d759ull);
+    check("stock HLSL pass-through is 6385aaf8's plus the tie shift",
+          strlen(s_vs_pass) == 981 && fnv64(s_vs_pass) == 0x73a3e344b098a945ull);
+    check("both pass-throughs move only flat ties",
+          strstr(s_vs_pass, "(float)(i.v0.w == 1.0)") && strstr(s_msl, "float(v[0].w == 1.0)"));
     if (s_fail)
-        fprintf(stderr, "[basic_shaders] HLSL %zu bytes %016llx, MSL %zu bytes %016llx\n",
+        fprintf(stderr, "[basic_shaders] HLSL %zu bytes %016llx, MSL %zu bytes %016llx, "
+                "HLSL VS %zu bytes %016llx\n",
                 strlen(s_ps_src), (unsigned long long)fnv64(s_ps_src),
-                strlen(s_msl), (unsigned long long)fnv64(s_msl));
+                strlen(s_msl), (unsigned long long)fnv64(s_msl),
+                strlen(s_vs_pass), (unsigned long long)fnv64(s_vs_pass));
 
     check("stock HLSL has no snap gradients", !strstr(s_ps_src, "SampleGrad")
           && !strstr(s_ps_src, "nv2a_snap_grad") && !strstr(s_ps_src, "nv2a_snap_uv2d"));

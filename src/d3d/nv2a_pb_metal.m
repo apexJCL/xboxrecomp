@@ -2447,6 +2447,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         }
         nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, rt->pad, &vc);
         nv2a_aspect_map(&vc, rt->w, rt->h, rt->pad, place);
+        nv2a_vp_tie_fill(&vc, rt->hw, rt->hh);
 
         if (!s_enc || s_enc_rt != rt)
             begin_encoder(rt, 0, NULL);

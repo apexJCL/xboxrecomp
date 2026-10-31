@@ -26,8 +26,8 @@
 #define NPROG 400
 #define NCOMB 400
 #define NCASE (2 * NPROG + NCOMB)
-#define EXPECTED_HASH 0xdb72c33eu      /* all cases, one FNV-1a */
-#define EXPECTED_CHARS 7420112u        /* re-recorded: depth-off z capped at w */
+#define EXPECTED_HASH 0xc0cfc59du      /* all cases, one FNV-1a */
+#define EXPECTED_CHARS 7458912u        /* re-recorded: upscale tie shift */
 
 #include "expected.h"   /* s_expect[NCASE], or HLSL_NO_EXPECT */
 

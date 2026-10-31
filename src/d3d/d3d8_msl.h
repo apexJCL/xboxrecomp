@@ -106,8 +106,9 @@ extern "C" {
  *
  * With D3D8_MSL_SCREEN_SPACE, the function maps oPos from surface pixels to
  * clip space, and applies fog and specular, as NV2A_VSH_HLSL_SCREEN_SPACE
- * does (see d3d8_hlsl.h). VpConsts is vp_scale, vp_off, fog_param, then
- * uint4 fog_ctl and uint4 spec_ctl (z: depth test off, so no far-plane clip).
+ * does (see d3d8_hlsl.h; vp_off.zw is the tie shift, nv2a_vp_tie_fill).
+ * VpConsts is vp_scale, vp_off, fog_param, then uint4 fog_ctl and uint4
+ * spec_ctl (z: depth test off, so no far-plane clip).
  */
 #define D3D8_MSL_SCREEN_SPACE 0x1
 
