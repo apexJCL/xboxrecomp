@@ -816,7 +816,7 @@ static const char k_hud_toml[] =
     "[[wrapper]]\nva = 0x00010000\n"
     "[[site]]\nret_va = 0x2000\nelement = \"score\"\nkind = \"left\"\n";
 static int s_hud_rc, s_hud_rc2, s_hud_fail;
-static int s_hud_off_in_pre, s_hud_moved, s_hud_restored;
+static int s_hud_off_in_pre, s_hud_flip_in_pre, s_hud_moved, s_hud_restored;
 static const struct xbox_mod k_hudt;
 static const struct xbox_mod_api *s_hud_api;
 
@@ -836,6 +836,8 @@ static void hudt_pre(struct xbox_mod_call *c, void *u)
     s_hud_moved = memcmp(before, s_guest + 0x40, sizeof before) != 0;
     if (s_hud_off_in_pre)       /* the Mods page, between the pre and the post */
         CHECK(xbox_mod_set_enabled(index_of("hudt"), 0) == XBOX_MOD_OFF);
+    if (s_hud_flip_in_pre)      /* and a frame ends before the post */
+        frame_out();
 }
 static void hudt_post(struct xbox_mod_call *c, void *u)
 {
@@ -896,7 +898,9 @@ static void test_hud_table(void)
     CHECK(strcmp(token_of(out, tok, sizeof tok), "hudt,v1") == 0);
 
     /* RESTORE through the hook: the bytes come back whole, whether the
-     * mod's post runs or the owner is switched off before it. */
+     * owner is switched off between the pre and the post (its hooks follow
+     * the switch at the next frame, so the post still runs) or a frame
+     * ends there too (the layer undoes the pre itself). */
     {
         static const float q[16] = { 600, 10, 0, 0, 700, 10, 1, 0,
                                      700, 30, 1, 1, 600, 30, 0, 1 };
@@ -912,10 +916,41 @@ static void test_hud_table(void)
         s_hud_restored = 0;
         guest_call(sub_std, args, 5);
         s_hud_off_in_pre = 0;
+        CHECK(s_hud_moved && s_hud_restored == 1);
+        CHECK(memcmp(want, s_guest + 0x40, sizeof want) == 0);
+        frame_out();
+        CHECK(xbox_mod_set_enabled(index_of("hudt"), 1) == XBOX_MOD_ON);
+        frame_out();
+        s_hud_off_in_pre = s_hud_flip_in_pre = 1;
+        s_hud_restored = 0;
+        guest_call(sub_std, args, 5);
+        s_hud_off_in_pre = s_hud_flip_in_pre = 0;
         CHECK(s_hud_moved && s_hud_restored == 0);
         CHECK(memcmp(want, s_guest + 0x40, sizeof want) == 0);
         CHECK(xbox_mod_set_enabled(index_of("hudt"), 1) == XBOX_MOD_ON);
         frame_out();
+    }
+
+    /* A live switch lands at the flip, not mid-frame: the rest of
+     * the frame's calls keep the state the frame began with, as the layer
+     * does, so no frame is drawn half moved. */
+    {
+        const uint32_t args[5] = { 1, 2, 3, 4, 5 };
+        CHECK(hud_layer_active());
+        CHECK(xbox_mod_set_enabled(index_of("hudt"), 0) == XBOX_MOD_OFF);
+        s_hud_pres = 0;
+        guest_call(sub_std, args, 5);
+        CHECK(s_hud_pres == 1 && s_hud_moved && hud_layer_active());
+        frame_out();
+        s_hud_pres = 0;
+        guest_call(sub_std, args, 5);
+        CHECK(s_hud_pres == 0 && !hud_layer_active());
+        CHECK(xbox_mod_set_enabled(index_of("hudt"), 1) == XBOX_MOD_ON);
+        guest_call(sub_std, args, 5);
+        CHECK(s_hud_pres == 0 && !hud_layer_active());
+        frame_out();
+        guest_call(sub_std, args, 5);
+        CHECK(s_hud_pres == 1 && s_hud_moved && hud_layer_active());
     }
 
     /* One table per run: a second mod's is refused. */

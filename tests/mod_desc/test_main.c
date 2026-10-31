@@ -790,6 +790,36 @@ static void test_init_rule(void)
     set_env("RECOMP_EXT_VMA", NULL);
 }
 
+/* RECOMP_DEBUG=mod_set_at: the Mods page's switch made from the
+ * flip tick once the guest reaches a frame count, each entry once; an
+ * entry naming no setting is skipped. */
+static void test_set_at(void)
+{
+    static const struct xbox_mod *const mods[] = { &m_dorm, NULL };
+    int dorm;
+
+    set_env("RECOMP_DEBUG", "mod_set_at=2:mods.dorm.on=on,3:mods.dorm.on=off,1:nope=1");
+    start("[menu]\nenabled = true\n", NULL, mods);
+    dorm = index_of("dorm");
+    CHECK(xbox_mod_state(dorm) == XBOX_MOD_OFF);
+    xbox_mod_frame();
+    xbox_mod_debug_tick();                  /* frame 1: nothing due */
+    CHECK(xbox_mod_state(dorm) == XBOX_MOD_OFF);
+    xbox_mod_frame();
+    xbox_mod_debug_tick();
+    CHECK(xbox_mod_state(dorm) == XBOX_MOD_ON);
+    s_log[0] = 0;
+    xbox_mod_frame();
+    CHECK(strstr(s_log, "dorm.on") != NULL);
+    xbox_mod_debug_tick();
+    CHECK(xbox_mod_state(dorm) == XBOX_MOD_OFF);
+    CHECK(xbox_mod_setting_set(dorm, 0, 1) == 1);
+    xbox_mod_debug_tick();                  /* each entry once */
+    CHECK(xbox_mod_state(dorm) == XBOX_MOD_ON);
+    set_env("RECOMP_DEBUG", NULL);
+    start(NULL, NULL, mods);
+}
+
 /* ---- 5. unknown keys --------------------------------------------------- */
 
 static void test_unknown_keys(void)
@@ -1049,6 +1079,7 @@ int main(void)
     test_precedence();
     test_set_and_callback();
     test_init_rule();
+    test_set_at();
     test_unknown_keys();
     test_dump();
     xbox_mod_shutdown();

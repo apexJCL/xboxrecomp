@@ -1251,7 +1251,16 @@ The pages are Render, Shaders, Pack, Game (a title's own items, from
   with A, the mod's page. A mod that gave `on_enable` turns off and on at
   once; one that did not shows "applies at restart". Turning a mod off
   stops nothing by itself: its frame hooks and armed actions keep
-  running, and the mod gates them while off. The page lists, top down:
+  running, and the mod gates them while off. The HUD table's owner is
+  the exception: its hooks follow the state the layer took at the last
+  frame, so on the game thread a switch lands whole at the next frame
+  (the render thread reads the layer's aspect state when it executes the
+  pushbuffer, so a render thread running behind can show the edge HUD
+  clipped for a frame or two). `RECOMP_DEBUG=mod_set_at=<frame>:<key>=<value>,...` makes the
+  same change from the flip tick once the guest has run that many
+  `xbox_mod_frame` calls (the menu must be armed), to shoot a live switch
+  without the menu: `mod_set_at=900:mods.hud.enable=off,1200:mods.hud.enable=on`.
+  The page lists, top down:
   - the title and `v<version>`, then Author, About (the summary,
     wrapped to the panel at any width) and State: `On`, `Off`,
     `Off (mods."<id>" = false)` when that key holds it off, `Failed:

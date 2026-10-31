@@ -140,6 +140,18 @@ static int s_active[MOD_MAX];
 /* The mod that registered the HUD table (api->hud_table), or -1: the layer
  * sets its s_active each frame, so it is listed only while the layer is. */
 static int s_hud_owner = -1;
+/* Its on state as the layer took it at the last frame (hud_frame): its
+ * hooks follow this, not s_state, so a switch from the menu thread lands
+ * at the flip with the layer's own flag and never splits a frame's HUD
+ * between moved and stock. */
+static int s_hud_owner_on;
+/* RECOMP_DEBUG=mod_set_at's entries (xbox_mod_debug_tick) and the guest
+ * frames counted for them. */
+#define SET_AT_MAX 16
+struct set_at { uint32_t frame; int mod; uint32_t idx; double v; int done; };
+static struct set_at s_set_at[SET_AT_MAX];
+static int s_nset_at = -1;
+static uint32_t s_frames;
 static int s_follows_on[MOD_MAX];
 static uint64_t s_token;
 
@@ -334,8 +346,11 @@ static uint32_t api_guest_alloc(const struct xbox_mod *m, uint32_t size, uint32_
 static void hud_frame(void)
 {
     int o = s_hud_owner;
-    if (o >= 0)
-        __atomic_store_n(&s_active[o], hud_layer_frame(hook_owner_on(o)), __ATOMIC_RELAXED);
+    if (o >= 0) {
+        int on = hook_owner_on(o);
+        __atomic_store_n(&s_hud_owner_on, on, __ATOMIC_RELEASE);
+        __atomic_store_n(&s_active[o], hud_layer_frame(on), __ATOMIC_RELAXED);
+    }
 }
 
 /* A hook runs while its mod does: on, or on until a restart. Inited
@@ -349,13 +364,17 @@ static int hook_owner_on(int i)
 }
 
 /* As hook_owner_on, and the HUD table's owner also while a capture runs,
- * so its hooks reach hud_apply to be recorded (design A15). The layer's
- * mod part stays off with the mod: hud_apply then records and returns -1,
- * changing nothing; the mod's own work it skips by hud_capturing. Once the
- * capture is done the owner's hooks follow the mod again. */
+ * so its hooks reach hud_apply to be recorded (design A15). The owner's
+ * state is the one hud_frame latched, so its hooks switch at the same
+ * guest frame as the layer. The layer's mod part stays off
+ * with the mod: hud_apply then records and returns -1, changing nothing;
+ * the mod's own work it skips by hud_capturing. Once the capture is done
+ * the owner's hooks follow the mod again. */
 static int hook_runs(int i)
 {
-    return hook_owner_on(i) || (i == s_hud_owner && hud_capture_live());
+    if (i == s_hud_owner)
+        return __atomic_load_n(&s_hud_owner_on, __ATOMIC_ACQUIRE) || hud_capture_live();
+    return hook_owner_on(i);
 }
 
 static void hook_pre(struct xbox_mod_call *c, void *user)
@@ -373,8 +392,9 @@ static void hook_post(struct xbox_mod_call *c, void *user)
 {
     const struct mod_hook *h = user;
     if (!hook_runs(h->owner)) {
-        /* Switched off between the pre and this post: the HUD layer still
-         * undoes what the pre began (a RESTORE shift, a wrapper's entry). */
+        /* Switched off between the pre and this post (for the HUD owner, a
+         * frame ended in between): the HUD layer still undoes what the pre
+         * began (a RESTORE shift, a wrapper's entry). */
         if (h->owner == s_hud_owner)
             hud_layer_post_off(c);
         return;
@@ -486,8 +506,8 @@ static int api_hud_table(const char *toml, size_t len)
 static int api_hud_capturing(const struct xbox_mod *m)
 {
     int o = s_hud_owner;
-    return o >= 0 && m && s_table && o < s_count && s_table[o] == m && !hook_owner_on(o)
-           && hud_capture_live();
+    return o >= 0 && m && s_table && o < s_count && s_table[o] == m
+           && !__atomic_load_n(&s_hud_owner_on, __ATOMIC_ACQUIRE) && hud_capture_live();
 }
 
 static void api_active(const struct xbox_mod *m, int on)
@@ -1327,6 +1347,9 @@ static int mod_init(int describe)
     s_nhooks = 0;
     s_ncap_hooks = 0;
     s_hud_owner = -1;
+    s_hud_owner_on = 0;
+    s_nset_at = -1;
+    s_frames = 0;
     hud_layer_reset();
     recomp_hook_reset();
     enhance_actions_drop_mods();
@@ -1532,8 +1555,86 @@ int xbox_mod_init_describe(void)
     return s_count;
 }
 
+/* RECOMP_DEBUG=mod_set_at=<frame>:<key>=<value>,...: a mod setting changed
+ * from the flip tick (the walker thread, where the menu steps when the
+ * title is not polling) once the guest has run that many xbox_mod_frame
+ * calls, through xbox_mod_setting_set as the Mods page does, so a live
+ * switch can be shot without the menu. The tick runs while the
+ * actions layer is armed (the menu on). */
+
+static double set_at_value(const struct xbox_mod_setting *s, const char *v, size_t n)
+{
+    static const char *const offs[] = { "off", "false", "0", NULL };
+    static const char *const ons[] = { "on", "true", "1", NULL };
+    char b[64];
+    snprintf(b, sizeof b, "%.*s", (int)(n < sizeof b ? n : sizeof b - 1), v);
+    for (int c = 0; s->kind == XBOX_SET_ENUM && s->choices && s->choices[c]; c++)
+        if (!strcmp(s->choices[c], b))
+            return c;
+    for (int c = 0; offs[c]; c++)
+        if (!strcmp(offs[c], b))
+            return 0;
+    for (int c = 0; ons[c]; c++)
+        if (!strcmp(ons[c], b))
+            return 1;
+    return atof(b);
+}
+
+static void set_at_parse(void)
+{
+    const char *p = recomp_env(RENV_MOD_SET_AT);
+    s_nset_at = 0;
+    while (p && *p) {
+        const char *end = strchr(p, ',');
+        size_t len = end ? (size_t)(end - p) : strlen(p);
+        const char *colon = memchr(p, ':', len);
+        const char *eq = colon ? memchr(colon, '=', len - (size_t)(colon - p)) : NULL;
+        int ok = 0;
+        if (colon && eq && s_nset_at < SET_AT_MAX && p[0] >= '0' && p[0] <= '9') {
+            size_t kn = (size_t)(eq - colon - 1);
+            for (int i = 0; i < s_count && !ok; i++)
+                for (uint32_t k = 0; s_mod[i].valid && k < s_mod[i].d.n_settings && !ok; k++) {
+                    const char *key = s_mod[i].set[k].key;
+                    if (strlen(key) != kn || strncmp(key, colon + 1, kn))
+                        continue;
+                    s_set_at[s_nset_at] = (struct set_at){
+                        (uint32_t)strtoul(p, NULL, 10), i, k,
+                        set_at_value(&s_mod[i].d.settings[k], eq + 1,
+                                     len - (size_t)(eq + 1 - p)), 0 };
+                    s_nset_at++;
+                    ok = 1;
+                }
+        }
+        if (!ok)
+            fprintf(stderr, "[MOD] mod_set_at: entry '%.*s' skipped (frame:key=value, "
+                    "a mod setting's key, %d at most)\n", (int)len, p, SET_AT_MAX);
+        p = end ? end + 1 : NULL;
+    }
+}
+
+void xbox_mod_debug_tick(void)
+{
+    uint32_t f;
+    if (!recomp_env(RENV_MOD_SET_AT) || __atomic_load_n(&s_shut, __ATOMIC_ACQUIRE))
+        return;
+    if (s_nset_at < 0)
+        set_at_parse();
+    f = __atomic_load_n(&s_frames, __ATOMIC_ACQUIRE);
+    for (int i = 0; i < s_nset_at; i++) {
+        struct set_at *e = &s_set_at[i];
+        if (e->done || f < e->frame)
+            continue;
+        e->done = 1;
+        xbox_mod_setting_set(e->mod, e->idx, e->v);
+        fprintf(stderr, "[MOD] mod_set_at: frame %u %s=%g (state %d)\n", f,
+                s_mod[e->mod].set[e->idx].key, e->v,
+                (int)__atomic_load_n(&s_state[e->mod], __ATOMIC_RELAXED));
+    }
+}
+
 void xbox_mod_frame(void)
 {
+    __atomic_add_fetch(&s_frames, 1, __ATOMIC_RELEASE);
     if (!s_nrunning) {
         if (hud_capture_on() && !__atomic_load_n(&s_shut, __ATOMIC_ACQUIRE))
             cap_frame();

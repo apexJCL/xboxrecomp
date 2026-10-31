@@ -421,6 +421,10 @@ int xbox_mod_init(void);
 /* The title's glue, once per guest frame on the guest's thread. */
 void xbox_mod_frame(void);
 
+/* From the actions layer's flip tick: RECOMP_DEBUG=mod_set_at's requests
+ * (mod.c). Nothing without the key. */
+void xbox_mod_debug_tick(void);
+
 /* The title's pad glue: whether a mod has port 0 (enhance_input_captured). */
 int xbox_mod_input_captured(void);
 

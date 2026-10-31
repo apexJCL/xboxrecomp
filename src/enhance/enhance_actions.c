@@ -854,6 +854,8 @@ void enhance_actions_tick(void)
     int stale0 = 0;
     enhance_menu_hook_fn hook;
 
+    /* A debug key's live mod switches, from the thread the menu steps on. */
+    xbox_mod_debug_tick();
     if (!__atomic_load_n(&s_armed, __ATOMIC_ACQUIRE))
         return;
     /* Which ports to read, and their slots. The clock is read under the
