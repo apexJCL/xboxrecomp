@@ -1461,7 +1461,7 @@ The title's glue calls two entries:
 - `xbox_mod_input_captured()` from its pad read. While it returns true, the
   title must see a released pad.
 
-`struct xbox_mod_api` (version 5, `XBOX_MOD_API_VERSION`) holds:
+`struct xbox_mod_api` (version 6, `XBOX_MOD_API_VERSION`) holds:
 
 | Member | What it gives |
 | --- | --- |
@@ -1485,6 +1485,8 @@ The title's glue calls two entries:
 | `hud_apply(c, d)` | v5. From a hook's pre on the call that takes a HUD element's vertices: moves, clips or stretches them for this frame. Guest threads. |
 | `hud_restore(c)` | v5. From the same hook's post: puts back what an `XBOX_HUD_RESTORE` apply changed. |
 | `hud_capturing(mod)` | v5. Non-zero when the mod's hooks run only for a mapping capture (it owns the HUD table and is off or dormant): a hook then does only `hud_apply` and `hud_restore`. Any thread. |
+| `guest_call(va, args, eax_out)` | v6. Runs the lifted guest function at `va` ([Guest calls](#guest-calls-v6)). Only from a hook's pre or post, or an `on_frame` callback. |
+| `guest_alloc(mod, size, align)` | v6. A zeroed block of guest memory the title's heap never hands out ([Guest calls](#guest-calls-v6)). Same threads as `guest_call`. |
 
 `struct xbox_mod` gained two fields in v4, after `desc`:
 
@@ -1549,6 +1551,43 @@ callback may be NULL, but not both.
 - **Failed init.** A failed init's hooks are dropped with the rest of what
   it registered. The hooks take effect together, after every mod's init:
   the log reads `[MOD] N hooked functions`.
+
+### Guest calls (v6)
+
+`api->guest_call(va, a, eax_out)` calls the guest function at `va` from a
+mod callback, in the middle of the guest code that ran the callback. It
+works only on a guest thread inside a hook's pre or post or an `on_frame`
+callback; anywhere else it logs `[MOD] guest_call 0x...: refused, ...` and
+returns 0. A guest thread is one the kernel started for the title
+(guest-main or a title thread); a host thread (menu, render, input) is
+refused even inside a callback, since it has no guest registers.
+
+- **Arguments.** `struct xbox_guest_args` sets `eax`, `ecx` and `edx`, and
+  pushes `stack[0..n_stack)`, with `stack[0]` the first argument. At most
+  `XBOX_GUEST_MAX_STACK` (16).
+- **Frame.** The call's frame starts 0x100 bytes below the current guest
+  esp, with the first argument on a 16-byte boundary. The return address
+  is `0xDEADBEEF`, so no return-address lookup matches it.
+- **Registers.** The whole register set (`src/kernel/recomp_regs.h`, the
+  list the DPC path saves too) is saved first and put back after. The
+  callee's `eax` goes to `*eax_out` (may be NULL); every other effect is in
+  guest memory.
+- **Result.** 1, or 0 with one log line when `va` has no lifted function,
+  the arguments are too many, or esp is not a guest stack.
+
+The function runs with the guest's state as it is at that point. Whether
+calling it there is safe (locks, re-entry, a list being walked) is the
+mod's business: call only what the game itself calls from a matching
+place.
+
+`api->guest_alloc(mod, size, align)` gives the mod a block of `size` bytes
+from the kernel's contiguous arena, zeroed, aligned to `align` rounded up
+to a page. It returns the block's guest VA, or 0. One block per mod: a
+later call with a size up to the first returns the same block, and a
+larger one is refused. Two guest threads asking at once still get one
+block. Nothing frees it. Use it for data the guest must
+reach by address (a record a guest function reads), never for the mod's
+own state.
 
 ### HUD table (v5)
 
@@ -1955,7 +1994,7 @@ Schema 1. Fields are only added; one removed or changed in meaning bumps
 `schema`. A field that does not apply is left out.
 
 ```json
-{"schema": 1, "api": 5, "mods": [
+{"schema": 1, "api": 6, "mods": [
   {"id": "fly", "title": "Free camera", "descriptor": true, "init": "no", "enable": "fly.enabled",
    "settings": [
       {"name": "speed", "key": "mods.fly.speed", "kind": "float", "label": "Speed",

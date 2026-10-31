@@ -1052,6 +1052,7 @@ int     xbox_DpcDrainHere(void);        /* the caller holds the gate; DPCs run *
  * waits; 1 when DPCs stayed queued on a busy gate. *ran counts what ran. */
 int     xbox_DpcDrainTimer(int *ran);
 void    xbox_DpcMarkGuestThread(void);  /* this thread runs guest code */
+int     xbox_DpcIsGuestThread(void);    /* 1 after xbox_DpcMarkGuestThread here */
 int     xbox_DpcOnRaise(void);  /* gate on and RECOMP_DPC_ON_RAISE not 0 */
 
 typedef struct {

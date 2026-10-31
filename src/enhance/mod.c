@@ -25,6 +25,7 @@
 #include "enhance_menu.h"
 #include "recomp_cfg.h"
 #include "recomp_exit_hook.h"
+#include "recomp_guest_call.h"
 #include "recomp_hook_mod.h"
 #include "xbox_memory_layout.h"
 
@@ -247,6 +248,87 @@ static int api_on_enable(void (*fn)(int on, void *user), void *user)
 static void mod_mem(void);
 static int hook_owner_on(int i);
 
+/* Non-zero while this thread runs a mod callback the guest's code called
+ * into: a hook, or xbox_mod_frame's callbacks. guest_call and guest_alloc
+ * run only there: the registers they save are this thread's guest state,
+ * and a menu, render or input thread has none (v6). */
+static RECOMP_TLS int t_in_guest_cb;
+
+/* Each mod's guest_alloc block, index as the table's. */
+static uint32_t s_galloc_va[MOD_MAX], s_galloc_size[MOD_MAX];
+static volatile int s_galloc_lock;
+
+_Static_assert(XBOX_GUEST_MAX_STACK == RECOMP_GUEST_CALL_MAX_STACK,
+               "mod.h and recomp_guest_call.h disagree on the stack arguments");
+
+static int api_guest_call(uint32_t va, const struct xbox_guest_args *a, uint32_t *eax_out)
+{
+    if (!t_in_guest_cb) {
+        fprintf(stderr, LOGP "guest_call 0x%08X: refused, not on a guest thread inside a "
+                "hook or frame callback\n", (unsigned)va);
+        return 0;
+    }
+    if (!a) {
+        fprintf(stderr, LOGP "guest_call 0x%08X: no arguments given\n", (unsigned)va);
+        return 0;
+    }
+    return recomp_guest_call(LOGP, va, a->eax, a->ecx, a->edx, a->stack, a->n_stack, eax_out);
+}
+
+static uint32_t api_guest_alloc(const struct xbox_mod *m, uint32_t size, uint32_t align)
+{
+    const char *name = m && m->name ? m->name : "?";
+    uint32_t va, have;
+    int i, fresh = 0;
+
+    for (i = 0; m && s_table && i < s_count; i++)
+        if (s_table[i] == m)
+            break;
+    if (!m || !s_table || i >= s_count) {
+        fprintf(stderr, LOGP "guest_alloc: refused, not a mod in the table\n");
+        return 0;
+    }
+    if (!t_in_guest_cb) {
+        fprintf(stderr, "[MOD %s] guest_alloc: refused, not on a guest thread inside a "
+                "hook or frame callback\n", name);
+        return 0;
+    }
+    if (!size) {
+        fprintf(stderr, "[MOD %s] guest_alloc: 0 bytes refused\n", name);
+        return 0;
+    }
+    /* Two guest threads may run a mod's callbacks at once; the first
+     * use must give one block, not one each. Held across the arena call
+     * only on that first use. */
+    while (__atomic_exchange_n(&s_galloc_lock, 1, __ATOMIC_ACQUIRE))
+        ;
+    va = s_galloc_va[i];
+    have = s_galloc_size[i];
+    if (!va) {
+        va = recomp_guest_alloc(size, align);
+        if (va) {
+            s_galloc_va[i] = va;
+            s_galloc_size[i] = have = size;
+            fresh = 1;
+        }
+    }
+    __atomic_store_n(&s_galloc_lock, 0, __ATOMIC_RELEASE);
+    if (!va) {
+        fprintf(stderr, "[MOD %s] guest_alloc: %u bytes not given (no guest thread, or the"
+                " contiguous arena is full)\n", name, (unsigned)size);
+        return 0;
+    }
+    if (size > have) {
+        fprintf(stderr, "[MOD %s] guest_alloc: %u bytes refused, the block has %u\n", name,
+                (unsigned)size, (unsigned)have);
+        return 0;
+    }
+    if (fresh)
+        fprintf(stderr, "[MOD %s] guest_alloc: %u bytes at 0x%08X\n", name, (unsigned)size,
+                (unsigned)va);
+    return va;
+}
+
 /* The HUD layer's frame: its owner's listing follows the layer (mod.h,
  * hud_table). Without a table, one load. */
 static void hud_frame(void)
@@ -282,7 +364,9 @@ static void hook_pre(struct xbox_mod_call *c, void *user)
     if (!hook_runs(h->owner))
         return;
     mod_mem();
+    t_in_guest_cb++;
     h->pre(c, h->user);
+    t_in_guest_cb--;
 }
 
 static void hook_post(struct xbox_mod_call *c, void *user)
@@ -296,7 +380,9 @@ static void hook_post(struct xbox_mod_call *c, void *user)
         return;
     }
     mod_mem();
+    t_in_guest_cb++;
     h->post(c, h->user);
+    t_in_guest_cb--;
 }
 
 static int api_hook(uint32_t va, xbox_mod_hook_fn pre, xbox_mod_hook_fn post,
@@ -1235,6 +1321,9 @@ static int mod_init(int describe)
         s_follows_on[i] = 0;
     }
     s_token = 0;
+    /* A re-init (tests) forgets the blocks; the arena keeps them. */
+    memset(s_galloc_va, 0, sizeof s_galloc_va);
+    memset(s_galloc_size, 0, sizeof s_galloc_size);
     s_nhooks = 0;
     s_ncap_hooks = 0;
     s_hud_owner = -1;
@@ -1287,6 +1376,8 @@ static int mod_init(int describe)
     s_api.hud_apply = hud_layer_apply;
     s_api.hud_restore = hud_layer_restore;
     s_api.hud_capturing = api_hud_capturing;
+    s_api.guest_call = api_guest_call;
+    s_api.guest_alloc = api_guest_alloc;
     hud_layer_set_mem(&s_api.mem);
     s_menu_on = enhance_cfg_bool("menu.enabled", 0);
 
@@ -1428,6 +1519,8 @@ static int mod_init(int describe)
     return s_nrunning;
 }
 
+static void mod_frame_run(void);
+
 int xbox_mod_init(void)
 {
     return mod_init(0);
@@ -1441,8 +1534,6 @@ int xbox_mod_init_describe(void)
 
 void xbox_mod_frame(void)
 {
-    int i;
-
     if (!s_nrunning) {
         if (hud_capture_on() && !__atomic_load_n(&s_shut, __ATOMIC_ACQUIRE))
             cap_frame();
@@ -1451,6 +1542,16 @@ void xbox_mod_frame(void)
     mod_mem();
     if (__atomic_load_n(&s_shut, __ATOMIC_ACQUIRE))
         return;
+    t_in_guest_cb++;
+    mod_frame_run();
+    t_in_guest_cb--;
+}
+
+/* xbox_mod_frame's callbacks, on the guest's thread (t_in_guest_cb set). */
+static void mod_frame_run(void)
+{
+    int i;
+
     /* The Mods page's toggles and settings, on the thread the mods' frames
      * run on. */
     if (__atomic_load_n(&s_any_pending, __ATOMIC_ACQUIRE) &&

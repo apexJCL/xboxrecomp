@@ -83,6 +83,23 @@ void enhance_menu_start(void) {}
 static uint8_t s_guest[64];
 ptrdiff_t xbox_GetMemoryOffset(void);
 ptrdiff_t xbox_GetMemoryOffset(void) { return (ptrdiff_t)((uintptr_t)s_guest - 0x1000u); }
+/* mod.c's v6 guest calls run guest code (recomp_guest_call.c, tested in
+ * mod_guest_call); this test has none to run. */
+int recomp_guest_call(const char *who, uint32_t va, uint32_t eax, uint32_t ecx, uint32_t edx,
+                      const uint32_t *stack, uint32_t n_stack, uint32_t *eax_out);
+int recomp_guest_call(const char *who, uint32_t va, uint32_t eax, uint32_t ecx, uint32_t edx,
+                      const uint32_t *stack, uint32_t n_stack, uint32_t *eax_out)
+{
+    (void)who; (void)va; (void)eax; (void)ecx; (void)edx; (void)stack; (void)n_stack;
+    (void)eax_out;
+    return 0;
+}
+uint32_t recomp_guest_alloc(uint32_t size, uint32_t align);
+uint32_t recomp_guest_alloc(uint32_t size, uint32_t align)
+{
+    (void)size; (void)align;
+    return 0;
+}
 static struct nv2a_pb_present s_present = { 0x00C00000u, 640, 480, 2560, 0 };
 const struct nv2a_pb_present *nv2a_pb_present_state(void) { return &s_present; }
 
@@ -878,7 +895,7 @@ static void test_dump(void)
     xbox_mod_init_describe();
     CHECK(xbox_mod_describe_write("empty.json") == 0);
     got = read_all("empty.json");
-    CHECK(got && !strcmp(got, "{\"schema\": 1, \"api\": 5, \"mods\": [], \"shaders\": "
+    CHECK(got && !strcmp(got, "{\"schema\": 1, \"api\": 6, \"mods\": [], \"shaders\": "
                              "{\"active\": \"none\", \"presets\": [], \"active_profile\": "
                              "\"none\", \"profiles\": []}}\n"));
     free(got);

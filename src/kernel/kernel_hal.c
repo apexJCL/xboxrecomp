@@ -15,6 +15,7 @@
 #include "kernel_missing.h"
 #include "kernel_pacing.h"
 #include "recomp_env.h"
+#include "recomp_regs.h"
 #include "xbox_memory_layout.h"   /* RECOMP_TLS, g_fs_base */
 #include <stdio.h>
 #include <stdlib.h>
@@ -451,6 +452,11 @@ void xbox_DpcMarkGuestThread(void)
     t_guest_thread = 1;
 }
 
+int xbox_DpcIsGuestThread(void)
+{
+    return t_guest_thread;
+}
+
 void xbox_IrqSetHandler(int line, void (*run)(void))
 {
     if (line >= 0 && line < XBOX_IRQ_LINES)
@@ -477,58 +483,13 @@ static void irq_note_wait(int line, uint64_t posted_ns)
             break;
 }
 
-/* The holder's recompiled register state. A safe point at a thunk sits
- * before the bridge reads its arguments, and one at a spin-wait yield sits
- * in the middle of a guest loop, so everything the generated code keeps in
- * these across a call or an instruction is put back. g_fs_base stays: the
- * routine runs on the holder's TIB, as on the console's one CPU (a device
- * model's thread as holder: see irq_release_point). */
-extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_ebx, g_esi, g_edi, g_ebp;
-extern RECOMP_TLS uint32_t g_seh_ebp, g_eflags;
-extern RECOMP_TLS int g_df, g_fp_top, g_fp_cmp;
-extern RECOMP_TLS double g_fp_stack[8];
-extern RECOMP_TLS uint16_t g_fp_control_word, g_fp_cc;
-extern RECOMP_TLS RecompXmm g_xmm0, g_xmm1, g_xmm2, g_xmm3;
-extern RECOMP_TLS RecompXmm g_xmm4, g_xmm5, g_xmm6, g_xmm7;
-extern RECOMP_TLS RecompMmx g_mm0, g_mm1, g_mm2, g_mm3;
-extern RECOMP_TLS RecompMmx g_mm4, g_mm5, g_mm6, g_mm7;
-
-typedef struct {
-    uint32_t eax, ecx, edx, ebx, esi, edi, ebp, esp, seh_ebp, eflags;
-    int df, fp_top, fp_cmp;
-    double fp[8];
-    uint16_t fp_cw, fp_cc;
-    RecompXmm xmm[8];
-    RecompMmx mm[8];
-} IrqRegs;
-
-static void irq_regs_save(IrqRegs *r)
-{
-    r->eax = g_eax; r->ecx = g_ecx; r->edx = g_edx; r->ebx = g_ebx;
-    r->esi = g_esi; r->edi = g_edi; r->ebp = g_ebp; r->esp = g_esp;
-    r->seh_ebp = g_seh_ebp; r->eflags = g_eflags; r->df = g_df;
-    r->fp_top = g_fp_top; r->fp_cmp = g_fp_cmp;
-    memcpy(r->fp, g_fp_stack, sizeof r->fp);
-    r->fp_cw = g_fp_control_word; r->fp_cc = g_fp_cc;
-    r->xmm[0] = g_xmm0; r->xmm[1] = g_xmm1; r->xmm[2] = g_xmm2; r->xmm[3] = g_xmm3;
-    r->xmm[4] = g_xmm4; r->xmm[5] = g_xmm5; r->xmm[6] = g_xmm6; r->xmm[7] = g_xmm7;
-    r->mm[0] = g_mm0; r->mm[1] = g_mm1; r->mm[2] = g_mm2; r->mm[3] = g_mm3;
-    r->mm[4] = g_mm4; r->mm[5] = g_mm5; r->mm[6] = g_mm6; r->mm[7] = g_mm7;
-}
-
-static void irq_regs_restore(const IrqRegs *r)
-{
-    g_eax = r->eax; g_ecx = r->ecx; g_edx = r->edx; g_ebx = r->ebx;
-    g_esi = r->esi; g_edi = r->edi; g_ebp = r->ebp; g_esp = r->esp;
-    g_seh_ebp = r->seh_ebp; g_eflags = r->eflags; g_df = r->df;
-    g_fp_top = r->fp_top; g_fp_cmp = r->fp_cmp;
-    memcpy(g_fp_stack, r->fp, sizeof r->fp);
-    g_fp_control_word = r->fp_cw; g_fp_cc = r->fp_cc;
-    g_xmm0 = r->xmm[0]; g_xmm1 = r->xmm[1]; g_xmm2 = r->xmm[2]; g_xmm3 = r->xmm[3];
-    g_xmm4 = r->xmm[4]; g_xmm5 = r->xmm[5]; g_xmm6 = r->xmm[6]; g_xmm7 = r->xmm[7];
-    g_mm0 = r->mm[0]; g_mm1 = r->mm[1]; g_mm2 = r->mm[2]; g_mm3 = r->mm[3];
-    g_mm4 = r->mm[4]; g_mm5 = r->mm[5]; g_mm6 = r->mm[6]; g_mm7 = r->mm[7];
-}
+/* The holder's recompiled register state is saved around each routine
+ * (RecompRegs, recomp_regs.h). A safe point at a thunk sits before the
+ * bridge reads its arguments, and one at a spin-wait yield sits in the
+ * middle of a guest loop, so everything the generated code keeps in these
+ * across a call or an instruction is put back. g_fs_base stays: the routine
+ * runs on the holder's TIB, as on the console's one CPU (a device model's
+ * thread as holder: see irq_release_point). */
 
 /* Queued DPCs, run on the guest thread that owns "the processor at
  * DISPATCH". On the console a DPC queued by an ISR runs when the processor
@@ -549,13 +510,13 @@ static void irq_regs_restore(const IrqRegs *r)
  * front-end method cleared by the APU frame thread). */
 static void dpc_run_here(void)
 {
-    IrqRegs saved;
+    RecompRegs saved;
 
     if (!xbox_DpcPending() || !t_guest_thread || t_in_dpc || t_in_isr)
         return;
     if (!xbox_DpcOnRaise())
         return;
-    irq_regs_save(&saved);
+    recomp_regs_save(&saved);
     t_in_dpc = 1;
     /* The routines run without the guest CPU (RECOMP_GUEST_LOCK), as on the
      * timer thread: a DPC never takes it. This drain runs under the gate,
@@ -566,7 +527,7 @@ static void dpc_run_here(void)
      * may see its intermediate state, as it may on the timer thread. */
     xbox_DpcDrainHere();
     t_in_dpc = 0;
-    irq_regs_restore(&saved);
+    recomp_regs_restore(&saved);
 }
 
 /* Run one posted line here, on the holder. 0 when no worker stack was free
@@ -574,7 +535,7 @@ static void dpc_run_here(void)
 static int irq_run_line(int line)
 {
     void (*run)(void) = s_irq_run[line];
-    IrqRegs saved;
+    RecompRegs saved;
     int slot, irql;
 
     if (!run)
@@ -590,7 +551,7 @@ static int irq_run_line(int line)
         return 0;
     }
     irq_note_wait(line, s_irq_post_ns[line]);
-    irq_regs_save(&saved);
+    recomp_regs_save(&saved);
     g_esp = XBOX_WORKER_STACK_TOP(slot);
     g_eax = g_ecx = g_edx = g_ebx = g_esi = g_edi = 0;
     t_in_isr = 1;
@@ -598,7 +559,7 @@ static int irq_run_line(int line)
     run();
     xbox_IrqlLeaveInterrupt(irql);
     t_in_isr = 0;
-    irq_regs_restore(&saved);
+    recomp_regs_restore(&saved);
     xbox_worker_stack_free(slot);
     InterlockedIncrement(&s_irq.on_holder[line]);
     return 1;

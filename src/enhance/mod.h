@@ -56,7 +56,7 @@
 extern "C" {
 #endif
 
-#define XBOX_MOD_API_VERSION 5u
+#define XBOX_MOD_API_VERSION 6u
 
 struct xbox_mod_api;
 
@@ -79,6 +79,15 @@ struct xbox_hud_call {
     uint64_t tex;               /* the pack's texel hash of its texture, or 0 */
 };
 #define XBOX_HUD_RESTORE 1u
+
+/* A guest call's arguments (api->guest_call). stack[0] is the first stack
+ * argument, at [esp + 4] when the callee starts. */
+struct xbox_guest_args {
+    uint32_t eax, ecx, edx;     /* register arguments (thiscall, fastcall, custom) */
+    const uint32_t *stack;      /* pushed right to left; NULL when n_stack is 0 */
+    uint32_t n_stack;           /* at most XBOX_GUEST_MAX_STACK */
+};
+#define XBOX_GUEST_MAX_STACK 16u
 struct xbox_mod_desc;
 struct enhance_item;            /* enhance_menu.h */
 
@@ -362,6 +371,31 @@ struct xbox_mod_api {
      * hud_restore, and the run stays as it would be without the mod. 0
      * otherwise, the mod on included. Any thread; a few loads. */
     int (*hud_capturing)(const struct xbox_mod *m);
+
+    /* ---- version 6 (check size before using these) ---------------------
+     * The guest's own functions and memory. Both only on a guest thread
+     * inside a mod callback (a hook's pre or post, an on_frame, on_enable
+     * or on_setting callback); elsewhere they return 0 with one line. */
+
+    /* Run the lifted guest function at va with a's registers and stack
+     * arguments, the frame 0x100 bytes below the current guest esp and the
+     * first argument 16-byte aligned. Every guest register (g_ebp,
+     * g_seh_ebp, the x87 stack and control, SSE, MMX and mxcsr included) is
+     * saved before and put back after, so a hook's function continues as if
+     * no call happened, whatever the callee pops or clobbers. *eax_out gets
+     * the callee's eax (may be NULL). 1, or 0 with a line: no lifted function
+     * at va, more than XBOX_GUEST_MAX_STACK arguments, no guest stack, not a
+     * guest thread. The callee runs inside the caller's call: it must not be
+     * one that waits for the frame to end. */
+    int (*guest_call)(uint32_t va, const struct xbox_guest_args *a, uint32_t *eax_out);
+    /* The mod's one block of guest memory: size bytes, zeroed, aligned to
+     * align (at least a page), from the kernel's contiguous arena, so the
+     * title's heap never hands it out. The first call allocates; a later one
+     * returns the same block for a size up to the first and 0 for a larger
+     * one. Never freed. Asked from the guest thread at first use, so a mod
+     * that stays off leaves the guest's memory map stock. Its guest VA, or
+     * 0 with a line. */
+    uint32_t (*guest_alloc)(const struct xbox_mod *m, uint32_t size, uint32_t align);
 };
 
 /* Stack argument n (0-based) of a hooked call, in a pre or a post. */

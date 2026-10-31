@@ -32,6 +32,7 @@ set(KERNEL_SOURCES
     recomp_trace.c
     recomp_hook.c
     recomp_hook_run.c
+    recomp_guest_call.c
     nv2a_pb_scan.c
     nv2a_pb_exec.c
     nv2a_flip_hold.c

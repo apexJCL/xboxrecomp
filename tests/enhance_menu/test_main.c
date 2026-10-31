@@ -106,6 +106,23 @@ int xbox_path_shader_cache(char *out, size_t n)
 
 ptrdiff_t xbox_GetMemoryOffset(void);
 ptrdiff_t xbox_GetMemoryOffset(void) { return 0; }
+/* mod.c's v6 guest calls run guest code (recomp_guest_call.c, tested in
+ * mod_guest_call); this test has none to run. */
+int recomp_guest_call(const char *who, uint32_t va, uint32_t eax, uint32_t ecx, uint32_t edx,
+                      const uint32_t *stack, uint32_t n_stack, uint32_t *eax_out);
+int recomp_guest_call(const char *who, uint32_t va, uint32_t eax, uint32_t ecx, uint32_t edx,
+                      const uint32_t *stack, uint32_t n_stack, uint32_t *eax_out)
+{
+    (void)who; (void)va; (void)eax; (void)ecx; (void)edx; (void)stack; (void)n_stack;
+    (void)eax_out;
+    return 0;
+}
+uint32_t recomp_guest_alloc(uint32_t size, uint32_t align);
+uint32_t recomp_guest_alloc(uint32_t size, uint32_t align)
+{
+    (void)size; (void)align;
+    return 0;
+}
 
 static struct nv2a_pb_present s_present = { 0x00C00000u, 640, 480, 2560, 0 };
 const struct nv2a_pb_present *nv2a_pb_present_state(void) { return &s_present; }
