@@ -9,6 +9,56 @@ blinx2-v0.3.2; earlier tags are described by their commits.
 
 ## [Unreleased]
 
+## [blinx2-v0.11.0] - 2026-10-31
+
+### Added
+- Mod API v6: `api->guest_call` runs one of the game's own recompiled
+  functions from a mod (inside a hook or frame callback) with every guest
+  register, x87 and SSE state saved and put back around it, so the game
+  carries on as if no call happened; `api->guest_alloc` gives each mod one
+  zeroed block of guest memory, taken at first use so a mod that is off
+  leaves the memory map stock. Both refuse host threads. The DPC path now
+  shares the same register set and also keeps `g_mxcsr`.
+- Shader profiles: named chains of up to 8 slang presets, saved as TOML
+  under `config/shader-profiles/`, can be made, named, edited, switched
+  and deleted from the in-game Shaders page on Metal and D3D11.
+  `present.profile` (`RECOMP_PRESENT_PROFILE`) picks one at start (off by
+  default, so stock output is unchanged). A failing stage falls back to
+  the stock present with a red row, and a chain forced from the
+  environment cannot be edited from the menu.
+- Pad scripts and `pad_record` reach games that answer `XInputGetState`
+  themselves and never start the USB host (BLiNX 2): `usb_gamepad.h`
+  gains `usb_gamepad_game_press`, `_record` and `_pads`, with the same
+  step format, so a record replays through either path.
+- Recorded pad input can anchor to file opens: `pad_anchor=<text>|...`
+  beside `pad_record` writes `@open:<file>` steps, and a replay holds its
+  clock to those opens, so a load that runs longer or shorter than when
+  it was recorded no longer drifts the presses off the menus. A late open
+  is waited for (retrying a recorded tap up to 8 times) and given up
+  after 1800 flips. With no key set nothing changes.
+- `RECOMP_DEBUG=mod_set_at=<frame>:<key>=<value>,...` makes a menu
+  setting change at a given frame, so a live mod switch can be captured
+  unattended.
+
+### Changed
+- Each game gets its own default hard disk,
+  `<data>/xboxrecomp/<title id>`, so titles no longer see each other's
+  saves or share one cache. On the first run a game's old save folders
+  are copied once from the shared root, which is only read: each copy is
+  built in a temporary folder and renamed into place, so a full disk or a
+  second instance of the game leaves no half copy, and file times are
+  kept. A folder the player has already saved into is never overwritten;
+  the log says where the old saves wait to be copied by hand.
+  `RECOMP_HDD_DIR` and installed builds are unchanged.
+
+### Fixed
+- A start shader profile waits for the shader cache folder on a fresh
+  hard disk, reports a missing stage at once instead of waiting forever,
+  and its wait is ordered safely between threads.
+- A HUD mod's hooks switch together with the HUD anchor layer at the next
+  frame, so turning the HUD mod on or off from the menu no longer draws a
+  frame with the HUD half moved.
+
 ## [blinx2-v0.10.0] - 2026-10-30
 
 ### Added
