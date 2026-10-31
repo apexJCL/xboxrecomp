@@ -714,15 +714,22 @@ int main(int argc, char **argv)
     recomp_env_set(RENV_STORAGE_RAM_CACHE, "0");
     if (!mkdtemp(tmpl)) return 2;
     setenv("XDG_DATA_HOME", tmpl, 1);
-    snprintf(cache, sizeof cache, "%s/xboxrecomp/Cache", tmpl);
-    snprintf(cmd, sizeof cmd, "mkdir -p '%s'", cache);
-    if (system(cmd) != 0) return 2;
 
     xbe = load(argc > 1 ? argv[1] : "tools/conformance/test.xbe", &n);
     if (!xbe || !xbox_MemoryLayoutInit(xbe, n)) {
         printf("cannot map guest memory (run tools/conformance/mkxbe.py)\n");
         return 2;
     }
+    /* The default hard disk is per title (<XDG>/xboxrecomp/<title id>), and
+     * the title id is the XBE's, so Cache is found through the path layer. */
+    {
+        char root[200];
+        xbox_path_init(NULL, NULL);
+        if (!xbox_path_hdd_root(root, sizeof root)) return 2;
+        snprintf(cache, sizeof cache, "%s/Cache", root);
+    }
+    snprintf(cmd, sizeof cmd, "mkdir -p '%s'", cache);
+    if (system(cmd) != 0) return 2;
 
     g_thunks  = xbox_HeapAlloc(0x1000, 4096);
     g_stack   = xbox_HeapAlloc(0x1000, 4096);

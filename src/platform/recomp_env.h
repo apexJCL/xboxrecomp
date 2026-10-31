@@ -117,7 +117,7 @@ extern "C" {
     X(WINDOW_QUIT_AFTER, CONFIG, "RECOMP_WINDOW_QUIT_AFTER", NULL, "close the window after this many seconds") \
     X(FB_WINDOW,         CONFIG, "RECOMP_FB_WINDOW",         NULL, "Windows: show the framebuffer window (not beside the d3d11 backend)") \
     X(GAME_FILES,        CONFIG, "RECOMP_GAME_FILES",        NULL, "game files directory; the launcher sets it, the game's main.c has the default") \
-    X(HDD_DIR,           CONFIG, "RECOMP_HDD_DIR",           NULL, "emulated hard disk: partition images, saves, caches") \
+    X(HDD_DIR,           CONFIG, "RECOMP_HDD_DIR",           NULL, "emulated hard disk: partition images, saves, caches (default: <data>/xboxrecomp/<title id>)") \
     X(SAVE_DIR,          CONFIG, "RECOMP_SAVE_DIR",          NULL, "root for the title's UDATA/TDATA/CACHE") \
     X(DXBC_CACHE,        CONFIG, "RECOMP_DXBC_CACHE",        NULL, "D3D11 compiled-shader (DXBC) cache: on (default, <hdd dir>/ShaderCache/dxbc), 0/off/false/no: off, or an absolute directory") \
     X(AC97_READY,        CONFIG, "RECOMP_AC97_READY",        NULL, "emulated APU and audio; default on (x86-64 Windows/Proton, macOS/Linux arm64), 0: off") \

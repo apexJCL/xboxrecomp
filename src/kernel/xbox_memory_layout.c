@@ -4096,6 +4096,9 @@ BOOL xbox_MemoryLayoutInit(const void *xbe_data, size_t xbe_size)
             extern void xbox_FramebufferWindowSetTitle(const uint16_t *, int);
             xbox_FramebufferWindowSetTitle(
                 (const uint16_t *)(xbe + cert_off + 0x0C), 40);
+            /* The title id (+0x08) names the default hard disk root, so
+             * games that pass no hdd dir stop sharing one (kernel_path.c). */
+            xbox_path_set_title_id(*(const uint32_t *)(xbe + cert_off + 0x08));
         }
         int sections_short = 0;
         size_t total_bytes = 0;

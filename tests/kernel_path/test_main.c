@@ -26,6 +26,10 @@
 #include <ftw.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#include <sys/time.h>
+#include <sys/wait.h>
+#include <dirent.h>
+#include <signal.h>
 #endif
 
 /* Provided by the generated title; nothing here calls a guest function. */
@@ -376,6 +380,675 @@ static void test_legacy_saves(void)
            "CACHE still goes to <save>/TitleCache");
 }
 
+static void write_text(const char *path, const char *text)
+{
+    FILE *f = fopen(path, "wb");
+    if (f) { fputs(text, f); fclose(f); }
+}
+
+/* The file's first line, or "" when it cannot be read. */
+static const char *read_text(const char *path)
+{
+    static char buf[256];
+    FILE *f = fopen(path, "rb");
+    buf[0] = '\0';
+    if (f) {
+        size_t n = fread(buf, 1, sizeof buf - 1, f);
+        buf[n] = '\0';
+        fclose(f);
+    }
+    return buf;
+}
+
+static int exists(const char *path)
+{
+    FILE *f;
+    if (is_dir(path)) return 1;
+    f = fopen(path, "rb");
+    if (f) fclose(f);
+    return f != NULL;
+}
+
+/* A file's or a folder's last write, in seconds since 1970. */
+static long long mtime_of(const char *p)
+{
+#if defined(_WIN32)
+    WIN32_FILE_ATTRIBUTE_DATA a;
+    ULARGE_INTEGER t;
+    if (!GetFileAttributesExA(p, GetFileExInfoStandard, &a)) return -1;
+    t.LowPart = a.ftLastWriteTime.dwLowDateTime;
+    t.HighPart = a.ftLastWriteTime.dwHighDateTime;
+    return (long long)(t.QuadPart / 10000000ULL) - 11644473600LL;
+#else
+    struct stat st;
+    return stat(p, &st) == 0 ? (long long)st.st_mtime : -1;
+#endif
+}
+
+static void set_mtime(const char *p, long long t)
+{
+#if defined(_WIN32)
+    FILETIME ft;
+    ULARGE_INTEGER u;
+    HANDLE h = CreateFileA(p, FILE_WRITE_ATTRIBUTES,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    u.QuadPart = (ULONGLONG)(t + 11644473600LL) * 10000000ULL;
+    ft.dwLowDateTime = u.LowPart;
+    ft.dwHighDateTime = u.HighPart;
+    SetFileTime(h, NULL, &ft, &ft);
+    CloseHandle(h);
+#else
+    struct timeval tv[2];
+    tv[0].tv_sec = tv[1].tv_sec = (time_t)t;
+    tv[0].tv_usec = tv[1].tv_usec = 0;
+    utimes(p, tv);
+#endif
+}
+
+/* Any <name>.copying* entry left in dir. */
+static int copying_left(const char *dir, const char *name)
+{
+    char want[64];
+    size_t n = (size_t)snprintf(want, sizeof want, "%s.copying", name);
+    int found = 0;
+#if defined(_WIN32)
+    char pat[900];
+    WIN32_FIND_DATAA fd;
+    HANDLE f;
+    snprintf(pat, sizeof pat, "%s\\*", dir);
+    f = FindFirstFileA(pat, &fd);
+    if (f == INVALID_HANDLE_VALUE) return 0;
+    do found |= _strnicmp(fd.cFileName, want, n) == 0;
+    while (FindNextFileA(f, &fd));
+    FindClose(f);
+#else
+    DIR *d = opendir(dir);
+    struct dirent *e;
+    if (!d) return 0;
+    while ((e = readdir(d)) != NULL)
+        found |= strncmp(e->d_name, want, n) == 0;
+    closedir(d);
+#endif
+    return found;
+}
+
+/* A shared root as builds before the per-title default left it: two
+ * titles' saves side by side. */
+static void make_legacy(const char *legacy)
+{
+    char p[900];
+    make_dir(legacy);
+    snprintf(p, sizeof p, "%s" SEP "UDATA", legacy);             make_dir(p);
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065", legacy); make_dir(p);
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065" SEP "SAVE1", legacy); make_dir(p);
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065" SEP "SAVE1" SEP "save.dat", legacy);
+    write_text(p, "blinx2 save");
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530013", legacy); make_dir(p);
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530013" SEP "other.dat", legacy);
+    write_text(p, "blinx1 save");
+    snprintf(p, sizeof p, "%s" SEP "TDATA", legacy);             make_dir(p);
+    snprintf(p, sizeof p, "%s" SEP "TDATA" SEP "4d530065", legacy); make_dir(p);
+    snprintf(p, sizeof p, "%s" SEP "TDATA" SEP "4d530065" SEP "t.bin", legacy);
+    write_text(p, "title data");
+    snprintf(p, sizeof p, "%s" SEP "Cache", legacy);             make_dir(p);
+    snprintf(p, sizeof p, "%s" SEP "Cache" SEP "pelon000.rec", legacy);
+    write_text(p, "another game's page");
+}
+
+/* xbox_path_adopt_legacy_saves on explicit roots, so both backends run it. */
+static void test_adopt_legacy(void)
+{
+    char legacy[700], root[700], p[900];
+    int rc;
+
+    printf("saves copied from the shared root\n");
+    snprintf(legacy, sizeof legacy, "%s" SEP "legacy", g_root);
+    make_legacy(legacy);
+
+    snprintf(root, sizeof root, "%s" SEP "new1", g_root);
+    make_dir(root);
+    rc = xbox_path_adopt_legacy_saves(legacy, root, 0x4d530065);
+    check(rc == 2, "UDATA and TDATA of this title copied (returns 2)");
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065" SEP "SAVE1" SEP "save.dat", root);
+    check(same(read_text(p), "blinx2 save"), "the save file is in the new root, same bytes");
+    snprintf(p, sizeof p, "%s" SEP "TDATA" SEP "4d530065" SEP "t.bin", root);
+    check(same(read_text(p), "title data"), "the title data is in the new root");
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530013", root);
+    check(!exists(p), "another title's saves are not copied");
+    snprintf(p, sizeof p, "%s" SEP "Cache", root);
+    check(!exists(p), "the shared Cache is not copied");
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065.copying", root);
+    check(!exists(p), "no .copying tree left");
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065" SEP "SAVE1" SEP "save.dat", legacy);
+    check(same(read_text(p), "blinx2 save"), "the shared root still has the save");
+    snprintf(p, sizeof p, "%s" SEP ".legacy-saves", root);
+    check(exists(p), "the marker is written");
+
+    /* Once only: a save the player deleted does not come back. */
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065" SEP "SAVE1" SEP "save.dat", root);
+    remove(p);
+    rc = xbox_path_adopt_legacy_saves(legacy, root, 0x4d530065);
+    check(rc == 0 && !exists(p), "with the marker, nothing is copied again");
+
+    /* A root with its own UDATA keeps it; a partial copy from a run that
+     * stopped midway is redone. */
+    snprintf(root, sizeof root, "%s" SEP "new2", g_root);
+    make_dir(root);
+    snprintf(p, sizeof p, "%s" SEP "UDATA", root);                       make_dir(p);
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065", root);        make_dir(p);
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065" SEP "mine.dat", root);
+    write_text(p, "newer save");
+    snprintf(p, sizeof p, "%s" SEP "TDATA", root);                       make_dir(p);
+    snprintf(p, sizeof p, "%s" SEP "TDATA" SEP "4d530065.copying", root); make_dir(p);
+    snprintf(p, sizeof p, "%s" SEP "TDATA" SEP "4d530065.copying" SEP "half", root);
+    write_text(p, "partial");
+    rc = xbox_path_adopt_legacy_saves(legacy, root, 0x4d530065);
+    check(rc == 1, "only TDATA copied when the root has its own UDATA");
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065" SEP "mine.dat", root);
+    check(same(read_text(p), "newer save"), "the root's own save is left alone");
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065" SEP "SAVE1", root);
+    check(!exists(p), "the shared save is not merged into it");
+    snprintf(p, sizeof p, "%s" SEP "TDATA" SEP "4d530065" SEP "t.bin", root);
+    check(same(read_text(p), "title data"), "TDATA copied after a stale partial copy");
+    snprintf(p, sizeof p, "%s" SEP "TDATA" SEP "4d530065" SEP "half", root);
+    check(!exists(p), "the partial copy is not taken for the save");
+    snprintf(p, sizeof p, "%s" SEP "TDATA" SEP "4d530065.copying", root);
+    check(!exists(p), "the partial copy is gone");
+
+    /* A title with nothing in the shared root. */
+    snprintf(root, sizeof root, "%s" SEP "new3", g_root);
+    make_dir(root);
+    rc = xbox_path_adopt_legacy_saves(legacy, root, 0x11111111);
+    snprintf(p, sizeof p, "%s" SEP ".legacy-saves", root);
+    check(rc == 0 && exists(p), "nothing to copy: 0, and the marker is written");
+    check(xbox_path_adopt_legacy_saves(legacy, root, 0) == 0,
+          "title id 0 does nothing");
+}
+
+/* The legacy save of make_legacy that the failure cases make unreadable. */
+static void legacy_save(const char *legacy, char *out, size_t n)
+{
+    snprintf(out, n, "%s" SEP "UDATA" SEP "4d530065" SEP "SAVE1" SEP "save.dat", legacy);
+}
+
+/* A copy that fails writes no marker and leaves no empty UDATA behind: an
+ * empty UDATA in the root would hide the saves still kept in the game folder
+ * until the next run. The next run copies it, with its times. */
+static void test_adopt_failure(void)
+{
+    const long long t_file = 1104537600LL, t_dir = 1107216000LL;   /* 2005 */
+    char legacy[700], root[700], save[900], p[900];
+    int rc, blocked;
+#if defined(_WIN32)
+    HANDLE hold;
+#endif
+
+    printf("a failed copy is tried again and hides nothing\n");
+    snprintf(legacy, sizeof legacy, "%s" SEP "legacy", g_root);
+    make_legacy(legacy);
+    legacy_save(legacy, save, sizeof save);
+    set_mtime(save, t_file);
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065" SEP "SAVE1", legacy);
+    set_mtime(p, t_dir);
+
+    snprintf(root, sizeof root, "%s" SEP "new4", g_root);
+    make_dir(root);
+#if defined(_WIN32)
+    /* No sharing: CopyFileW cannot open it, as with a file another program
+     * holds. */
+    hold = CreateFileA(save, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
+    blocked = hold != INVALID_HANDLE_VALUE;
+#else
+    blocked = geteuid() != 0 && chmod(save, 0) == 0;   /* root reads anyway */
+#endif
+    if (blocked) {
+        rc = xbox_path_adopt_legacy_saves(legacy, root, 0x4d530065);
+        check(rc == -1, "an unreadable save fails the copy (returns -1)");
+        snprintf(p, sizeof p, "%s" SEP ".legacy-saves", root);
+        check(!exists(p), "no marker after a failed copy");
+        snprintf(p, sizeof p, "%s" SEP "UDATA", root);
+        check(!exists(p), "no empty UDATA left to hide the game folder's saves");
+        snprintf(p, sizeof p, "%s" SEP "TDATA" SEP "4d530065" SEP "t.bin", root);
+        check(same(read_text(p), "title data"), "the folder that could be read is copied");
+        snprintf(p, sizeof p, "%s" SEP "TDATA", root);
+        check(!copying_left(p, "4d530065"), "no partial copy left");
+    } else {
+        printf("  (skipped: the save cannot be made unreadable here)\n");
+    }
+#if defined(_WIN32)
+    if (blocked) CloseHandle(hold);
+#else
+    chmod(save, 0644);
+#endif
+
+    rc = xbox_path_adopt_legacy_saves(legacy, root, 0x4d530065);
+    check(rc == (blocked ? 1 : 2), "the next run copies the save");
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065" SEP "SAVE1" SEP "save.dat", root);
+    check(same(read_text(p), "blinx2 save"), "the save is in the new root");
+    check(mtime_of(p) == t_file, "the save file keeps its last-write time");
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065" SEP "SAVE1", root);
+    check(mtime_of(p) == t_dir,
+          "the save folder keeps its date (XFindFirstSaveGame reports it)");
+    snprintf(p, sizeof p, "%s" SEP ".legacy-saves", root);
+    check(exists(p), "the marker is written once the copy succeeds");
+    if (blocked)
+        check(strstr(read_text(p), "copied UDATA") && strstr(read_text(p), "already present TDATA"),
+              "the marker names the copied and the already present folders");
+}
+
+/* A file the copy cannot read, as one another program holds open. */
+typedef struct {
+    int on;
+#if defined(_WIN32)
+    HANDLE h;
+#endif
+} blocked_file;
+
+static blocked_file block_file(const char *p)
+{
+    blocked_file b;
+#if defined(_WIN32)
+    b.h = CreateFileA(p, GENERIC_READ, 0, NULL, OPEN_EXISTING, 0, NULL);
+    b.on = b.h != INVALID_HANDLE_VALUE;
+#else
+    b.on = geteuid() != 0 && chmod(p, 0) == 0;   /* root reads anyway */
+#endif
+    return b;
+}
+
+static void unblock_file(const char *p, blocked_file *b)
+{
+#if defined(_WIN32)
+    (void)p;
+    if (b->on) CloseHandle(b->h);
+#else
+    chmod(p, 0644);
+#endif
+    b->on = 0;
+}
+
+/* The game between two attempts: BLiNX 2 makes an empty TDATA/<tid> at boot
+ * (and UDATA/<tid> on its first save). An empty folder does not stop the
+ * retry; one the player saved into is never overwritten. */
+static void test_adopt_retry(void)
+{
+    char legacy[700], root[700], save[900], tbin[900], p[900];
+    blocked_file bs, bt;
+    int rc;
+
+    printf("the game between a failed copy and the retry\n");
+    snprintf(legacy, sizeof legacy, "%s" SEP "legacy", g_root);
+    make_legacy(legacy);
+    legacy_save(legacy, save, sizeof save);
+    snprintf(tbin, sizeof tbin, "%s" SEP "TDATA" SEP "4d530065" SEP "t.bin", legacy);
+
+    /* Both folders fail; the game then boots with empty ones. */
+    snprintf(root, sizeof root, "%s" SEP "new10", g_root);
+    make_dir(root);
+    bs = block_file(save);
+    bt = block_file(tbin);
+    if (bs.on && bt.on) {
+        rc = xbox_path_adopt_legacy_saves(legacy, root, 0x4d530065);
+        check(rc == -1, "both folders fail");
+        snprintf(p, sizeof p, "%s" SEP ".legacy-saves-failed-UDATA", root);
+        check(exists(p), "the failure is noted for UDATA");
+        snprintf(p, sizeof p, "%s" SEP ".legacy-saves-failed-TDATA", root);
+        check(exists(p), "and for TDATA");
+        unblock_file(save, &bs);
+        unblock_file(tbin, &bt);
+        snprintf(p, sizeof p, "%s" SEP "TDATA", root);                make_dir(p);
+        snprintf(p, sizeof p, "%s" SEP "TDATA" SEP "4d530065", root); make_dir(p);
+        snprintf(p, sizeof p, "%s" SEP "UDATA", root);                make_dir(p);
+        snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065", root); make_dir(p);
+
+        rc = xbox_path_adopt_legacy_saves(legacy, root, 0x4d530065);
+        check(rc == 2, "the empty folders the game made do not stop the retry");
+        snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065" SEP "SAVE1" SEP "save.dat", root);
+        check(same(read_text(p), "blinx2 save"), "the save is copied over the empty UDATA folder");
+        snprintf(p, sizeof p, "%s" SEP "TDATA" SEP "4d530065" SEP "t.bin", root);
+        check(same(read_text(p), "title data"), "the title data over the empty TDATA folder");
+        snprintf(p, sizeof p, "%s" SEP ".legacy-saves-failed-UDATA", root);
+        check(!exists(p), "the failure notes are removed");
+        snprintf(p, sizeof p, "%s" SEP ".legacy-saves", root);
+        check(strstr(read_text(p), "copied UDATA") && strstr(read_text(p), "TDATA"),
+              "the marker names both folders as copied");
+    } else {
+        printf("  (skipped: the files cannot be made unreadable here)\n");
+    }
+    unblock_file(save, &bs);
+    unblock_file(tbin, &bt);
+
+    /* UDATA fails; the player then saves into the new root. */
+    snprintf(root, sizeof root, "%s" SEP "new11", g_root);
+    make_dir(root);
+    bs = block_file(save);
+    if (bs.on) {
+        rc = xbox_path_adopt_legacy_saves(legacy, root, 0x4d530065);
+        check(rc == -1, "UDATA fails");
+        unblock_file(save, &bs);
+        snprintf(p, sizeof p, "%s" SEP "UDATA", root);                make_dir(p);
+        snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065", root); make_dir(p);
+        snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065" SEP "NEW", root); make_dir(p);
+        snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065" SEP "NEW" SEP "save.dat", root);
+        write_text(p, "made after the failure");
+
+        rc = xbox_path_adopt_legacy_saves(legacy, root, 0x4d530065);
+        check(rc == -1, "a folder saved into after a failed copy fails the retry");
+        check(same(read_text(p), "made after the failure"), "the new save is kept");
+        snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065" SEP "SAVE1", root);
+        check(!exists(p), "nothing is copied over it");
+        snprintf(p, sizeof p, "%s" SEP ".legacy-saves", root);
+        check(!exists(p), "and no marker is written");
+
+        /* After a copy by hand, deleting the note ends the check. */
+        snprintf(p, sizeof p, "%s" SEP ".legacy-saves-failed-UDATA", root);
+        remove(p);
+        rc = xbox_path_adopt_legacy_saves(legacy, root, 0x4d530065);
+        check(rc == 0, "without the note the folder counts as present");
+        snprintf(p, sizeof p, "%s" SEP ".legacy-saves", root);
+        check(strstr(read_text(p), "already present UDATA") != NULL, "the marker says so");
+    } else {
+        printf("  (skipped: the save cannot be made unreadable here)\n");
+    }
+    unblock_file(save, &bs);
+}
+
+#if defined(_WIN32)
+/* CopyFileW keeps the read-only attribute: the flush after the copy and the
+ * removal of a gone process's partial copy must both get past it. */
+static void test_adopt_readonly(void)
+{
+    char legacy[700], root[700], save[900], p[900];
+    DWORD a;
+    int rc;
+
+    printf("read-only save files\n");
+    snprintf(legacy, sizeof legacy, "%s" SEP "legacy", g_root);
+    make_legacy(legacy);
+    legacy_save(legacy, save, sizeof save);
+    SetFileAttributesA(save, FILE_ATTRIBUTE_READONLY);
+
+    snprintf(root, sizeof root, "%s" SEP "new12", g_root);
+    make_dir(root);
+    snprintf(p, sizeof p, "%s" SEP "TDATA", root); make_dir(p);
+    snprintf(p, sizeof p, "%s" SEP "TDATA" SEP "4d530065.copying.4294967292", root);
+    make_dir(p);
+    snprintf(p, sizeof p, "%s" SEP "TDATA" SEP "4d530065.copying.4294967292" SEP "ro.bin", root);
+    write_text(p, "partial");
+    SetFileAttributesA(p, FILE_ATTRIBUTE_READONLY);
+
+    rc = xbox_path_adopt_legacy_saves(legacy, root, 0x4d530065);
+    check(rc == 2, "a read-only save is copied");
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065" SEP "SAVE1" SEP "save.dat", root);
+    check(same(read_text(p), "blinx2 save"), "with its contents");
+    a = GetFileAttributesA(p);
+    check(a != INVALID_FILE_ATTRIBUTES && (a & FILE_ATTRIBUTE_READONLY),
+          "and still read-only");
+    snprintf(p, sizeof p, "%s" SEP "TDATA", root);
+    check(!copying_left(p, "4d530065"), "a partial copy with a read-only file is removed");
+
+    SetFileAttributesA(save, FILE_ATTRIBUTE_NORMAL);
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065" SEP "SAVE1" SEP "save.dat", root);
+    SetFileAttributesA(p, FILE_ATTRIBUTE_NORMAL);   /* for the cleanup */
+}
+#endif
+
+/* Partial copies: removed when their process is gone (or is this one) even
+ * when the folder itself is already in place; another live instance's is
+ * left alone. */
+static void test_adopt_stale(void)
+{
+    char legacy[700], root[700], p[900];
+    unsigned long dead;
+    int rc;
+
+    printf("partial copies of gone processes are removed\n");
+    snprintf(legacy, sizeof legacy, "%s" SEP "legacy", g_root);
+#if defined(_WIN32)
+    dead = 0xfffffffcUL;                  /* no such process */
+#else
+    {
+        pid_t c = fork();
+        if (c == 0) _exit(0);
+        waitpid(c, NULL, 0);
+        dead = (unsigned long)c;
+    }
+#endif
+    snprintf(root, sizeof root, "%s" SEP "new5", g_root);
+    make_dir(root);
+    snprintf(p, sizeof p, "%s" SEP "UDATA", root);                         make_dir(p);
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065", root);          make_dir(p);
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065" SEP "own.dat", root);
+    write_text(p, "the player's own");
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065.copying", root);  make_dir(p);
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065.copying.%lu", root, dead);
+    make_dir(p);
+    snprintf(p, sizeof p, "%s" SEP "TDATA", root);                         make_dir(p);
+    snprintf(p, sizeof p, "%s" SEP "TDATA" SEP "4d530065.copying.%lu", root,
+#if defined(_WIN32)
+             (unsigned long)GetCurrentProcessId());
+#else
+             (unsigned long)getpid());
+#endif
+    make_dir(p);
+    snprintf(p, sizeof p, "%s" SEP "TDATA" SEP "4d530065.copying.%lu" SEP "half", root,
+#if defined(_WIN32)
+             (unsigned long)GetCurrentProcessId());
+#else
+             (unsigned long)getpid());
+#endif
+    write_text(p, "partial");
+#if !defined(_WIN32)
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065.copying.%lu", root,
+             (unsigned long)getppid());
+    make_dir(p);
+#endif
+
+    rc = xbox_path_adopt_legacy_saves(legacy, root, 0x4d530065);
+    check(rc == 1, "only TDATA is copied");
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065.copying", root);
+    check(!exists(p), "a crash's .copying is removed although UDATA is in place");
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065.copying.%lu", root, dead);
+    check(!exists(p), "a gone process's copy is removed");
+    snprintf(p, sizeof p, "%s" SEP "TDATA" SEP "4d530065" SEP "t.bin", root);
+    check(same(read_text(p), "title data"), "a copy under this process's id is redone");
+    snprintf(p, sizeof p, "%s" SEP "TDATA" SEP "4d530065" SEP "half", root);
+    check(!exists(p), "and its partial file is not kept");
+#if !defined(_WIN32)
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065.copying.%lu", root,
+             (unsigned long)getppid());
+    check(exists(p), "a live process's copy is left alone");
+#endif
+    snprintf(p, sizeof p, "%s" SEP ".legacy-saves", root);
+    check(strstr(read_text(p), "copied TDATA") && strstr(read_text(p), "already present UDATA"),
+          "the marker says UDATA was already present");
+}
+
+#if !defined(_WIN32)
+/* A link to a file is copied as the file; a link to a folder, or one to
+ * nothing, fails the copy rather than leave a save with a part missing. */
+static void test_adopt_links(void)
+{
+    char legacy[700], root[700], p[900], q[900];
+    struct stat st;
+    int rc;
+
+    printf("links in the shared root\n");
+    snprintf(legacy, sizeof legacy, "%s/legacy-links", g_root);
+    make_dir(legacy);
+    snprintf(p, sizeof p, "%s/UDATA", legacy);                 make_dir(p);
+    snprintf(p, sizeof p, "%s/UDATA/4d530065", legacy);        make_dir(p);
+    snprintf(q, sizeof q, "%s/outside.dat", g_root);
+    write_text(q, "linked save");
+    snprintf(p, sizeof p, "%s/UDATA/4d530065/link.dat", legacy);
+    symlink(q, p);
+
+    snprintf(root, sizeof root, "%s/new6", g_root);
+    make_dir(root);
+    rc = xbox_path_adopt_legacy_saves(legacy, root, 0x4d530065);
+    snprintf(p, sizeof p, "%s/UDATA/4d530065/link.dat", root);
+    check(rc == 1 && lstat(p, &st) == 0 && S_ISREG(st.st_mode)
+          && same(read_text(p), "linked save"),
+          "a link to a file is copied as the file");
+
+    snprintf(p, sizeof p, "%s/UDATA/4d530065/dirlink", legacy);
+    symlink(g_game, p);
+    snprintf(root, sizeof root, "%s/new7", g_root);
+    make_dir(root);
+    rc = xbox_path_adopt_legacy_saves(legacy, root, 0x4d530065);
+    snprintf(p, sizeof p, "%s/.legacy-saves", root);
+    snprintf(q, sizeof q, "%s/UDATA", root);
+    check(rc == -1 && !exists(p) && !exists(q),
+          "a link to a folder fails the copy: no marker, no UDATA");
+    snprintf(p, sizeof p, "%s/UDATA/4d530065/dirlink", legacy);
+    remove(p);
+
+    snprintf(p, sizeof p, "%s/UDATA/4d530065/gone", legacy);
+    snprintf(q, sizeof q, "%s/nothing-here", g_root);
+    symlink(q, p);
+    snprintf(root, sizeof root, "%s/new8", g_root);
+    make_dir(root);
+    rc = xbox_path_adopt_legacy_saves(legacy, root, 0x4d530065);
+    snprintf(p, sizeof p, "%s/.legacy-saves", root);
+    check(rc == -1 && !exists(p), "a dangling link fails the copy");
+}
+
+/* Two or more instances started together on a new root: each folder is
+ * copied once, and none sees a half copy. */
+static void test_adopt_race(void)
+{
+    enum { KIDS = 4 };
+    char legacy[700], root[700], p[900];
+    pid_t kid[KIDS];
+    int go[2], total = 0, bad = 0;
+
+    printf("instances started together\n");
+    snprintf(legacy, sizeof legacy, "%s/legacy", g_root);
+    snprintf(root, sizeof root, "%s/new9", g_root);
+    make_dir(root);
+    if (pipe(go) != 0) { check(0, "pipe"); return; }
+    for (int i = 0; i < KIDS; i++) {
+        kid[i] = fork();
+        if (kid[i] == 0) {
+            char c;
+            close(go[1]);
+            (void)!read(go[0], &c, 1);    /* all start when the pipe closes */
+            _exit(xbox_path_adopt_legacy_saves(legacy, root, 0x4d530065) + 1);
+        }
+    }
+    close(go[0]);
+    close(go[1]);
+    for (int i = 0; i < KIDS; i++) {
+        int status = 0;
+        waitpid(kid[i], &status, 0);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) == 0) bad++;
+        else total += WEXITSTATUS(status) - 1;
+    }
+    check(!bad, "no instance fails");
+    check(total == 2, "UDATA and TDATA are each copied by one instance");
+    snprintf(p, sizeof p, "%s/UDATA/4d530065/SAVE1/save.dat", root);
+    check(same(read_text(p), "blinx2 save"), "the save is whole");
+    snprintf(p, sizeof p, "%s/UDATA", root);
+    check(!copying_left(p, "4d530065"), "no partial copy left in UDATA");
+    snprintf(p, sizeof p, "%s/TDATA", root);
+    check(!copying_left(p, "4d530065"), "nor in TDATA");
+    snprintf(p, sizeof p, "%s/.legacy-saves", root);
+    check(exists(p), "the marker is written");
+}
+#endif
+
+/* Point the per-user data folder ($XDG_DATA_HOME, %LOCALAPPDATA%) at v, or
+ * restore it (NULL). */
+static void set_data_home(const char *v)
+{
+#if defined(_WIN32)
+    static char saved[MAX_PATH];
+    static int have_saved = -1;
+    if (have_saved < 0) {
+        const char *o = getenv("LOCALAPPDATA");
+        have_saved = o != NULL;
+        snprintf(saved, sizeof saved, "%s", o ? o : "");
+    }
+    _putenv_s("LOCALAPPDATA", v ? v : (have_saved ? saved : ""));
+#else
+    if (v) setenv("XDG_DATA_HOME", v, 1);
+    else unsetenv("XDG_DATA_HOME");
+#endif
+}
+
+/* The default root with no save dir from the game: one per title id, under
+ * $XDG_DATA_HOME or %LOCALAPPDATA%. */
+static void test_title_default(void)
+{
+    char xdg[700], legacy[800], a[900], b[900], root[900], p[1200];
+
+    printf("default root per title\n");
+    recomp_env_set(RENV_SAVE_DIR, NULL);
+    snprintf(xdg, sizeof xdg, "%s" SEP "xdg", g_root);
+    make_dir(xdg);
+    set_data_home(xdg);
+    snprintf(legacy, sizeof legacy, "%s" SEP "xboxrecomp", xdg);
+    make_legacy(legacy);
+
+    xbox_path_set_title_id(0x4d530065);
+    xbox_path_init(g_game, NULL);
+    snprintf(a, sizeof a, "%s" SEP "4d530065", legacy);
+    check(xbox_path_hdd_root(root, sizeof root) && same(root, a),
+          "title 4d530065: root <data>/xboxrecomp/4d530065");
+    snprintf(p, sizeof p, "%s" SEP "Cache" SEP "blinx2_000.rec", a);
+    expect("Z:\\blinx2_000.rec", p, "Z: goes to the title's own Cache");
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065" SEP "SAVE1" SEP "save.dat", a);
+    check(same(host("\\Device\\Harddisk0\\Partition1\\UDATA\\4d530065\\SAVE1\\save.dat"), p)
+          && same(read_text(p), "blinx2 save"),
+          "the shared root's save is found through the title's UDATA");
+
+    xbox_path_set_title_id(0x4d530013);
+    xbox_path_init(g_game, NULL);
+    snprintf(b, sizeof b, "%s" SEP "4d530013", legacy);
+    check(xbox_path_hdd_root(root, sizeof root) && same(root, b),
+          "title 4d530013: root <data>/xboxrecomp/4d530013");
+    snprintf(p, sizeof p, "%s" SEP "Cache" SEP "pelon000.rec", b);
+    expect("Z:\\pelon000.rec", p, "Z: goes to that title's Cache");
+    check(!exists(p), "its Cache starts empty (no shared pages)");
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530013" SEP "other.dat", b);
+    check(same(read_text(p), "blinx1 save"), "that title's save is found too");
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065", b);
+    check(!exists(p), "neither title gets the other's saves");
+
+    /* The second init of a root copies nothing (the marker). */
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d530065" SEP "SAVE1" SEP "save.dat", a);
+    remove(p);
+    xbox_path_set_title_id(0x4d530065);
+    xbox_path_init(g_game, NULL);
+    check(!exists(p), "a later run does not copy again");
+
+    /* RECOMP_SAVE_DIR names the saves: nothing is copied. */
+    snprintf(p, sizeof p, "%s" SEP "UDATA" SEP "4d5300ff", legacy);
+    make_dir(p);
+    recomp_env_set(RENV_SAVE_DIR, g_user);
+    xbox_path_set_title_id(0x4d5300ff);
+    xbox_path_init(g_game, NULL);
+    snprintf(p, sizeof p, "%s" SEP "4d5300ff" SEP ".legacy-saves", legacy);
+    check(!exists(p), "with RECOMP_SAVE_DIR, no copy and no marker");
+    recomp_env_set(RENV_SAVE_DIR, NULL);
+
+    /* Before the title id is known: the shared root, as before. */
+    xbox_path_set_title_id(0);
+    xbox_path_init(g_game, NULL);
+    check(xbox_path_hdd_root(root, sizeof root) && same(root, legacy),
+          "no title id: the shared root");
+
+    /* A save dir from the game wins over the per-title default. */
+    xbox_path_set_title_id(0x4d530065);
+    xbox_path_init(g_game, g_save);
+    check(xbox_path_hdd_root(root, sizeof root) && same(root, g_save),
+          "a save dir from the game is used as is");
+    xbox_path_set_title_id(0);
+    set_data_home(NULL);
+}
+
 int main(int argc, char **argv)
 {
     /* argv[1]: write the report there (Proton drops a console exe's stdout) */
@@ -407,6 +1080,18 @@ int main(int argc, char **argv)
     test_save_dir_root();
     test_case_fallback();
     test_legacy_saves();
+    test_adopt_legacy();
+    test_adopt_failure();
+    test_adopt_retry();
+    test_adopt_stale();
+#if defined(_WIN32)
+    test_adopt_readonly();
+#endif
+#if !defined(_WIN32)
+    test_adopt_links();
+    test_adopt_race();
+#endif
+    test_title_default();
     remove_root();
 
     printf("%s (%d failure%s)\n", failures ? "FAILED" : "OK", failures, failures == 1 ? "" : "s");

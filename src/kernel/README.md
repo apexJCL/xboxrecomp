@@ -168,8 +168,32 @@ Z:\cache.dat                 → <save_dir>\cache\cache.dat
 xbox_path_init("Burnout 3 Takedown", "saves");
 ```
 
-`save_dir` defaults to `$XDG_DATA_HOME/xboxrecomp` (POSIX) or
-`%LOCALAPPDATA%\xboxrecomp` (Windows). The title's own saves,
+`save_dir` defaults to `$XDG_DATA_HOME/xboxrecomp/<title id>` (POSIX; `~/.local/share`
+without `XDG_DATA_HOME`) or `%LOCALAPPDATA%\xboxrecomp\<title id>` (Windows), so
+two games never share a `Cache`. The id is the XBE certificate's, as 8
+lower-case hex digits, which `xbox_MemoryLayoutInit` passes to
+`xbox_path_set_title_id`; before that the root is the shared
+`<base>/xboxrecomp`. Builds before the per-title root kept every game there.
+The first run with a per-title root copies the title's `UDATA/<title id>` and
+`TDATA/<title id>` from the shared root (`xbox_path_adopt_legacy_saves`). It
+copies each one only when the new root has none or an empty one (the game
+makes an empty `TDATA/<title id>` at boot), and only once: a
+`.legacy-saves` marker records it once both are in place. Each copy goes to
+`<title id>.copying.<pid>`, is flushed, then renamed, so a crash leaves no
+half save and two instances started together copy each folder once. Files
+and folders keep their times (a save's date is its folder's last write). A
+link to a file is copied as the file; a link to a folder, a junction or an
+unreadable file fails the copy, which then leaves no marker, no empty
+`UDATA` and a `.legacy-saves-failed-<UDATA|TDATA>` note. The next run tries
+again while that folder in the new root is missing or empty. Once the player
+has saved into it, it is never overwritten: each run logs that the old saves
+wait in the shared root to be copied by hand, which ends by deleting the
+note. Read-only files are copied and stay read-only. On macOS the flushes
+use `F_FULLFSYNC`, and the root is flushed before the marker. The shared
+root is never written.
+Caches and partition images start empty. A title sees only its own root, so
+another title's `UDATA` (a prequel's save that a game looks for to unlock a
+bonus) is not visible unless `RECOMP_HDD_DIR` points both at one folder. The title's own saves,
 `\Device\Harddisk0\Partition1\UDATA` and `...\TDATA` (where XAPI maps U: and T:),
 go to `<save_dir>/UDATA` and `<save_dir>/TDATA`, and its scratch, `...\CACHE`,
 to `<save_dir>/TitleCache`, which keeps the cache a title writes out of the

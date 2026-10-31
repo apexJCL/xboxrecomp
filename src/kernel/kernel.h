@@ -565,8 +565,26 @@ void xbox_kernel_set_ordinal_remap(const unsigned short *map, int count);
  * Path Translation (kernel_path.c)
  * ============================================================================ */
 
-/* Initialize path translation with base directories */
+/* Initialize path translation with base directories. With save_dir NULL the
+ * root is the toolkit default: <base>/xboxrecomp/<title id> once the title id
+ * is known (xbox_path_set_title_id), where <base> is $XDG_DATA_HOME or
+ * ~/.local/share (POSIX) and %LOCALAPPDATA% (Windows); <base>/xboxrecomp
+ * before that. A per-title root copies the title's saves from
+ * <base>/xboxrecomp once (xbox_path_adopt_legacy_saves). */
 void xbox_path_init(const char* game_dir, const char* save_dir);
+
+/* The running title's id, which names the default root above.
+ * xbox_MemoryLayoutInit sets it from the XBE certificate; 0 clears it. */
+void xbox_path_set_title_id(uint32_t title_id);
+
+/* Copy UDATA/<tid> and TDATA/<tid> (tid as 8 lower-case hex digits) from
+ * legacy_root to root, each only when root has no copy yet, and only once:
+ * a marker file in root (.legacy-saves) stops later calls. legacy_root is
+ * only read. UTF-8 paths. Returns the number of folders copied, 0 when there
+ * was nothing to do, -1 when a copy failed (logged; the marker is not
+ * written, so the next call tries again). */
+int xbox_path_adopt_legacy_saves(const char *legacy_root, const char *root,
+                                 uint32_t title_id);
 
 /* The HDD root xbox_path_init settled on (its save_dir, or the toolkit
  * default), in UTF-8: where host-side files that belong with the title's

@@ -833,8 +833,8 @@ static int host_main(void)
 
     /* Step 5: Set game directory for file I/O path translation. A NULL save
      * dir (RECOMP_HDD_DIR unset) puts saves and partition images in the
-     * toolkit's default place (beside the game on Windows, $XDG_DATA_HOME or
-     * ~/.local/share elsewhere). */
+     * toolkit's default place: xboxrecomp/<title id> under %LOCALAPPDATA% on
+     * Windows, $XDG_DATA_HOME or ~/.local/share elsewhere. */
     {
         extern void xbox_path_init(const char *game_dir, const char *save_dir);
         xbox_path_init(game_dir, hdd_dir);

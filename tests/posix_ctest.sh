@@ -38,6 +38,13 @@ export SDL_AUDIODRIVER=${SDL_AUDIODRIVER:-$SDL_AUDIO_DRIVER}
 while IFS= read -r v; do
     unset "$v"
 done < <(compgen -e | grep '^RECOMP_' || true)
+# A test that maps an XBE and then uses the path layer without a save dir
+# gets the default hard disk, which is under the developer's own data dir
+# (<XDG>/xboxrecomp/<title id>; the shared root's saves are copied into it on
+# first use). Keep that in the build dir; tests that need their own still set
+# XDG_DATA_HOME themselves.
+export XDG_DATA_HOME=$B/xdg-data
+mkdir -p "$XDG_DATA_HOME"
 
 is_project() {
     grep -qiE '^[[:space:]]*project[[:space:]]*\(' "$1/CMakeLists.txt"
