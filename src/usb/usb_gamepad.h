@@ -96,4 +96,28 @@ void usb_gamepad_rumble(int pad, uint16_t left, uint16_t right);
  * whose present path does not count flips). */
 uint32_t usb_gamepad_flips(void);
 
+/* A game that answers the title's XInputGetState itself (BLiNX 2's
+ * recomp_manual.c) never asks this model for a report, so the toolkit's
+ * RECOMP_PAD_SCRIPT, RECOMP_PAD_LIVE, RECOMP_PAD_PRESS and
+ * RECOMP_DEBUG=pad_record would never run for it. These give it the same
+ * ones, on the same flip count and in the same step format, so a record
+ * made through either path replays through either.
+ *
+ *   game_press   the script's, the live file's and the synthetic press's
+ *                buttons for pad `pad`, pressed on top of *g, as
+ *                usb_gamepad_report presses them on a source's state.
+ *   game_record  *g, the state the title gets, to the pad record, under
+ *                the flip the same poll's game_press used. Call it on
+ *                every poll, a disconnected port's zeros too, so a pad
+ *                that drops mid-hold is seen released.
+ *   game_pads    the pads those inputs name (bit n for pad n), which the
+ *                game should report connected.
+ *
+ * Call them on the thread that polls, one poll at a time; the toolkit
+ * keeps their state unlocked, as it does for the report. */
+#define USB_GAMEPAD_HAVE_GAME_TAP 1
+void usb_gamepad_game_press(int pad, struct XBOX_GAMEPAD *g);
+void usb_gamepad_game_record(int pad, const struct XBOX_GAMEPAD *g);
+uint32_t usb_gamepad_game_pads(void);
+
 #endif /* XBOX_USB_GAMEPAD_H */

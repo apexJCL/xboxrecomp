@@ -418,6 +418,17 @@ typedef struct {
 timing, the port's change bits and the no-device answer, all without a title.
 BLiNX 1's `src/pad_input.c` is a source.
 
+A game that answers the title's `XInputGetState` itself never reaches the
+report, so `usb_gamepad.h` also has a tap for it:
+`usb_gamepad_game_press(pad, &g)` presses the script's, the live file's and
+the synthetic press's buttons on top of the game's state,
+`usb_gamepad_game_record(pad, &g)` writes the state the title gets to
+`RECOMP_DEBUG=pad_record` (on every poll, a disconnected port's zeros too,
+under the flip that poll's press used), and `usb_gamepad_game_pads()` names the pads
+those inputs drive. They use the walker's flip count and the same step
+format, so a record replays with `RECOMP_PAD_SCRIPT=@file` through either
+path. BLiNX 2's `src/pad_input.c` uses it; `tests/usb_pad_game` covers it.
+
 ## Ports
 
 ```c

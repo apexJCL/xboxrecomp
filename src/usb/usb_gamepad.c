@@ -349,6 +349,10 @@ static uint8_t synthetic_buttons(void)
  * Like RECOMP_PAD_PRESS these are bring-up tools, off unless set. */
 static PadStep s_script[PAD_SCRIPT_MAX];
 static int     s_script_len = -1;
+/* Bumped by every compaction: the steps below s_script_len have moved, so
+ * script_pads must look at all of them again (a live poll may compact and
+ * append in one go, leaving the length past where it last looked). */
+static unsigned s_script_gen;
 
 /* The executor's flip count, for flip-timed steps and the recorder. Written
  * by the walker's thread, read on the pad's: a stale read is a flip late. */
@@ -406,6 +410,7 @@ static void pad_script_compact(unsigned long t)
         if (!pad_step_done(&s_script[i], t, s_flip))
             s_script[n++] = s_script[i];
     s_script_len = n;
+    s_script_gen++;
 }
 
 /* Read whatever has been appended to RECOMP_PAD_LIVE since last time, and
@@ -535,16 +540,34 @@ static void pad_script_apply(int pad, uint8_t *out, uint32_t flip)
  * has named, kept after the step ends, so a pad does not leave the bus
  * between two presses), the live file's pad 1, the synthetic press's pad 1.
  * With a source installed these stay plugged in whatever the source says,
- * so a run driven by RECOMP_PAD_SCRIPT alone gets the pad it gets today. */
+ * so a run driven by RECOMP_PAD_SCRIPT alone gets the pad it gets today.
+ *
+ * Unlocked, like s_script itself. The USB model's calls come from the OHCI
+ * model's thread; a game's own XInputGetState (usb_gamepad_game_*) calls it
+ * under that game's pad lock (BLiNX 2: pad_input.c's g_lock). The two never
+ * meet in BLiNX 2 because its XAPI never starts the OHCI (its logs have no
+ * "[OHCI0] operational"). A title that answers XInputGetState itself and
+ * also starts the OHCI would need a lock here. `named` only gains bits, so
+ * a torn read costs a rescan at most. */
 static uint32_t script_pads(void)
 {
     static uint32_t named;
+    static int scanned;
+    static unsigned gen;
     int i;
 
     if (s_script_len < 0)
         pad_script_load();
-    for (i = 0; i < s_script_len; i++)
+    /* A game's own poll asks once per port per frame, and a recorded route
+     * holds thousands of steps: look only at the ones added since (from the
+     * start again after a live session's compaction). */
+    if (gen != s_script_gen || s_script_len < scanned) {
+        gen = s_script_gen;
+        scanned = 0;
+    }
+    for (i = scanned; i < s_script_len; i++)
         named |= 1u << (s_script[i].pad & 3);
+    scanned = s_script_len;
     {
         const char *live = recomp_env(RENV_PAD_LIVE);
         if (live && *live)
@@ -576,6 +599,42 @@ void usb_gamepad_rumble(int pad, uint16_t left, uint16_t right)
         v.wRightMotorSpeed = (WORD)right;
         xbox_InputSetState((DWORD)pad, &v);
     }
+}
+
+/* The 20-byte report's bytes 2..19 from a pad state, and back: the script
+ * and the recorder work on reports, a game that answers XInputGetState
+ * itself has states. */
+static void report_from_gamepad(const XBOX_GAMEPAD *g, uint8_t *out)
+{
+    int i;
+
+    memset(out, 0, 20);
+    out[1] = 20;
+    out[2] = (uint8_t)(g->wButtons & 0xFF);
+    out[3] = (uint8_t)((g->wButtons >> 8) & 0xFF);
+    for (i = 0; i < 8; i++)
+        out[4 + i] = g->bAnalogButtons[i];
+    out[12] = (uint8_t)(g->sThumbLX & 0xFF);
+    out[13] = (uint8_t)((g->sThumbLX >> 8) & 0xFF);
+    out[14] = (uint8_t)(g->sThumbLY & 0xFF);
+    out[15] = (uint8_t)((g->sThumbLY >> 8) & 0xFF);
+    out[16] = (uint8_t)(g->sThumbRX & 0xFF);
+    out[17] = (uint8_t)((g->sThumbRX >> 8) & 0xFF);
+    out[18] = (uint8_t)(g->sThumbRY & 0xFF);
+    out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
+}
+
+static void gamepad_from_report(const uint8_t *r, XBOX_GAMEPAD *g)
+{
+    int i;
+
+    g->wButtons = (WORD)(r[2] | (r[3] << 8));
+    for (i = 0; i < 8; i++)
+        g->bAnalogButtons[i] = r[4 + i];
+    g->sThumbLX = (SHORT)(uint16_t)(r[12] | (r[13] << 8));
+    g->sThumbLY = (SHORT)(uint16_t)(r[14] | (r[15] << 8));
+    g->sThumbRX = (SHORT)(uint16_t)(r[16] | (r[17] << 8));
+    g->sThumbRY = (SHORT)(uint16_t)(r[18] | (r[19] << 8));
 }
 
 /* RECOMP_DEBUG=pad_record=<file>: the report as the title gets it, after the
@@ -684,7 +743,6 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     /* One flip for the script and the recorder: the walker may count one
      * between two reads, and the record would then lag the press by a flip. */
     uint32_t flip = s_flip;
-    int i;
 
     if (max < 20)
         return 0;
@@ -743,19 +801,53 @@ int usb_gamepad_report(int pad, uint8_t *out, int max)
     }
 
     g = &state.Gamepad;
-    out[2] = (uint8_t)((g->wButtons & 0xFF) | synth);
-    out[3] = (uint8_t)((g->wButtons >> 8) & 0xFF);
-    for (i = 0; i < 8; i++)
-        out[4 + i] = g->bAnalogButtons[i];
-    out[12] = (uint8_t)(g->sThumbLX & 0xFF);
-    out[13] = (uint8_t)((g->sThumbLX >> 8) & 0xFF);
-    out[14] = (uint8_t)(g->sThumbLY & 0xFF);
-    out[15] = (uint8_t)((g->sThumbLY >> 8) & 0xFF);
-    out[16] = (uint8_t)(g->sThumbRX & 0xFF);
-    out[17] = (uint8_t)((g->sThumbRX >> 8) & 0xFF);
-    out[18] = (uint8_t)(g->sThumbRY & 0xFF);
-    out[19] = (uint8_t)((g->sThumbRY >> 8) & 0xFF);
+    report_from_gamepad(g, out);
+    out[2] |= synth;
     pad_script_apply(pad, out, flip);
     pad_record(pad, out, flip);
     return 20;
+}
+
+/* ---- a game's own XInputGetState --------------------------------------- */
+
+/* The flip each pad's press was applied under, for the record that follows
+ * it on the same poll: the walker may count a flip between the two calls,
+ * and a release recorded a flip late lengthens the hold (f10:a:5 would
+ * read back f10:a:6). */
+static uint32_t s_game_flip[USB_GAMEPAD_MAX];
+static uint8_t  s_game_pressed[USB_GAMEPAD_MAX];
+
+void usb_gamepad_game_press(int pad, struct XBOX_GAMEPAD *g)
+{
+    uint8_t r[20];
+    uint32_t flip = s_flip;
+
+    if (pad < 0 || pad >= USB_GAMEPAD_MAX)
+        return;
+    s_game_flip[pad] = flip;
+    s_game_pressed[pad] = 1;
+    report_from_gamepad(g, r);
+    if (pad == 0)
+        r[2] |= synthetic_buttons();
+    pad_script_apply(pad, r, flip);
+    gamepad_from_report(r, g);
+}
+
+void usb_gamepad_game_record(int pad, const struct XBOX_GAMEPAD *g)
+{
+    uint8_t r[20];
+    uint32_t flip;
+
+    if (pad < 0 || pad >= USB_GAMEPAD_MAX)
+        return;
+    /* The press's flip when this poll had one, else this one's own. */
+    flip = s_game_pressed[pad] ? s_game_flip[pad] : s_flip;
+    s_game_pressed[pad] = 0;
+    report_from_gamepad(g, r);
+    pad_record(pad, r, flip);
+}
+
+uint32_t usb_gamepad_game_pads(void)
+{
+    return script_pads() & ((1u << USB_GAMEPAD_MAX) - 1u);
 }
