@@ -42,7 +42,14 @@ double apu_hook_fault_bench(unsigned n)
      * `add r32, [mem]`, a form the decoder does not handle. */
     for (unsigned i = 0; i < n; i++) {
         uint32_t v;
+#if defined(_MSC_VER) && !defined(__clang__)
+        /* No inline assembly on x64 MSVC: the volatile-load intrinsic is a
+         * MOV of its own. */
+        v = (uint32_t)__iso_volatile_load32((const volatile __int32 *)p);
+        _ReadWriteBarrier();
+#else
         __asm__ volatile("movl (%1), %0" : "=r"(v) : "r"(p) : "memory");
+#endif
         sink += v;
     }
     QueryPerformanceCounter(&b);

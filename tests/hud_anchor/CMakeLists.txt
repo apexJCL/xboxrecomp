@@ -11,6 +11,7 @@
 #   cmake --build build/hud_anchor && ctest --test-dir build/hud_anchor
 cmake_minimum_required(VERSION 3.20)
 project(hud_anchor_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 

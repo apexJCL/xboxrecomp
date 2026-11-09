@@ -5,6 +5,7 @@
 #   cmake --build build/tex_pack && ctest --test-dir build/tex_pack
 cmake_minimum_required(VERSION 3.20)
 project(tex_pack_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 

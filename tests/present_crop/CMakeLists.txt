@@ -5,6 +5,7 @@
 #   cmake --build build/present_crop && ctest --test-dir build/present_crop
 cmake_minimum_required(VERSION 3.20)
 project(present_crop_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 set(CMAKE_C_STANDARD 11)
 add_executable(present_crop_test test_main.c
     ../../src/kernel/nv2a_backend_common.c

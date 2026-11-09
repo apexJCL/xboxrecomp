@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(kernel_path_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 # Cross-platform: the path layer called directly, so it covers the Win32
 # backend on Windows/Proton and the POSIX one elsewhere.
 set(CMAKE_C_STANDARD 11)

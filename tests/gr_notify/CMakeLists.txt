@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(gr_notify_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 # The PGRAPH notify and the run-ahead's ack rule (nv2a_gr_notify.h) are
 # pure functions over a register block, so the test builds them alone, on
 # every host.

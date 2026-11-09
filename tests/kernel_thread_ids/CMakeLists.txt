@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(kernel_thread_ids_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 # Cross-platform, like tests/memory_regressions: the bridge's thread creation
 # and the TIB are the same code on both hosts.
 set(CMAKE_C_STANDARD 11)

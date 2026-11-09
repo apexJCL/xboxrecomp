@@ -7,6 +7,7 @@
 #   cmake --build build/enhance_text && ctest --test-dir build/enhance_text
 cmake_minimum_required(VERSION 3.20)
 project(enhance_text_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 find_package(Threads REQUIRED)

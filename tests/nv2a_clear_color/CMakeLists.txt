@@ -5,6 +5,7 @@
 #   cmake --build build/nv2a_clear_color && ctest --test-dir build/nv2a_clear_color
 cmake_minimum_required(VERSION 3.20)
 project(nv2a_clear_color_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 set(CMAKE_C_STANDARD 11)
 add_executable(nv2a_clear_color_test test_main.c
     ../../src/kernel/nv2a_backend_common.c

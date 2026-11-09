@@ -10,6 +10,7 @@
 #   cmake --build build/mod_demo && ctest --test-dir build/mod_demo
 cmake_minimum_required(VERSION 3.20)
 project(mod_demo_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 

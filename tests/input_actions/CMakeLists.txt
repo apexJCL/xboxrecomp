@@ -10,6 +10,7 @@
 # rebuild case (a polling thread and a flip thread against rebuilds).
 cmake_minimum_required(VERSION 3.20)
 project(input_actions_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 option(INPUT_ACTIONS_TSAN "Build with ThreadSanitizer" OFF)

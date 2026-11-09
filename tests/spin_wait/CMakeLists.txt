@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(spin_wait_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 # Cross-platform: the same kernel_pacing.c runs on both hosts, under each
 # host's own clock and wait primitives.
 set(CMAKE_C_STANDARD 11)

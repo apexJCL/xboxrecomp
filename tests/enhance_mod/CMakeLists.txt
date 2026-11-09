@@ -8,6 +8,7 @@
 #   cmake --build build/enhance_mod && ctest --test-dir build/enhance_mod
 cmake_minimum_required(VERSION 3.20)
 project(enhance_mod_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
