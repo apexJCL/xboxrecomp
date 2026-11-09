@@ -6,6 +6,7 @@
 #   cmake --build build/render_scale && ctest --test-dir build/render_scale
 cmake_minimum_required(VERSION 3.20)
 project(render_scale_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 set(CMAKE_C_STANDARD 11)
 add_executable(render_scale_test test_main.c
     ../../src/kernel/nv2a_backend_common.c

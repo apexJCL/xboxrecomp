@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(mem_stats_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 # The [MEM] line (src/platform/mem_stats.c): its formatter and parser, a live
 # reading of this process, and the SIGINT path a bench's stop takes. Builds
 # the platform files it uses, on every host.

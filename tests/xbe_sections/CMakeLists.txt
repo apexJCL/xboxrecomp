@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(xbe_sections_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 # XBE section paging (src/kernel/xbe_sections.c): refcounts, the fresh copy on
 # 0 -> 1, shared-page counts and the resident tally. The module touches guest
 # memory only through the pointer it is given, so this links it alone and

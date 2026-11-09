@@ -5,6 +5,7 @@
 #   cmake --build build/host_opts_live && ctest --test-dir build/host_opts_live
 cmake_minimum_required(VERSION 3.20)
 project(host_opts_live_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 find_package(Threads REQUIRED)

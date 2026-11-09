@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(nv2a_tex_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 set(CMAKE_C_STANDARD 11)
 # The shared texture helpers (nv2a_backend_common), with the format tables
 # they read. Standalone: cmake -S tests/nv2a_tex -B build && ctest.

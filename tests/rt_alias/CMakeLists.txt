@@ -6,6 +6,7 @@
 #   cmake --build build/rt_alias && ctest --test-dir build/rt_alias
 cmake_minimum_required(VERSION 3.20)
 project(rt_alias_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 set(CMAKE_C_STANDARD 11)
 add_executable(rt_alias_test test_main.c
     ../../src/kernel/nv2a_backend_common.c

@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(kernel_directory_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 if(NOT WIN32)
     message(FATAL_ERROR "This harness uses Win32 directory handles (FILE_FLAG_BACKUP_SEMANTICS); run it on Windows or under Proton.")
 endif()

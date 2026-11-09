@@ -10,6 +10,7 @@
 #   cmake --build build/mod_hook && ctest --test-dir build/mod_hook
 cmake_minimum_required(VERSION 3.20)
 project(mod_hook_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 

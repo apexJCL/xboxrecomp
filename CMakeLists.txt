@@ -16,6 +16,9 @@ project(xboxrecomp VERSION 0.14.0 LANGUAGES C)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
+# MSVC: the __atomic/__sync builtins and C11 atomics (cmake/msvc_atomic.cmake).
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/msvc_atomic.cmake)
+
 # macOS: the Metal render backend (src/d3d/nv2a_pb_metal.m) is Objective-C.
 if(APPLE)
     enable_language(OBJC)

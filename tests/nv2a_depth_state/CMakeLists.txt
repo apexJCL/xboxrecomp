@@ -6,6 +6,7 @@
 #   cmake --build build/nv2a_depth_state && ctest --test-dir build/nv2a_depth_state
 cmake_minimum_required(VERSION 3.20)
 project(nv2a_depth_state_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 set(CMAKE_C_STANDARD 11)
 add_executable(nv2a_depth_state_test test_main.c
     ../../src/kernel/nv2a_backend_common.c

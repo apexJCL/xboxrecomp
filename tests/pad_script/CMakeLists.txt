@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(pad_script_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 # The pad script's grammar and the recorder (pad_script.c) know a 20-byte
 # report and text, nothing of USB, so the test builds them alone.
 set(CMAKE_C_STANDARD 11)

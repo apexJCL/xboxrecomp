@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(guest_cpu_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 # Cross-platform: the guest CPU is the same code on both hosts, over each
 # host's critical sections and condition variables.
 set(CMAKE_C_STANDARD 11)

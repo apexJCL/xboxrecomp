@@ -11,6 +11,7 @@
 #   cmake --build build/shader_param_kinds && ctest --test-dir build/shader_param_kinds
 cmake_minimum_required(VERSION 3.20)
 project(shader_param_kinds_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 

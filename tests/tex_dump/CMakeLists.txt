@@ -7,6 +7,7 @@
 #   cmake --build build/tex_dump && ctest --test-dir build/tex_dump
 cmake_minimum_required(VERSION 3.20)
 project(tex_dump_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 

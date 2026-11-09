@@ -1,5 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 project(host_prof_test C)
+include(${CMAKE_CURRENT_LIST_DIR}/../../cmake/msvc_atomic.cmake)
 # The in-process sampler (src/platform/host_prof.c) needs only the host's
 # thread calls, so the test builds the platform files it uses, on the hosts
 # that have a sampler: Windows (and Wine) and macOS.
