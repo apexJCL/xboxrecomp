@@ -46,8 +46,9 @@
 #define EP_CAP          (2u * 8u * GP_FRAME_CYCLES)
 
 /* The GP's stereo output: its mixbuf bins 0 and 1 (xemu's monitor point
- * GP). The EP's AC-3 and surround output is not used yet: 6-channel output
- * waits for the SDL3 move (apu-dsp-emulation task 3.3). */
+ * GP). Only the front pair: DirectSound's GP image hands all six speaker
+ * channels to the EP, and the EP makes the stereo mix. The speakers hear
+ * the GP only until the EP delivers (see ep_out_period below). */
 #define GP_OUT_LEFT  APU_DSP_MIXBUF_BASE
 #define GP_OUT_RIGHT (APU_DSP_MIXBUF_BASE + NUM_SAMPLES_PER_FRAME)
 
@@ -103,7 +104,41 @@ static struct {
     uint64_t next_cap_log;
     Worker wk[2];
     ApuDspEmuStats st[2];           /* each core's, as of its last idle frame */
-} s = { .on = -1 };
+    /* The EP's stereo output (FIFO 0, the AC97 stream): the period its last
+     * frame wrote, whether that is new since the APU thread took one, and
+     * how many EP periods ago it last wrote one. Written by whichever thread
+     * runs the EP frame; the worker's mutex orders it before idle() sees the
+     * frame done. */
+    int16_t ep_pcm[NUM_SAMPLES_PER_FRAME * 8][2];
+    bool ep_fresh;
+    uint32_t ep_quiet;              /* EP periods since FIFO 0 was written */
+    bool period_ep;                 /* this period's output is the EP's */
+    int out_mode;                   /* -1 unread, else OUT_* */
+    uint64_t ep_periods, ep_delivered, ep_used;
+} s = { .on = -1, .out_mode = -1, .ep_quiet = UINT32_MAX };
+
+/* RECOMP_APU_OUT: which core the speakers hear. */
+enum { OUT_AUTO = 0, OUT_EP = 1, OUT_GP = 2 };
+/* auto keeps the EP's output while the EP has written FIFO 0 within this
+ * many periods (21 ms), so one late warm-up period does not hand the
+ * speakers back to the GP. */
+#define EP_QUIET_MAX 4u
+
+static int out_mode(void)
+{
+    if (s.out_mode < 0) {
+        const char *e = recomp_env(RENV_APU_OUT);
+        s.out_mode = OUT_AUTO;
+        if (e && !strcmp(e, "ep"))
+            s.out_mode = OUT_EP;
+        else if (e && !strcmp(e, "gp"))
+            s.out_mode = OUT_GP;
+        else if (e && *e && strcmp(e, "auto"))
+            fprintf(stderr, "[APU DSP] RECOMP_APU_OUT=%s: not auto, ep or gp;"
+                    " auto\n", e);
+    }
+    return s.out_mode;
+}
 
 bool mcpx_apu_dsp_device_on(void)
 {
@@ -181,11 +216,18 @@ static void fifo_rw(void *opaque, uint8_t *ptr, unsigned index, size_t len,
     uint32_t grp = k == GP ? NV_PAPU_GPOFBASE0 : NV_PAPU_EPOFBASE0;
     uint32_t base, end, cur_reg;
 
-    /* EP FIFO 0 is the AC97 stream: one period, which xemu hands the
-     * monitor instead of the title's buffer. Nothing plays it here yet. */
+    /* EP FIFO 0 is the AC97 stream: one period of s16 stereo, the EP's mix
+     * of all six speaker channels, which xemu's ep_sink_samples hands the
+     * monitor instead of the title's buffer (the buffer itself only ever
+     * feeds the AC97 DMA, which nothing here runs). Taking the GP's front
+     * pair instead, as this did, lost every channel but front left and
+     * right: the centre is where a 5.1 movie keeps its dialogue. */
     if (k == EP && dir && index == 0 &&
-        len == sizeof(s.d->monitor.frame_buf))
+        len == sizeof(s.d->monitor.frame_buf)) {
+        memcpy(s.ep_pcm, ptr, sizeof(s.ep_pcm));
+        s.ep_fresh = true;
         return;
+    }
     if (dir) {
         base = reg(grp + 0x10 * index) & 0xFFFFFF;
         end = reg(grp + 0x04 + 0x10 * index) & 0xFFFFFF;
@@ -372,6 +414,8 @@ void mcpx_apu_dsp_run_finalize(void)
     memset(&s, 0, sizeof(s));
     s.on = on;
     s.stats = stats;
+    s.out_mode = -1;
+    s.ep_quiet = UINT32_MAX;
 }
 
 /* ---- reports ---- */
@@ -519,6 +563,36 @@ static void ep_frame(ApuDspEmu *ep)
     }
 }
 
+/* After an EP frame: take the period it wrote to FIFO 0, if any. An EP
+ * frame still on its warm-up worker has not written it yet; idle() then
+ * says so and the period stays silent (frame_buf is cleared after each
+ * period is sent), as a late GP warm-up frame does. The EP's output goes
+ * out at the end of the same period, as on xemu: its frame runs at the
+ * period's first APU frame and the monitor sends the buffer at the last. */
+static void ep_out_period(MCPXAPUState *d, bool out)
+{
+    s.ep_periods++;
+    bool fresh = idle(EP) && s.ep_fresh;
+    if (fresh) {
+        s.ep_fresh = false;
+        s.ep_quiet = 0;
+        s.ep_delivered++;
+    } else if (s.ep_quiet < UINT32_MAX) {
+        s.ep_quiet++;
+    }
+    if (!out || !s.period_ep)
+        return;
+    if (fresh) {
+        memcpy(d->monitor.frame_buf, s.ep_pcm, sizeof(d->monitor.frame_buf));
+        s.ep_used++;
+    } else {
+        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+    }
+    if (s.ep_used == 1 && fresh)
+        fprintf(stderr, "[APU DSP] output: the EP's AC97 FIFO (EP period"
+                " %llu)\n", (unsigned long long)s.ep_periods);
+}
+
 void mcpx_apu_dsp_run_frame(MCPXAPUState *d,
                             float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME])
 {
@@ -556,18 +630,37 @@ void mcpx_apu_dsp_run_frame(MCPXAPUState *d,
      * stub's once-per-start tick (mcpx_apu_ssl_tick). */
     d->gp_emulated = apu_dsp_emu_running(gp);
 
+    /* Which core this period's output comes from, chosen at its first
+     * frame and kept for all eight, so a period is never half one core's.
+     * xemu's MON_GP_OR_EP takes the EP's whenever EPRST lets it run; auto
+     * waits until the EP has actually written FIFO 0, so an EP program that
+     * never does (or one still warming up) leaves the GP's front pair. */
+    if (d->ep_frame_div % 8 == 0) {
+        int mode = out_mode();
+        bool ep_live = apu_dsp_emu_running(ep) &&
+                       s.ep_quiet <= EP_QUIET_MAX;
+        s.period_ep = mode == OUT_EP ||
+                      (mode == OUT_AUTO && ep_live);
+    }
+    bool gp_out = out && !s.period_ep;
+
     if (d->gp_emulated) {
-        gp_frame(d, gp, mixbins, off, out);
+        gp_frame(d, gp, mixbins, off, gp_out);
     } else {
         /* No GP program, no output: the hardware's speakers hear the GP. */
         g_dbg.gp.cycles = 0;
-        if (out)
+        if (gp_out)
             silence(d, off);
     }
 
     g_dbg.ep.cycles = 0;
-    if (d->ep_frame_div % 8 == 0 && apu_dsp_emu_running(ep))
+    if (d->ep_frame_div % 8 == 0 && apu_dsp_emu_running(ep)) {
         ep_frame(ep);
+        ep_out_period(d, out);
+    } else if (d->ep_frame_div % 8 == 0 && out && s.period_ep) {
+        /* Forced to the EP (apu_out=ep) with no EP running: silence. */
+        memset(d->monitor.frame_buf, 0, sizeof(d->monitor.frame_buf));
+    }
 
     s.frames++;
     report();
