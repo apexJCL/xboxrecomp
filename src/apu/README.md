@@ -3,10 +3,12 @@
 Hardware emulation of the Xbox's MCPX APU (Audio Processing Unit), extracted from [xemu](https://github.com/xemu-project/xemu). The APU is a custom chip with three processors:
 
 - **VP (Voice Processor)** — 256 hardware voices, ADPCM/PCM decode, pitch shifting, envelopes, HRTF 3D audio
-- **GP (Global Processor)** — DSP for global effects (reverb, chorus). Currently **stubbed** — effects bypass.
-- **EP (Encode Processor)** — DSP for AC3/DTS encoding. Currently **stubbed** — passthrough.
+- **GP (Global Processor)** — DSP for global effects (reverb, chorus). Runs the title's own DSP program on the dsp56300 JIT (`apu_dsp_emu.c`, `apu_dsp_run.c`) in builds with `XBOXRECOMP_APU_DSP` (`RECOMP_APU_DSP=0` falls back to the stub in `apu_dsp.c`, which mixes the bins down itself).
+- **EP (Encode Processor)** — DSP for AC3/DTS encoding and the stereo downmix. Runs on the same JIT; its AC97 FIFO (the stereo mix of all six speaker channels) is what the speakers hear once it delivers (`RECOMP_APU_OUT`).
 
-Audio output uses Windows `waveOut` at 48kHz stereo 16-bit.
+The voice processor (`apu_vp.c`) follows xemu's after PR #3105 ("MCPX improvements"). Audio output is SDL3 (macOS, Linux), XAudio2 or `waveOut` (Windows), 48 kHz stereo 16-bit.
+
+Parts of this file below (the table, the diagram) describe the first extraction and are out of date.
 
 ## Files
 
