@@ -150,10 +150,16 @@ typedef struct DSPState {
 #define F_AP 5
 #define F_R  1
 
+/* Hardware keeps filter values to 1/16 of a 24-bit sample, rounding halves
+ * up (measured; xemu PR #3105). */
+static inline float svf_round(float x)
+{
+    return floorf(x * 524288.0f + 0.5f) / 524288.0f;
+}
+
 typedef struct {
     float f;
     float q;
-    float qnrm;
     float h;
     float b;
     float l;
@@ -165,7 +171,6 @@ typedef struct {
 static inline void setup_svf(sv_filter *sv, float fc, float q, int t) {
     sv->f = fc;
     sv->q = q;
-    sv->qnrm = (float)sqrt(sv->q / 2.0 + 0.01);
     switch (t) {
     case F_LP: sv->op = &(sv->l); break;
     case F_HP: sv->op = &(sv->h); break;
@@ -175,14 +180,14 @@ static inline void setup_svf(sv_filter *sv, float fc, float q, int t) {
     }
 }
 
+/* No input scaling or waveshaping: on hardware the filter is linear with
+ * unity passband gain at any resonance (xemu PR #3105, measured). */
 static inline float run_svf(sv_filter *sv, float in) {
     float out;
-    in = sv->qnrm * in;
     for (int i = 0; i < F_R; i++) {
-        sv->b = flush_to_zero(sv->b - sv->b * sv->b * sv->b * 0.001f);
-        sv->h = flush_to_zero(in - sv->l - sv->q * sv->b);
-        sv->b = sv->b + sv->f * sv->h;
-        sv->l = flush_to_zero(sv->l + sv->f * sv->b);
+        sv->h = svf_round(in - sv->l - sv->q * sv->b);
+        sv->b = svf_round(sv->b + sv->f * sv->h);
+        sv->l = svf_round(sv->l + sv->f * sv->b);
         sv->n = sv->l + sv->h;
         sv->p = sv->l - sv->h;
         out = *(sv->op);
@@ -199,7 +204,6 @@ static inline float run_svf(sv_filter *sv, float in) {
 #define HRTF_NUM_TAPS           31
 #define HRTF_MAX_DELAY_SAMPLES  42
 #define HRTF_BUFLEN             (HRTF_NUM_TAPS + HRTF_MAX_DELAY_SAMPLES)
-#define HRTF_PARAM_SMOOTH_ALPHA 0.01f
 
 typedef struct {
     int buf_pos;
@@ -210,6 +214,7 @@ typedef struct {
     } ch[2];
     float itd_cur;
     float itd_tar;
+    bool params_set;
 } HrtfFilter;
 
 static inline void hrtf_filter_init(HrtfFilter *f) {
@@ -222,50 +227,43 @@ static inline void hrtf_filter_clear_history(HrtfFilter *f) {
     memset(f->ch[1].buf, 0, sizeof(f->ch[1].buf));
 }
 
+/* As xemu's hw/xbox/mcpx/apu/vp/hrtf.h after PR #3105 ("MCPX
+ * improvements"): the taps apply as written (hardware does not normalise
+ * them), and taps and delay move from the last frame's to the target across
+ * one frame; a voice's first frame starts at the target (measured). */
 static inline void
 hrtf_filter_set_target_params(HrtfFilter *f, float hrir_coeff[2][HRTF_NUM_TAPS],
                               float itd) {
     f->itd_tar = fmaxf(-(float)HRTF_MAX_DELAY_SAMPLES,
                         fminf(itd, (float)HRTF_MAX_DELAY_SAMPLES));
-    for (int ch = 0; ch < 2; ch++) {
-        float *coeff = f->ch[ch].hrir_coeff_tar;
-        memcpy(coeff, hrir_coeff[ch], sizeof(f->ch[ch].hrir_coeff_tar));
-        float s = 0.0f;
-        for (int k = 0; k < HRTF_NUM_TAPS; k++) {
-            s += fabsf(coeff[k]);
-        }
-        if (s == 0.0f || s == 1.0f) break;
-        for (int k = 0; k < HRTF_NUM_TAPS; k++) {
-            coeff[k] /= s;
-        }
-    }
+    for (int ch = 0; ch < 2; ch++)
+        memcpy(f->ch[ch].hrir_coeff_tar, hrir_coeff[ch],
+               sizeof(f->ch[ch].hrir_coeff_tar));
 }
 
-static inline float hrtf_filter_smooth_param(float cur, float tar) {
-    return cur + HRTF_PARAM_SMOOTH_ALPHA * (tar - cur);
-}
-
-static inline void hrtf_filter_step_parameters(HrtfFilter *f) {
-    for (int ch = 0; ch < 2; ch++) {
-        float *cc = f->ch[ch].hrir_coeff_cur;
-        float *ct = f->ch[ch].hrir_coeff_tar;
-        for (int k = 0; k < HRTF_NUM_TAPS; k++) {
-            cc[k] = hrtf_filter_smooth_param(cc[k], ct[k]);
-        }
-    }
-    f->itd_cur = hrtf_filter_smooth_param(f->itd_cur, f->itd_tar);
+static inline void hrtf_filter_settle_parameters(HrtfFilter *f) {
+    for (int ch = 0; ch < 2; ch++)
+        memcpy(f->ch[ch].hrir_coeff_cur, f->ch[ch].hrir_coeff_tar,
+               sizeof(f->ch[ch].hrir_coeff_cur));
+    f->itd_cur = f->itd_tar;
 }
 
 static inline void hrtf_filter_process(HrtfFilter *f,
                                        float in[][2],
                                        float out[][2]) {
+    if (!f->params_set) {
+        hrtf_filter_settle_parameters(f);
+        f->params_set = true;
+    }
     for (int n = 0; n < HRTF_SAMPLES_PER_FRAME; n++) {
-        hrtf_filter_step_parameters(f);
+        float w = n / (float)HRTF_SAMPLES_PER_FRAME;
         for (int ch = 0; ch < 2; ch++) {
             float *buf = f->ch[ch].buf;
-            float *coeff = f->ch[ch].hrir_coeff_cur;
+            const float *cc = f->ch[ch].hrir_coeff_cur;
+            const float *ct = f->ch[ch].hrir_coeff_tar;
             buf[f->buf_pos] = in[n][ch];
-            float d = f->itd_cur * (ch == 0 ? +1.0f : -1.0f);
+            float itd = f->itd_cur + (f->itd_tar - f->itd_cur) * w;
+            float d = itd * (ch == 0 ? +1.0f : -1.0f);
             if (d < 0.0f) d = 0.0f;
             int di = (int)d;
             float dfrac = d - di;
@@ -277,12 +275,13 @@ static inline void hrtf_filter_process(HrtfFilter *f,
                     int idx2 = (idx1 - 1 + HRTF_BUFLEN) % HRTF_BUFLEN;
                     s = s * (1 - dfrac) + buf[idx2] * dfrac;
                 }
-                acc += coeff[k] * s;
+                acc += (cc[k] + (ct[k] - cc[k]) * w) * s;
             }
             out[n][ch] = acc;
         }
         f->buf_pos = (f->buf_pos + 1) % HRTF_BUFLEN;
     }
+    hrtf_filter_settle_parameters(f);
 }
 
 /* ============================================================
@@ -379,17 +378,28 @@ typedef struct MCPXAPUVPSSLData {
 typedef struct MCPXAPUVoiceFilter {
     uint16_t voice;
     float resample_buf[NUM_SAMPLES_PER_FRAME * 2];
-    SRC_STATE *resampler;
-    /* Linear-interpolation resampler state (voice_resample): the two newest
-     * source samples, the next output's position past rs_last (in (0,1]
-     * between them once consumed up to it), and whether they have been
-     * fetched yet. */
-    float rs_last[2], rs_next[2], rs_pos;
-    int   rs_have;
+    /* The resampler (voice_resample, xemu PR #3105's 8-point Lagrange):
+     * source frames fetched into resample_buf (resample_buf_len of them),
+     * the next one to use, the eight-tap history and the cursor in 16.16
+     * past interp[3]. */
+    int resample_buf_pos, resample_buf_len;
+    float interp[8][2];
+    uint32_t interp_pos;
     sv_filter svf[2];
+    sv_filter peq[2];
+    float i3dl2[2];
+    float route_gain[8];    /* each route's gain at the end of the last frame */
+    bool gains;
+    float pitch;
+    bool pitched;
+    float dls2_f[2];
+    float peq_f[2];
+    bool dls2_set;
+    bool peq_set;
+    uint16_t lfo_phase[2];
+    uint16_t lfo_wait[2];
+    bool lfo_armed;
     HrtfFilter hrtf;
-    float gain_prev[8];     /* each bin's gain at the end of the last frame */
-    bool gain_valid;
 } MCPXAPUVoiceFilter;
 
 typedef struct VoiceWorkItem {

@@ -8,11 +8,17 @@
  *     wider samples-per-block value overran them on the stack (a mono
  *     voice already at two).
  *   - gain_*: a volume change stepped at the frame boundary instead of
- *     ramping across the frame.
+ *     ramping across the frame. Since the port of xemu PR #3105 it pins
+ *     that PR's measured ramp (from the last frame's gain, a new voice from
+ *     silence, in 1/16384 rounded down).
+ *   - hrir_*, attenuation_*: xemu PR #3105's tap format and attenuation
+ *     curve.
  *   - outbuf_sge_*: output buffer SGE entries were written into the voices'
  *     table (VPSGEADDR), so an output buffer at handle 1 overwrote the first
  *     page of a voice buffer at inbuf handle 1.
- *   - resample_*: the resampler held one fetched sample back, so a voice at
+ *   - resample_*: (now xemu PR #3105's 8-point Lagrange, its output
+ *     RS_DELAY samples behind the source) the resampler held one fetched
+ *     sample back, so a voice at
  *     rate 1 looping a 32-sample buffer rewritten each frame (Burnout 3's
  *     effect returns from the GP) began each frame with the last frame's
  *     sample 0; and at rate 0.3 its source count (floorf of the summed
@@ -253,33 +259,47 @@ static void put_s16(unsigned i, int16_t x)
     memcpy(s_ram + DATA_BASE + 2 * i, &x, 2);
 }
 
-/* One frame of voice 0 at `rate`, the way voice_process asks for it. */
+/* The output delay of the resampler (voice_resample): the cursor starts one
+ * sample in, so output k plays source position k - 4. */
+#define RS_DELAY 4
+
+/* One frame of voice 0 at `rate` (output to source), the way voice_process
+ * asks for it: a whole frame of 16.16 steps. */
 static int resample_frame(MCPXAPUState *d, float rate,
                           float out[NUM_SAMPLES_PER_FRAME][2])
 {
-    int n = 0, empty = 0;
-    while (n < NUM_SAMPLES_PER_FRAME) {
-        int c = voice_resample(d, 0, &out[n], NUM_SAMPLES_PER_FRAME - n, rate);
-        if (c < 0 || (c == 0 && ++empty > 4))
-            break;
-        n += c;
-    }
-    return n;
+    uint32_t steps[NUM_SAMPLES_PER_FRAME];
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
+        steps[i] = (uint32_t)lrint(65536.0 / rate);
+    return voice_resample(d, 0, out, NUM_SAMPLES_PER_FRAME, steps);
 }
 
+/* A freshly set-up voice 0, as VOICE_ON leaves it. */
+static void reset_voice0(MCPXAPUState *d)
+{
+    voice_reset_filters(d, 0);
+}
+
+/* Rate 1 over a 32-sample loop rewritten each frame: every output is the
+ * sample of the lap it belongs to, RS_DELAY behind, so a frame reads only
+ * its own lap (no look-ahead into the next frame's buffer). */
 static void resample_rate_one_plays_this_frames_buffer(void)
 {
     static MCPXAPUState d;
     float out[NUM_SAMPLES_PER_FRAME][2];
 
     setup_pcm_loop_voice(&d, NUM_SAMPLES_PER_FRAME);
+    reset_voice0(&d);
     for (int frame = 0; frame < 6; frame++) {
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
             put_s16((unsigned)i, (int16_t)(frame * 1000 + i * 7 + 1));
         int n = resample_frame(&d, 1.0f, out);
         CHECK(n == NUM_SAMPLES_PER_FRAME, "frame %d: %d samples", frame, n);
         for (int i = 0; i < n; i++) {
-            float want = int16_to_float((int16_t)(frame * 1000 + i * 7 + 1));
+            int at = frame * NUM_SAMPLES_PER_FRAME + i - RS_DELAY;
+            int lap = at / NUM_SAMPLES_PER_FRAME, k = at % NUM_SAMPLES_PER_FRAME;
+            float want = at < 0 ? 0.0f
+                       : int16_to_float((int16_t)(lap * 1000 + k * 7 + 1));
             if (out[i][0] != want) {
                 CHECK(0, "frame %d: sample %d is %f, this frame's buffer has %f",
                       frame, i, out[i][0], want);
@@ -297,6 +317,7 @@ static void resample_half_rate_lands_on_source_samples(void)
     const unsigned len = 1024;
 
     setup_pcm_loop_voice(&d, len);
+    reset_voice0(&d);
     for (unsigned i = 0; i < len; i++)
         put_s16(i, (int16_t)(i * 13));
     /* Rate 0.5: two source samples an output, each on a whole position. */
@@ -304,10 +325,10 @@ static void resample_half_rate_lands_on_source_samples(void)
         int n = resample_frame(&d, 0.5f, out);
         CHECK(n == NUM_SAMPLES_PER_FRAME, "frame %d: %d samples", frame, n);
         for (int i = 0; i < n; i++) {
-            unsigned at = 2u * (unsigned)(frame * NUM_SAMPLES_PER_FRAME + i);
-            float want = int16_to_float((int16_t)(at * 13));
+            int at = 2 * (frame * NUM_SAMPLES_PER_FRAME + i) - RS_DELAY;
+            float want = at < 0 ? 0.0f : int16_to_float((int16_t)(at * 13));
             if (out[i][0] != want) {
-                CHECK(0, "frame %d: output %d is %f, source %u is %f",
+                CHECK(0, "frame %d: output %d is %f, source %d is %f",
                       frame, i, out[i][0], at, want);
                 break;
             }
@@ -326,13 +347,16 @@ static void resample_rate_0_3_drops_no_source_sample(void)
     const float step = 1.0f / 0.3f;
 
     setup_pcm_loop_voice(&d, len);
+    reset_voice0(&d);
     for (unsigned i = 0; i < len; i++)
         put_s16(i, (int16_t)(i * 13));
     for (int frame = 0; frame < 8; frame++) {
         int n = resample_frame(&d, 0.3f, out);
         CHECK(n == NUM_SAMPLES_PER_FRAME, "frame %d: %d samples", frame, n);
-        for (int i = 0; i < n; i++) {
-            double at = (double)(frame * NUM_SAMPLES_PER_FRAME + i) * step;
+        for (int i = frame ? 0 : 3; i < n; i++) {
+            /* The first outputs' taps reach before the voice's start. */
+            double at = (double)(frame * NUM_SAMPLES_PER_FRAME + i) * step
+                        - RS_DELAY;
             double got = out[i][0] * 32768.0 / 13.0;
             if (fabs(got - at) > 0.05) {
                 CHECK(0, "frame %d: output %d sits at source %.3f, expected %.3f",
@@ -453,36 +477,48 @@ static void stream_fetch_ending_before_ebo_plays_ebo(void)
           s_ram[done_at], d.vp.ssl[0].ssl_index);
 }
 
-/* A 40-sample one-shot (EBO 39) at rate 1 ends 8 samples into its second
- * frame. Those 8 samples, sample ebo last, must reach the mix bins; the
- * frame after, with the voice off, adds nothing. Voice 0 is a 3D voice with
- * every bin on mix bin 0, unit volume and envelope, so bin 0 gets 8 times
- * each sample. */
+/* Expected mix: voice 0 is a 3D voice without an HRTF entry, every route
+ * on mix bin 0 at unit volume and envelope. Its routes 0-3 (the HRTF ears)
+ * are silent, so bin 0 gets 4 times each sample, RS_DELAY behind; the
+ * first frame fades in from silence (the gain i/32 at sample i). */
+static float mix_expect(int frame, int i, int src, float sample, float g_to)
+{
+    float g = frame ? g_to : floorf(16384.0f * g_to * i / 32.0f) / 16384.0f;
+    (void)src;
+    return 4.0f * g * sample;
+}
+
+/* A 40-sample one-shot (EBO 39) at rate 1 ends in its second frame. The
+ * fetch passes EBO there and the voice goes off, but the frame is still
+ * mixed: samples 28-39 (with the resampler's delay) reach the mix bins; the
+ * frame after, with the voice off, adds nothing. */
 static void one_shot_final_frame_reaches_mix_bins(void)
 {
     static MCPXAPUState d;
     static float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     static float sample_buf[NUM_SAMPLES_PER_FRAME][2];
-    const unsigned len = 40;
+    const int len = 40;
 
-    setup_pcm_loop_voice(&d, len);
+    setup_pcm_loop_voice(&d, (unsigned)len);
+    reset_voice0(&d);
     set_voice_reg(0, NV_PAVS_VOICE_CFG_FMT,
                   (NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B16 << 30) |
                   (NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16 << 28));
     set_voice_reg(0, NV_PAVS_VOICE_CFG_HRTF_TARGET, HRTF_NULL_HANDLE);
-    for (unsigned i = 0; i < len; i++)
-        put_s16(i, (int16_t)(i * 100 + 1));
+    for (int i = 0; i < len; i++)
+        put_s16((unsigned)i, (int16_t)(i * 100 + 1));
 
     for (int frame = 0; frame < 3; frame++) {
         memset(mixbins, 0, sizeof(mixbins));
         voice_process(&d, mixbins, sample_buf, 0, 0);
         for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-            unsigned at = (unsigned)(frame * NUM_SAMPLES_PER_FRAME + i);
-            float want = at < len ? 8.0f * int16_to_float((int16_t)(at * 100 + 1))
-                                  : 0.0f;
+            int at = frame * NUM_SAMPLES_PER_FRAME + i - RS_DELAY;
+            float x = (at >= 0 && at < len && frame < 2)
+                    ? int16_to_float((int16_t)(at * 100 + 1)) : 0.0f;
+            float want = mix_expect(frame, i, at, x, 1.0f);
             if (fabsf(mixbins[0][i] - want) > 1e-6f) {
                 CHECK(0, "frame %d: mix bin 0 sample %d is %f, expected %f "
-                      "(voice sample %u of %u)", frame, i, mixbins[0][i], want,
+                      "(voice sample %d of %d)", frame, i, mixbins[0][i], want,
                       at, len);
                 break;
             }
@@ -494,34 +530,36 @@ static void one_shot_final_frame_reaches_mix_bins(void)
 }
 
 /* Rate 0.5: each output takes two source samples, so a 40-sample one-shot
- * ends 20 outputs into its first frame, the resampler returning those 20
- * before the voice is off. They must reach the mix bins (source 0, 2, ..
- * 38, each on a whole position). */
+ * ends 22 outputs into its first frame and the voice is off after it.
+ * Those outputs must reach the mix bins (source 2i - RS_DELAY, each on a
+ * whole position). */
 static void one_shot_half_rate_final_frame_reaches_mix_bins(void)
 {
     static MCPXAPUState d;
     static float mixbins[NUM_MIXBINS][NUM_SAMPLES_PER_FRAME];
     static float sample_buf[NUM_SAMPLES_PER_FRAME][2];
-    const unsigned len = 40;
+    const int len = 40;
 
-    setup_pcm_loop_voice(&d, len);
+    setup_pcm_loop_voice(&d, (unsigned)len);
+    reset_voice0(&d);
     set_voice_reg(0, NV_PAVS_VOICE_CFG_FMT,
                   (NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B16 << 30) |
                   (NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16 << 28));
     set_voice_reg(0, NV_PAVS_VOICE_CFG_HRTF_TARGET, HRTF_NULL_HANDLE);
     voice_set_mask(&d, 0, NV_PAVS_VOICE_TAR_PITCH_LINK,
                    NV_PAVS_VOICE_TAR_PITCH_LINK_PITCH, 4096);  /* rate 0.5 */
-    for (unsigned i = 0; i < len; i++)
-        put_s16(i, (int16_t)(i * 100 + 1));
+    for (int i = 0; i < len; i++)
+        put_s16((unsigned)i, (int16_t)(i * 100 + 1));
 
     memset(mixbins, 0, sizeof(mixbins));
     voice_process(&d, mixbins, sample_buf, 0, 0);
     for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-        unsigned at = 2u * (unsigned)i;
-        float want = at < len ? 8.0f * int16_to_float((int16_t)(at * 100 + 1))
-                              : 0.0f;
+        int at = 2 * i - RS_DELAY;
+        float x = (at >= 0 && at < len)
+                ? int16_to_float((int16_t)(at * 100 + 1)) : 0.0f;
+        float want = mix_expect(0, i, at, x, 1.0f);
         if (fabsf(mixbins[0][i] - want) > 1e-6f) {
-            CHECK(0, "mix bin 0 sample %d is %f, expected %f (source %u of %u)",
+            CHECK(0, "mix bin 0 sample %d is %f, expected %f (source %d of %d)",
                   i, mixbins[0][i], want, at, len);
             break;
         }
@@ -535,8 +573,9 @@ static void one_shot_half_rate_final_frame_reaches_mix_bins(void)
  * it: the frame plays the packet, then the empty next SSL turns the voice
  * off. The 8 samples must reach the mix bins. A non-persist stream plays
  * only in its release phase (voice_get_samples turns it off before that),
- * so the envelope sits early in a long release: one gain g for the frame,
- * close to 1, and bin 0 holds 8 * g * each sample. */
+ * so the envelope sits at the start of a long release: level byte FFh, as
+ * 2040/2048, a route gain of 16320/16384, faded in from silence over the
+ * voice's first frame. */
 static void stream_end_final_frame_reaches_mix_bins(void)
 {
     static MCPXAPUState d;
@@ -546,6 +585,7 @@ static void stream_end_final_frame_reaches_mix_bins(void)
                         8u | (NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B16 << 16) };
 
     setup_pcm_loop_voice(&d, 8);
+    reset_voice0(&d);
     set_voice_reg(0, NV_PAVS_VOICE_CFG_FMT,
                   (NV_PAVS_VOICE_CFG_FMT_CONTAINER_SIZE_B16 << 30) |
                   (NV_PAVS_VOICE_CFG_FMT_SAMPLE_SIZE_S16 << 28) |
@@ -570,12 +610,11 @@ static void stream_end_final_frame_reaches_mix_bins(void)
 
     memset(mixbins, 0, sizeof(mixbins));
     voice_process(&d, mixbins, sample_buf, 0, 0);
-    float g = mixbins[0][0] / (8.0f * int16_to_float(1));
-    CHECK(g > 0.99f && g <= 1.0f, "stream's frame mixed at gain %f, expected "
-          "its release envelope near 1", g);
     for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-        float want = i < 8 ? 8.0f * g * int16_to_float((int16_t)(i * 100 + 1))
-                           : 0.0f;
+        int at = i - RS_DELAY;
+        float x = (at >= 0 && at < 8)
+                ? int16_to_float((int16_t)(at * 100 + 1)) : 0.0f;
+        float want = mix_expect(0, i, at, x, 16320.0f / 16384.0f);
         if (fabsf(mixbins[0][i] - want) > 1e-5f) {
             CHECK(0, "mix bin 0 sample %d is %f, expected %f (packet has 8)",
                   i, mixbins[0][i], want);
@@ -588,8 +627,11 @@ static void stream_end_final_frame_reaches_mix_bins(void)
 }
 
 /* Voice 100 (not 3D, so no HRTF) in multipass mode: its input is mixbin 20,
- * held at 1.0, and only bin 1 is audible. Full volume for a frame, then
- * silent: the second frame must fall from the first's level to nothing. */
+ * held at 1.0 (read as the largest 24-bit sample), and only bin 1 is
+ * audible. Full volume: the first frame fades in from silence; then silent:
+ * the second frame falls from the first's level to nothing. Each sample's
+ * gain is the ramp's, from + (to - from) * i / 32, in 1/16384 rounded down
+ * (xemu PR #3105, measured). */
 static void gain_ramps_across_a_frame(void)
 {
     static MCPXAPUState d;
@@ -611,20 +653,23 @@ static void gain_ramps_across_a_frame(void)
     for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
         mixbins[20][i] = 1.0f;
 
+    const float top = 8388607.0f / 8388608.0f;
     set_voice_reg(v, NV_PAVS_VOICE_TAR_VOLA, vola_full);
     voice_process(&d, mixbins, d.vp.sample_buf, v, 0);
-    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++)
-        if (mixbins[1][i] != 1.0f) {
-            CHECK(0, "frame 1 sample %d is %f, expected the voice's level 1.0",
-                  i, mixbins[1][i]);
+    for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
+        float expect = top * (float)i / NUM_SAMPLES_PER_FRAME;
+        if (fabsf(mixbins[1][i] - expect) > 1e-6f) {
+            CHECK(0, "frame 1 sample %d is %f, expected the fade-in's %f",
+                  i, mixbins[1][i], expect);
             break;
         }
+    }
 
     memset(mixbins[1], 0, sizeof(mixbins[1]));
     set_voice_reg(v, NV_PAVS_VOICE_TAR_VOLA, vola_silent);
     voice_process(&d, mixbins, d.vp.sample_buf, v, 0);
     for (int i = 0; i < NUM_SAMPLES_PER_FRAME; i++) {
-        float expect = 1.0f - (float)(i + 1) / NUM_SAMPLES_PER_FRAME;
+        float expect = top * (1.0f - (float)i / NUM_SAMPLES_PER_FRAME);
         if (fabsf(mixbins[1][i] - expect) > 1e-6f) {
             CHECK(0, "frame 2 sample %d is %f, expected the ramp's %f",
                   i, mixbins[1][i], expect);
@@ -673,22 +718,56 @@ static void sample_reads_take_the_data_resolver(void)
         put_s16((unsigned)i, (int16_t)-x);
     }
     s_data = data;
+    reset_voice0(&d);
     n = resample_frame(&d, 1.0f, out);
     CHECK(n == NUM_SAMPLES_PER_FRAME, "PCM: %d samples", n);
-    for (int i = 0; i < n; i++)
-        if (out[i][0] != int16_to_float((int16_t)(i * 211 + 3))) {
+    for (int i = RS_DELAY; i < n; i++) {
+        int k = i - RS_DELAY;
+        if (out[i][0] != int16_to_float((int16_t)(k * 211 + 3))) {
             CHECK(0, "PCM: sample %d is %f, the data resolver's buffer has %f",
-                  i, out[i][0], int16_to_float((int16_t)(i * 211 + 3)));
+                  i, out[i][0], int16_to_float((int16_t)(k * 211 + 3)));
             break;
         }
+    }
     s_data = NULL;
     free(data);
+}
+
+/* HRIR taps are sign-magnitude, 3-bit exponent and 4-bit mantissa, 1/2048
+ * to 31/32 (xemu PR #3105, measured). Read as int8 two's complement, 0x81
+ * was -127/128 instead of -1/2048. */
+static void hrir_taps_are_sign_magnitude_float(void)
+{
+    static const struct { uint8_t tap; float want; } t[] = {
+        { 0x00, 0.0f }, { 0x01, 1.0f / 2048 }, { 0x0F, 15.0f / 2048 },
+        { 0x10, 16.0f / 2048 }, { 0x7F, 31.0f / 32 }, { 0x81, -1.0f / 2048 },
+        { 0xFF, -31.0f / 32 }, { 0x25, 42.0f / 2048 },
+    };
+    for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); i++)
+        CHECK(hrir_tap_to_float(t[i].tap) == t[i].want,
+              "tap 0x%02X reads %f, expected %f", t[i].tap,
+              hrir_tap_to_float(t[i].tap), t[i].want);
+}
+
+/* Attenuation 0 is unity, FFFh (or 63 dB) nothing, 6 dB about half
+ * (xemu PR #3105's measured curve: 4095 * 10^(-6/20) = 2052.4 -> 2052 of
+ * 4095, in 1/16384 that is 8208). */
+static void attenuation_follows_the_hardware_curve(void)
+{
+    CHECK(attenuation_gain(0) == 16384, "att 0: %u", attenuation_gain(0));
+    CHECK(attenuation_gain(63 * 64) == 0, "att 63 dB: %u",
+          attenuation_gain(63 * 64));
+    CHECK(attenuation_gain(6 * 64) == 2052u * 4, "att 6 dB: %u, expected %u",
+          attenuation_gain(6 * 64), 2052u * 4);
+    CHECK(attenuate(0xFFF) == 0.0f, "vol FFFh: %f", attenuate(0xFFF));
 }
 
 int main(void)
 {
     s_ram = (uint8_t *)calloc(1, RAM_SIZE);
     if (!s_ram) return 2;
+    lagrange_init();       /* mcpx_apu_vp_init's tables */
+    attenuation_init();
 
     adpcm_wide_block_decodes();
     adpcm_whole_field_fits();
@@ -706,6 +785,8 @@ int main(void)
     stream_end_final_frame_reaches_mix_bins();
     gain_ramps_across_a_frame();
     sample_reads_take_the_data_resolver();
+    hrir_taps_are_sign_magnitude_float();
+    attenuation_follows_the_hardware_curve();
 
     free(s_ram);
     if (s_failures) {
@@ -713,10 +794,10 @@ int main(void)
         return 1;
     }
     puts("PASS: every ADPCM block count the descriptor can name decodes; output buffer SGE entries go to the GP FIFO table; the "
-         "resampler plays each frame's source, no sample held back; a fetch "
+         "resampler reads each frame's own source and drops none; a fetch "
          "ending before EBO still plays sample EBO; the frame a voice ends in "
          "is mixed (one-shot at rate 1 and 0.5, stream end); volume changes "
-         "ramp across a frame; samples are read through the data resolver and the "
+         "ramp across a frame, a new voice from silence; samples are read through the data resolver and the "
          "voice and SGE tables through the other.");
     return 0;
 }
