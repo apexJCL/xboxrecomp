@@ -62,7 +62,8 @@ static inline uint32_t float_to_24b(float value)
     } else if (scaled_value <= (-8.0 * 0x100000)) {
         int24 = -1 - 0x7fffff;
     } else {
-        int24 = (int)lrint(scaled_value);
+        /* Hardware rounds halves up (xemu PR #3105, measured) */
+        int24 = (int)floor(scaled_value + 0.5);
     }
     return int24 & 0xffffff;
 }
