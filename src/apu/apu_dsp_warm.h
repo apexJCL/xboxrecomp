@@ -8,7 +8,9 @@
  * APU thread waits for each one only up to a short deadline. A frame that
  * misses it is late: it is not heard, and the frames that find the worker
  * still busy are skipped and counted, so the APU thread never waits on a
- * compile. The wait matters: the APU thread makes its frames in bursts (on
+ * compile. Skipped by the APU thread only: the worker runs them afterwards,
+ * in order (apu_dsp_run.c, "catch-up"), because a program that loses frames
+ * falls out of step with the other core. The wait matters: the APU thread makes its frames in bursts (on
  * the Mac 8 back to back), and without it only the first frame of a burst
  * found the worker free, so the warm-up skipped 7 frames in 8 for 8 s. Once
  * the warm-up runs out the core runs inline again, as on xemu. Kept apart
@@ -25,7 +27,8 @@ typedef enum ApuDspWarmStep {
     APU_DSP_WARM_INLINE,    /* run the frame on the APU thread */
     APU_DSP_WARM_WORKER,    /* hand the frame to the worker, wait for it
                              * up to the deadline, then apu_dsp_warm_ran */
-    APU_DSP_WARM_SKIP,      /* the worker still has the core: skip it */
+    APU_DSP_WARM_SKIP,      /* the worker still has the core: not heard,
+                             * and owed to the worker, which runs it next */
 } ApuDspWarmStep;
 
 typedef struct ApuDspWarm {

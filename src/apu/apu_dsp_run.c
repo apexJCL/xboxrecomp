@@ -58,10 +58,29 @@
  * thread. For about a second after each bootstrap (1500 GP frames, 188 EP
  * periods) a core runs on its worker, and the APU thread waits for each frame
  * up to WARM_WAIT_NS. A GP frame that misses it is silent, and so are the
- * frames that find the worker still busy, which are skipped and counted. The
- * EP's output is not heard (see GP_OUT_LEFT). */
+ * frames that find the worker still busy, which are skipped and counted.
+ *
+ * A skipped frame is only skipped by the APU thread: the worker owes it and
+ * runs it (catch-up) as soon as it is done with the frame it has, before the
+ * core is the APU thread's again, so each program still runs every frame, in
+ * order. They have to. The GP writes the six speaker channels into rings in
+ * scratch memory that the EP reads a period at a time, and each program keeps
+ * its own ring position in its DMA descriptors, which move only when it runs.
+ * Dropping frames left the two out of step for good: each dropped GP frame
+ * put the GP a frame behind the EP and each dropped EP period put the EP
+ * eight behind, and once the EP read a half of the 512-sample ring the GP had
+ * not finished, the first 1-3 frames of every period it played were 512
+ * samples newer than the rest (a 187.5 Hz splice in everything heard, for the
+ * session; Enter the Matrix, 94-157 GP frames and 4-8 EP periods dropped
+ * after its logo movies, half its runs). Catch-up frames get silent mixbins
+ * and their EP stereo output is dropped: what they produce is too late to
+ * hear. The APU thread never waits for them. */
 #define GP_WARM_FRAMES  1500u
 #define EP_WARM_PERIODS 188u
+/* Owed frames past this (a second's worth) are dropped after all: a worker
+ * that never catches up must not owe without bound. Counted and logged. */
+#define GP_OWED_MAX     GP_WARM_FRAMES
+#define EP_OWED_MAX     EP_WARM_PERIODS
 /* Above the GP's slowest steady frames (1.8 ms on the Deck), well below the
  * device's buffer. */
 #define WARM_WAIT_NS    3000000u
@@ -79,17 +98,23 @@ typedef struct RunWindow {
 } RunWindow;
 
 /* A core's warm-up worker. busy is set by the APU thread when it hands over
- * a frame and cleared by the worker; the core is the worker's alone while it
- * is set. */
+ * a frame (or owes one to an idle worker) and cleared by the worker once it
+ * has run that frame and every frame owed meanwhile; the core is the
+ * worker's alone while it is set. */
 typedef struct Worker {
     QemuThread thread;
     QemuMutex mu;
     QemuCond cv;
     bool up, busy, job, quit, done;
+    bool frame;                     /* the job has a frame from dispatch */
+    int catching;                   /* running an owed frame (atomic) */
     uint32_t cycles;
     uint64_t ns;
     ApuDspWarm warm;
     uint64_t skipped_shown, late_shown;
+    uint64_t owed;                  /* skipped frames still to run */
+    uint64_t cu_frames, cu_cycles, cu_ns;   /* owed frames run, not folded */
+    uint64_t caught_up, dropped, caught_up_shown, dropped_shown;
 } Worker;
 
 static struct {
@@ -224,8 +249,11 @@ static void fifo_rw(void *opaque, uint8_t *ptr, unsigned index, size_t len,
      * right: the centre is where a 5.1 movie keeps its dialogue. */
     if (k == EP && dir && index == 0 &&
         len == sizeof(s.d->monitor.frame_buf)) {
-        memcpy(s.ep_pcm, ptr, sizeof(s.ep_pcm));
-        s.ep_fresh = true;
+        /* An owed period's output is too late for its period: drop it. */
+        if (!qatomic_read(&s.wk[EP].catching)) {
+            memcpy(s.ep_pcm, ptr, sizeof(s.ep_pcm));
+            s.ep_fresh = true;
+        }
         return;
     }
     if (dir) {
@@ -261,11 +289,23 @@ static void fifo_rw(void *opaque, uint8_t *ptr, unsigned index, size_t len,
 
 /* ---- the warm-up workers ---- */
 
+/* One owed frame, on the worker: as the frame would have run, with silent
+ * mixbins for the GP (the VP's were for a frame already gone by). */
+static uint32_t catch_up_frame(int k, uint32_t cap)
+{
+    static const uint32_t silent[NUM_MIXBINS * NUM_SAMPLES_PER_FRAME];
+    if (k == GP)
+        apu_dsp_emu_write_run(s.emu[k], APU_DSP_SPACE_X, APU_DSP_MIXBUF_BASE,
+                              silent, NUM_MIXBINS * NUM_SAMPLES_PER_FRAME);
+    return apu_dsp_emu_run_frame(s.emu[k], cap);
+}
+
 static void *worker_main(void *arg)
 {
     int k = *(const int *)arg;
     Worker *w = &s.wk[k];
     uint32_t cap = k == GP ? GP_CAP : EP_CAP;
+    uint64_t owed_max = k == GP ? GP_OWED_MAX : EP_OWED_MAX;
 
     qemu_mutex_lock(&w->mu);
     for (;;) {
@@ -273,15 +313,38 @@ static void *worker_main(void *arg)
             qemu_cond_wait(&w->cv, &w->mu);
         if (w->quit)
             break;
+        bool frame = w->frame;
         w->job = false;
-        qemu_mutex_unlock(&w->mu);
-        uint64_t t0 = apu_lockstat_now_ns();
-        uint32_t cycles = apu_dsp_emu_run_frame(s.emu[k], cap);
-        uint64_t ns = apu_lockstat_now_ns() - t0;
-        qemu_mutex_lock(&w->mu);
-        w->cycles = cycles;
-        w->ns = ns;
-        w->done = true;
+        w->frame = false;
+        if (frame) {
+            qemu_mutex_unlock(&w->mu);
+            uint64_t t0 = apu_lockstat_now_ns();
+            uint32_t cycles = apu_dsp_emu_run_frame(s.emu[k], cap);
+            uint64_t ns = apu_lockstat_now_ns() - t0;
+            qemu_mutex_lock(&w->mu);
+            w->cycles = cycles;
+            w->ns = ns;
+            w->done = true;
+        }
+        /* The frames the APU thread skipped meanwhile, oldest first, before
+         * it can hand over the next one. */
+        while (w->owed && !w->quit) {
+            if (w->owed > owed_max) {
+                w->dropped += w->owed - owed_max;
+                w->owed = owed_max;
+            }
+            w->owed--;
+            qatomic_set(&w->catching, 1);
+            qemu_mutex_unlock(&w->mu);
+            uint64_t t0 = apu_lockstat_now_ns();
+            uint32_t cycles = catch_up_frame(k, cap);
+            uint64_t ns = apu_lockstat_now_ns() - t0;
+            qemu_mutex_lock(&w->mu);
+            qatomic_set(&w->catching, 0);
+            w->cu_frames++;
+            w->cu_cycles += cycles;
+            w->cu_ns += ns;
+        }
         w->busy = false;
         qemu_cond_signal(&w->cv);
     }
@@ -329,6 +392,14 @@ static bool idle_within(int k, uint64_t wait_ns)
         count(k, w->cycles, w->ns);
         w->done = false;
     }
+    if (w->cu_frames) {
+        /* Owed frames ran as they would have: their cycles count too. */
+        uint64_t n = w->cu_frames;
+        for (uint64_t i = 0; i < n; i++)
+            count(k, (uint32_t)(w->cu_cycles / n), w->cu_ns / n);
+        w->caught_up += n;
+        w->cu_frames = w->cu_cycles = w->cu_ns = 0;
+    }
     qemu_mutex_unlock(&w->mu);
     return idle_now;
 }
@@ -352,7 +423,26 @@ static void dispatch(int k)
     qemu_mutex_lock(&w->mu);
     w->busy = true;
     w->job = true;
+    w->frame = true;
     qemu_cond_signal(&w->cv);
+    qemu_mutex_unlock(&w->mu);
+}
+
+/* Core k's frame was skipped (its worker had the core): the worker owes it.
+ * If the worker finished after idle() looked, wake it for just that one, so
+ * it still runs before the next frame is handed over. */
+static void owe(int k)
+{
+    Worker *w = &s.wk[k];
+    if (!w->up)
+        return;
+    qemu_mutex_lock(&w->mu);
+    w->owed++;
+    if (!w->busy) {
+        w->busy = true;
+        w->job = true;
+        qemu_cond_signal(&w->cv);
+    }
     qemu_mutex_unlock(&w->mu);
 }
 
@@ -465,17 +555,28 @@ static void report(void)
         s.wk[GP].warm.skipped != s.wk[GP].skipped_shown ||
         s.wk[EP].warm.skipped != s.wk[EP].skipped_shown ||
         s.wk[GP].warm.late != s.wk[GP].late_shown ||
-        s.wk[EP].warm.late != s.wk[EP].late_shown) {
+        s.wk[EP].warm.late != s.wk[EP].late_shown ||
+        s.wk[GP].caught_up != s.wk[GP].caught_up_shown ||
+        s.wk[EP].caught_up != s.wk[EP].caught_up_shown ||
+        s.wk[GP].dropped != s.wk[GP].dropped_shown ||
+        s.wk[EP].dropped != s.wk[EP].dropped_shown) {
         fprintf(stderr, "[APU DSP] cycle cap hit: GP %llu, EP %llu frames;"
                 " warm-up skipped/late: GP %llu/%llu frames,"
-                " EP %llu/%llu periods\n",
+                " EP %llu/%llu periods; skipped run later (caught up): GP"
+                " %llu, EP %llu; dropped: GP %llu, EP %llu\n",
                 (unsigned long long)st[GP].capped,
                 (unsigned long long)st[EP].capped,
                 (unsigned long long)s.wk[GP].warm.skipped,
                 (unsigned long long)s.wk[GP].warm.late,
                 (unsigned long long)s.wk[EP].warm.skipped,
-                (unsigned long long)s.wk[EP].warm.late);
+                (unsigned long long)s.wk[EP].warm.late,
+                (unsigned long long)s.wk[GP].caught_up,
+                (unsigned long long)s.wk[EP].caught_up,
+                (unsigned long long)s.wk[GP].dropped,
+                (unsigned long long)s.wk[EP].dropped);
         for (int k = 0; k < 2; k++) {
+            s.wk[k].caught_up_shown = s.wk[k].caught_up;
+            s.wk[k].dropped_shown = s.wk[k].dropped;
             s.capped_shown[k] = st[k].capped;
             s.wk[k].skipped_shown = s.wk[k].warm.skipped;
             s.wk[k].late_shown = s.wk[k].warm.late;
@@ -516,6 +617,7 @@ static void gp_frame(MCPXAPUState *d, ApuDspEmu *gp,
 
     g_dbg.gp.cycles = 0;
     if (step == APU_DSP_WARM_SKIP) {
+        owe(GP);        /* the worker runs it after the one it has */
         if (out)
             silence(d, off);
         return;
@@ -549,6 +651,7 @@ static void ep_frame(ApuDspEmu *ep)
 {
     switch (apu_dsp_warm_step(&s.wk[EP].warm, idle(EP))) {
     case APU_DSP_WARM_SKIP:
+        owe(EP);        /* the worker runs it after the one it has */
         break;
     case APU_DSP_WARM_WORKER:
         run_on_worker(EP);
