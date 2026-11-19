@@ -979,6 +979,9 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/kernel/nv2a_backend_common.c | nv2a_batch_filter_ask | memo | local_static | reset | renderer.common | memo keyed by prog_dwords/start, not content; unreachable local |
 | src/kernel/nv2a_backend_common.c | nv2a_depth_bias | logged | local_static | keep | - | log-once guard |
 | src/kernel/nv2a_backend_common.c | nv2a_wdepth_consts_fill | logged | local_static | keep | - | log-once guard |
+| src/kernel/nv2a_backend_common.c | nv2a_dof_skip_size | n | local_static | keep | - | env cache (RECOMP_DOF_SKIP) |
+| src/kernel/nv2a_backend_common.c | nv2a_dof_skip_size | tw | local_static | keep | - | env cache (RECOMP_DOF_SKIP) |
+| src/kernel/nv2a_backend_common.c | nv2a_dof_skip_size | th | local_static | keep | - | env cache (RECOMP_DOF_SKIP) |
 
 ### src/kernel/nv2a_backend_common.h
 
@@ -1937,6 +1940,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | zt_say | said | local_static | keep | - | log-once guard |
 | src/d3d/nv2a_pb_d3d11.c | zt_on | on | local_static | keep | - | env cache (RECOMP_D3D11_ZTEX) |
 | src/d3d/nv2a_pb_d3d11.c | zt_find | said | local_static | keep | - | log-once guard |
+| src/d3d/nv2a_pb_d3d11.c | - | s_dof_skipped | file_static | keep | - | stats counter |
 
 ### src/d3d/nv2a_pb_metal.m
 
@@ -2157,6 +2161,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_metal.m | metal_on_draw | keep | local_static | keep | - | env cache (RECOMP_METAL_W_ZCLIP) |
 | src/d3d/nv2a_pb_metal.m | metal_on_draw | clip_enc | local_static | keep | - | encoder serial of the last setDepthClipMode; s_enc_serial is monotonic |
 | src/d3d/nv2a_pb_metal.m | metal_on_draw | clip_set | local_static | keep | - | depth clip mode set on clip_enc's encoder |
+| src/d3d/nv2a_pb_metal.m | - | s_dof_skipped | file_static | keep | - | stats counter |
 
 ## Devices: APU, DSP, audio, input, USB, video, platform
 

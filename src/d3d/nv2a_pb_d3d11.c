@@ -229,6 +229,8 @@ _Static_assert(sizeof(PsConsts) == sizeof(NV2APSConstants),
 
 /* PS_CB_DECL (nv2a_basic_hlsl.h) is that layout in HLSL. */
 static uint64_t s_presents, s_clears, s_draws, s_draws_skipped;
+/* Draws RECOMP_DOF_SKIP dropped: a depth-of-field repaint (d3d11_on_draw). */
+static uint64_t s_dof_skipped;
 /* Draws dropped because CULL_FACE was FRONT_AND_BACK (D3D11 has no such
  * mode); counted apart from s_draws_skipped, which means "could not draw". */
 static uint64_t s_draws_culled;
@@ -4735,6 +4737,27 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
                 s_sc.rs = rs;
             }
         }
+        /* RECOMP_DOF_SKIP: Kung Fu Chaos blurs a 320x240 copy of the scene and
+         * repaints it over the 640x480 screen with the depth test on and depth
+         * writes off, so the blur lands on what lies behind the fighters. A
+         * draw into a larger target that samples such a copy (a render
+         * target stage, never a depth view or the self copy) under that
+         * state is that repaint: dropped, the far scene stays sharp. The
+         * full-screen passes that read the same copies with the depth test
+         * off (tint, brightness) are not touched. All the state is set, so
+         * the next draw starts clean. */
+        if (v->depth_enable && !v->depth_mask && !nv2a_dof_skip_size(rt->w, rt->h)) {
+            int dof = 0, n;
+            for (n = 0; n < 4; n++)
+                if (s_stage_rt[n] && s_stage_rt[n] != &s_self && !zt_is_view(s_stage_rt[n])
+                    && nv2a_dof_skip_size(s_stage_rt[n]->w, s_stage_rt[n]->h))
+                    dof = 1;
+            if (dof) {
+                s_dof_skipped++;
+                s_cur = NULL;
+                return;
+            }
+        }
         if (hp.place != NV2A_PLACE_CENTRE)
             s_draws_stretch++;
         if (hp.two_d && !have_x) {
@@ -6538,6 +6561,8 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_rtt_binds, (unsigned long long)s_stale_drops,
                 (unsigned long long)s_evict_lost, (unsigned long long)s_grows,
                 (unsigned long long)s_partial_clears);
+    if ((s_presents % 300) == 0 && s_dof_skipped && recomp_env_on(RENV_PRESENT_STATS))
+        fprintf(stderr, LOGP "dof_skip: %llu draws skipped\n", (unsigned long long)s_dof_skipped);
     if (s_zt_binds && (s_presents % 300) == 0)
         fprintf(stderr, LOGP "depth surfaces as textures: %llu binds, %llu conversions\n",
                 (unsigned long long)s_zt_binds, (unsigned long long)s_zt_converts);

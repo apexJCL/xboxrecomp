@@ -205,6 +205,8 @@ static uint64_t s_presents, s_clears, s_draws, s_draws_skipped, s_draws_prog,
                 s_draws_culled, s_draws_tex, s_tex_uploads, s_tex_rehash,
                 s_tex_changed, s_flushes, s_writebacks, s_cmd_errors,
                 s_draws_stretch;   /* hor+: batches placed off-centre (nv2a_aspect_place) */
+/* Draws RECOMP_DOF_SKIP dropped: a depth-of-field repaint (metal_on_draw). */
+static uint64_t s_dof_skipped;
 
 /* ---- render targets: one per guest surface --------------------------------- */
 
@@ -3038,6 +3040,27 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             if (textured)
                 s_draws_tex++;
         }
+        /* RECOMP_DOF_SKIP: Kung Fu Chaos blurs a 320x240 copy of the scene and
+         * repaints it over the 640x480 screen with the depth test on and depth
+         * writes off, so the blur lands on what lies behind the fighters. A
+         * draw into a larger target that samples such a copy (a render
+         * target stage, never a depth view or the self copy) under that
+         * state is that repaint: dropped, the far scene stays sharp. The
+         * full-screen passes that read the same copies with the depth test
+         * off (tint, brightness) are not touched. Nothing is encoded yet
+         * for this draw, so there is no state to undo. */
+        if (v->depth_enable && !v->depth_mask && !nv2a_dof_skip_size(rt->w, rt->h)) {
+            int dof = 0;
+            for (k = 0; k < 4; k++)
+                if (srcs[k] && srcs[k] != &s_self
+                    && !(srcs[k] >= s_zt_view && srcs[k] < s_zt_view + DT_MAX)
+                    && nv2a_dof_skip_size(srcs[k]->w, srcs[k]->h))
+                    dof = 1;
+            if (dof) {
+                s_dof_skipped++;
+                return;
+            }
+        }
         /* Hor+: a perspective screen quad over padded targets is a
          * full-width pass too (nv2a_aspect_screen_quad) and marks the third
          * it lies in as holding a bar; one drawn without depth in such a
@@ -4493,6 +4516,8 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
         fprintf(stderr, LOGP "present #%llu: 2D blits %llu target copies, %llu in guest"
                 " memory\n", (unsigned long long)s_presents, (unsigned long long)s_blits_gpu,
                 (unsigned long long)s_blits_guest);
+    if ((s_presents % 300) == 0 && s_dof_skipped && recomp_env_on(RENV_PRESENT_STATS))
+        fprintf(stderr, LOGP "dof_skip: %llu draws skipped\n", (unsigned long long)s_dof_skipped);
     if (s_zt_binds && (s_presents % 300) == 0)
         fprintf(stderr, LOGP "depth surfaces as textures: %llu binds, %llu conversions\n",
                 (unsigned long long)s_zt_binds, (unsigned long long)s_zt_converts);
