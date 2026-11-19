@@ -1109,6 +1109,10 @@ static void dt_mem_written(uint32_t addr, uint32_t bytes, uint64_t seq)
 static struct { uint64_t key; ID3D11DepthStencilState *dss; } s_dss[DSS_MAX];
 static int s_dss_count;
 static uint64_t s_zclears, s_draws_z;
+/* present_stats: depth-tested draws by encoding (W path, Z_PERSPECTIVE set but
+ * not on the W path, plain z) and the depth funcs the W path drew with. */
+static uint64_t s_dz_w, s_dz_zp, s_dz_z;
+static unsigned s_dz_wfuncs;
 
 static DepthTarget *depth_target(UINT w, UINT h)
 {
@@ -4659,6 +4663,11 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
                 dsv = dt->dsv;
                 dss = depth_state(v->depth_enable, use_s);
                 s_draws_z++;
+                if (v->depth_enable) {
+                    if (w_on) { s_dz_w++; s_dz_wfuncs |= 1u << (nv2a_cmp_from_gl(v->depth_func) & 7u); }
+                    else if ((v->control0 >> 16) & 1u) s_dz_zp++;
+                    else s_dz_z++;
+                }
                 rt->zeta = dt->zeta;
                 rt->has_zeta = 1;
             }
@@ -6538,6 +6547,9 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_rtt_binds, (unsigned long long)s_stale_drops,
                 (unsigned long long)s_evict_lost, (unsigned long long)s_grows,
                 (unsigned long long)s_partial_clears);
+    if ((s_presents % 300) == 0 && recomp_env_on(RENV_PRESENT_STATS))
+        fprintf(stderr, LOGP "depth draws: %llu W path, %llu Z_PERSPECTIVE off the W path, %llu plain z; W funcs mask 0x%02X\n",
+                (unsigned long long)s_dz_w, (unsigned long long)s_dz_zp, (unsigned long long)s_dz_z, s_dz_wfuncs);
     if (s_zt_binds && (s_presents % 300) == 0)
         fprintf(stderr, LOGP "depth surfaces as textures: %llu binds, %llu conversions\n",
                 (unsigned long long)s_zt_binds, (unsigned long long)s_zt_converts);
