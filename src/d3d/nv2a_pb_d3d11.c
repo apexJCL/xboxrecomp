@@ -6606,6 +6606,7 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
                    ? read_tex_pixel(s_back, (UINT)s_probe_x, (UINT)s_probe_y)
                    : 0xDEADBEEFu;
     s_presents++;
+    nv2a_w_earlyz_flip();
     dump_frame();
 #ifdef XBOXRECOMP_ENHANCE
     ovl_present();

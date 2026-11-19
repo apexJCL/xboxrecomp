@@ -1496,6 +1496,8 @@ int   nv2a_w_earlyz_requested(void);   /* RECOMP_W_EARLYZ on, W depth allowed */
 float nv2a_w_earlyz_b(void);           /* B: RECOMP_W_EARLYZ_B, default 2^-10 */
 /* What a depth buffer cleared (or made) now takes: requested, not latched. */
 int   nv2a_w_earlyz_want(void);
+/* Each backend's flip: RECOMP_DEBUG=w_earlyz_alt=1 takes the mode on even flips only. */
+void  nv2a_w_earlyz_flip(void);
 /* A plain-z depth batch on a buffer in the mode: off from the next depth
  * clear, one log line. */
 void  nv2a_w_earlyz_latch(void);

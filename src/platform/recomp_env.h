@@ -241,6 +241,7 @@ extern "C" {
     X(PB_MLOG,           DEBUG, "pb_mlog",         NULL,                       "=flip: every method of that flip (subchannel, method, parameter) to stderr as [MLOG]") \
     X(PB_MERGE,          DEBUG, "pb_merge",        NULL,                       "=0: draw every guest batch on its own, no merging of back-to-back triangle batches on a GPU backend") \
     X(FAST_KICK,         DEBUG, "fast_kick",       "RECOMP_FAST_KICK",         "=0: ack loop ticks at Sleep(1)") \
+    X(W_EARLYZ_ALT,      DEBUG, "w_earlyz_alt",    "RECOMP_W_EARLYZ_ALT",      "=1: RECOMP_W_EARLYZ on every other flip (taken at each depth clear), for an in-run parity test on a still scene") \
     X(KICK_EVENT,        DEBUG, "kick_event",      NULL,                       "=1: the ack loop sleeps until the guest pokes it instead of polling the KickOff every ~50 us (default off)") \
     X(RUN_AHEAD,         DEBUG, "run_ahead",       NULL,                       "=N: the walker publishes GET as it walks and acks the KickOff flush with up to N segments (1 for any other value but 0) submitted past its walk; D3D's notify NOPs raise the PGRAPH interrupt (default off; docs/env.md)") \
     X(KICK_NAP,          DEBUG, "kick_nap",        NULL,                       "=hybrid|timer|delay|spin: how the ack loop naps between its ~50 us polls (docs/env.md)") \

@@ -582,9 +582,21 @@ float nv2a_w_earlyz_b(void)
 
 static atomic_int s_earlyz_latched_off;
 
+/* RECOMP_DEBUG=w_earlyz_alt=1: the flips the backends count (nv2a_w_earlyz_flip). */
+static atomic_uint s_earlyz_flips;
+
+void nv2a_w_earlyz_flip(void)
+{
+    atomic_fetch_add(&s_earlyz_flips, 1u);
+}
+
 int nv2a_w_earlyz_want(void)
 {
-    return nv2a_w_earlyz_requested() && !atomic_load(&s_earlyz_latched_off);
+    static int alt = -1;
+    if (alt < 0)
+        alt = recomp_env_on(RENV_W_EARLYZ_ALT);
+    return nv2a_w_earlyz_requested() && !atomic_load(&s_earlyz_latched_off)
+           && !(alt && (atomic_load(&s_earlyz_flips) & 1u));
 }
 
 void nv2a_w_earlyz_latch(void)

@@ -4539,6 +4539,7 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
         }
     }
     s_presents++;
+    nv2a_w_earlyz_flip();
     /* The [MEM] exit line's GPU figure: every allocation this device made
      * for the process (the presenter's too, on the shared device). Unified
      * memory has no separate non-local pool. */
