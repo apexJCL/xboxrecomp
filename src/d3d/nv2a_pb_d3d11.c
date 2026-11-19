@@ -1073,6 +1073,10 @@ typedef struct {
     ID3D11ShaderResourceView *zsrv;
     ID3D11UnorderedAccessView *zuav;
     RenderTarget            view;       /* ztex as rt_texture serves it */
+    /* RECOMP_W_EARLYZ: the depth stored as E = B (1/w - 1/zmax), tests
+     * reversed (nv2a_w_earlyz_fast's comment). Set when made and at each
+     * depth clear, from nv2a_w_earlyz_want(). */
+    int                     earlyz;
 } DepthTarget;
 
 static DepthTarget s_dt[DT_MAX];
@@ -1113,6 +1117,15 @@ static uint64_t s_zclears, s_draws_z;
  * not on the W path, plain z) and the depth funcs the W path drew with. */
 static uint64_t s_dz_w, s_dz_zp, s_dz_z;
 static unsigned s_dz_wfuncs;
+/* RECOMP_W_EARLYZ, the batch's one decision (d3d11_on_draw, from
+ * nv2a_w_earlyz_fast): s_wz_ez, its depth buffer stores E (tests reversed,
+ * the W variant writes E too); s_wz_vs, the vertex epilogue's spec_ctl.w:
+ * 0 the stock z, 1 the W variant writes the depth (s_ps_w), 2 the vertex z
+ * is E -- the fast path, or a W batch on such a buffer whose W variant was
+ * not bound, which still has to store E, not z/w 0.5. */
+static int s_wz_ez, s_wz_vs;
+/* present_stats: W batches on such a buffer, fast and off the fast path */
+static uint64_t s_dz_wfast, s_dz_wslow;
 
 static DepthTarget *depth_target(UINT w, UINT h)
 {
@@ -1160,10 +1173,12 @@ static DepthTarget *depth_target(UINT w, UINT h)
         e->tex = NULL;
         return NULL;
     }
-    /* The CPU path starts its buffer at the far plane, stencil 0. */
+    /* The CPU path starts its buffer at the far plane, stencil 0: 1, or E's
+     * far end, 0, in RECOMP_W_EARLYZ's mode. */
+    e->earlyz = nv2a_w_earlyz_want();
     ID3D11DeviceContext_ClearDepthStencilView(s_ctx, e->dsv,
                                               D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL,
-                                              1.0f, 0);
+                                              e->earlyz ? 0.0f : 1.0f, 0);
     e->zeta = zeta;
     e->addr = nv2a_pb_dma_resolve(zeta);
     e->w = w;
@@ -1188,8 +1203,10 @@ static uint32_t stencil_op(uint32_t op)
 /* SET_DEPTH_FUNC takes GL's codes, 0x200 NEVER .. 0x207 ALWAYS, in the order
  * D3D11_COMPARISON_* numbers them from 1, and SET_STENCIL_FUNC the same (the
  * walker keeps its low nibble). Anything else tests as ALWAYS, as on the CPU.
- * Depth and stencil each only when enabled; one state per distinct key. */
-static ID3D11DepthStencilState *depth_state(int depth, int stencil)
+ * Depth and stencil each only when enabled; one state per distinct key.
+ * ez: the buffer stores RECOMP_W_EARLYZ's E, which falls as w grows, so the
+ * test is reversed (nv2a_cmp_reverse); the key holds the reversed code. */
+static ID3D11DepthStencilState *depth_state(int depth, int stencil, int ez)
 {
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
     uint32_t f = nv2a_cmp_from_gl(v->depth_func);
@@ -1197,6 +1214,8 @@ static ID3D11DepthStencilState *depth_state(int depth, int stencil)
     D3D11_DEPTH_STENCIL_DESC dd;
     int i;
 
+    if (ez)
+        f = nv2a_cmp_reverse(f);
     if (depth)
         key |= 1u | f << 1 | (v->depth_mask ? 1u : 0u) << 4;
     if (stencil)
@@ -1253,6 +1272,13 @@ static void d3d11_on_zclear(uint32_t param)
     rt->zeta = dt->zeta;
     rt->has_zeta = 1;
     z = nv2a_zclear_depth(g->format, v->zclear);
+    /* RECOMP_W_EARLYZ: each depth clear decides the buffer's encoding from
+     * here on (a stencil-only clear keeps the depth, and so its encoding),
+     * and stores E of the clear depth in that mode. */
+    if (param & 1u)
+        dt->earlyz = nv2a_w_earlyz_want();
+    if (dt->earlyz)
+        z = nv2a_w_earlyz_clear(z, nv2a_zmax(g->format), nv2a_w_earlyz_b());
     ID3D11DeviceContext_ClearDepthStencilView(s_ctx, dt->dsv,
         ((param & 1u) ? D3D11_CLEAR_DEPTH : 0u) | ((param & 2u) ? D3D11_CLEAR_STENCIL : 0u),
         z, (UINT8)(v->zclear & 0xFFu));
@@ -1683,7 +1709,11 @@ static ID3D11RasterizerState *rasterizer_state(const struct nv2a_pb_draw *d, int
         if (!keep && s_rs_wd[c][f])
             return s_rs_wd[c][f];
     }
-    if (!w)
+    /* The vertex z is RECOMP_W_EARLYZ's E (s_wz_vs 2): the GPU's depth clip
+     * stays on, E outside [0, 1] being w past zmax or nearer than about B;
+     * the fast path has no offset, and a fallback W batch's is in w units,
+     * which a bias on E cannot give: none. */
+    if (!w && s_wz_vs != 2)
         nv2a_depth_bias(v, d->prim, nv2a_pb_gpu_state()->format, nv2a_host_render_scale(),
                         &zb, &zs);
     if (zb != 0.0f || zs != 0.0f)
@@ -2769,8 +2799,14 @@ static int aspect_trace(void);
  * (z << 8) | stencil: read as A8R8G8B8, B is the stencil, G z's low byte, R
  * its middle one, A its top one. Z16, a float zeta, a swizzled or another
  * texture format, or a texture starting inside the surface fall back to the
- * guest bytes, said once. RECOMP_D3D11_ZTEX=0: off (A/B). */
+ * guest bytes, said once. RECOMP_D3D11_ZTEX=0: off (A/B).
+ *
+ * A buffer in RECOMP_W_EARLYZ's mode holds E = B (1/w - 1/zmax) instead:
+ * decoded first, w = B / (E + B / zmax), and the guest's value is w / zmax
+ * (E 0, the far clear, is zmax). zk = (mode, B, B / zmax, 1 / zmax) at b0,
+ * from the buffer's own earlyz. */
 static ID3D11ComputeShader *s_zt_cs;
+static ID3D11Buffer        *s_zt_cb;       /* zk */
 static int                  s_zt_bad;      /* no compute shader: never again */
 static uint64_t             s_zt_converts, s_zt_binds;
 
@@ -2778,14 +2814,17 @@ static const char s_zt_cs_src[] =
     "Texture2D<float> zd : register(t0);\n"
     "Texture2D<uint2> zs : register(t1);\n"
     "RWTexture2D<unorm float4> o : register(u0);\n"
+    "cbuffer ZtCB : register(b0) { float4 zk; };\n"
     "[numthreads(8, 8, 1)]\n"
     "void main(uint3 id : SV_DispatchThreadID) {\n"
     "    uint w, h;\n"
     "    o.GetDimensions(w, h);\n"
     "    if (id.x >= w || id.y >= h) return;\n"
+    "    float e = saturate(zd.Load(int3(id.xy, 0)));\n"
+    "    if (zk.x != 0.0) e = saturate(zk.y / (e + zk.z) * zk.w);\n"
     /* min: 1.0 (the clear) * 16777215 rounds to 2^24 in float, which would
      * carry into a ninth bit and zero the low bytes */
-    "    uint z = min((uint)round(saturate(zd.Load(int3(id.xy, 0))) * 16777215.0), 16777215u);\n"
+    "    uint z = min((uint)round(e * 16777215.0), 16777215u);\n"
     "    uint s = zs.Load(int3(id.xy, 0)).g & 255u;\n"
     "    o[id.xy] = float4((z >> 8) & 255u, z & 255u, s, z >> 16) / 255.0;\n"
     "}\n";
@@ -2898,6 +2937,8 @@ static int zt_make(DepthTarget *d)
         }
         ID3D10Blob_Release(code);
     }
+    if (!s_zt_cb && !(s_zt_cb = make_buffer(16, D3D11_BIND_CONSTANT_BUFFER)))
+        return 0;
     if (d->ztex)
         return 1;
     memset(&td, 0, sizeof td);
@@ -2969,9 +3010,18 @@ static RenderTarget *zt_texture(DepthTarget *d, const Stage *t)
     if (d->zconv != d->wseq) {
         ID3D11ShaderResourceView *srv[2] = { d->zd_srv, d->zs_srv }, *none[2] = { NULL, NULL };
         ID3D11UnorderedAccessView *nouav = NULL;
+        D3D11_MAPPED_SUBRESOURCE m;
+        float zmax = nv2a_zmax(d->zfmt << 4), b = nv2a_w_earlyz_b();
+        float zk[4] = { d->earlyz ? 1.0f : 0.0f, b, b / zmax, 1.0f / zmax };
+        if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)s_zt_cb, 0,
+                                           D3D11_MAP_WRITE_DISCARD, 0, &m)))
+            return NULL;
+        memcpy(m.pData, zk, sizeof zk);
+        ID3D11DeviceContext_Unmap(s_ctx, (ID3D11Resource *)s_zt_cb, 0);
         ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)d->zcopy,
                                          (ID3D11Resource *)d->tex);
         ID3D11DeviceContext_CSSetShader(s_ctx, s_zt_cs, NULL, 0);
+        ID3D11DeviceContext_CSSetConstantBuffers(s_ctx, 0, 1, &s_zt_cb);
         ID3D11DeviceContext_CSSetShaderResources(s_ctx, 0, 2, srv);
         ID3D11DeviceContext_CSSetUnorderedAccessViews(s_ctx, 0, 1, &d->zuav, NULL);
         ID3D11DeviceContext_Dispatch(s_ctx, (d->hw + 7u) / 8u, (d->hh + 7u) / 8u, 1);
@@ -3260,8 +3310,9 @@ static void stages_flat(unsigned mask)
 }
 
 /* The pixel shader setup_pixel returned is the combiners' W variant: the
- * vertex side's W mode (set_vp, vp u[7]) goes with it and with nothing
- * else, so a fallback keeps the stock z. */
+ * vertex side's W mode 1 (set_vp, vp u[7]: s_wz_vs) goes with it and with
+ * nothing else, so a fallback keeps the stock z -- or, on a buffer in
+ * RECOMP_W_EARLYZ's mode, takes the vertex E (s_wz_vs 2). */
 static int s_ps_w;
 
 /* A W variant is bound: its constants at PS b1 (nv2a_wdepth_consts). */
@@ -3279,6 +3330,11 @@ static int st_w_on(int w, const struct nv2a_pb_draw *d)
         return 0;
     nv2a_wdepth_consts_fill(nv2a_pb_vsh_state(), d->prim, nv2a_pb_gpu_state()->format,
                             nv2a_host_render_scale(), &wc);
+    if (s_wz_ez) {
+        /* RECOMP_W_EARLYZ, off the fast path: the same E (d3d8_hlsl.h) */
+        wc.w1[2] = nv2a_w_earlyz_b();
+        wc.w1[3] = 1.0f;
+    }
     if (!(memo_on() && ok && !memcmp(&shadow, &wc, sizeof wc))) {
         if (FAILED(ID3D11DeviceContext_Map(s_ctx, (ID3D11Resource *)cb, 0,
                                            D3D11_MAP_WRITE_DISCARD, 0, &m)))
@@ -3622,7 +3678,8 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
         if (ps) {
             /* No W constants (a failed Map): the stock variant, with the
              * stock z and the hardware bias, rather than the W shader
-             * reading a stale b1. */
+             * reading a stale b1. On a buffer in RECOMP_W_EARLYZ's mode the
+             * vertex z is E instead (d3d11_on_draw's s_wz_vs). */
             static NV2ACombinerState st0;
             st0 = s_last_rc;
             st0.w_depth = 0;
@@ -4118,8 +4175,9 @@ static void px_probe(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget *rt
         /* The probe's shaders write no depth, so against a W-buffered
          * batch's (the pixel's w) their rasterised z fails at random: those
          * are probed without the depth test rather than reported as not
-         * covering. The batch's own view is bound again below. */
-        ID3D11DepthStencilView *pdsv = s_ps_w ? NULL : dsv;
+         * covering. The batch's own view is bound again below. So are
+         * those on a buffer in RECOMP_W_EARLYZ's mode (its test reversed). */
+        ID3D11DepthStencilView *pdsv = s_ps_w || s_wz_ez ? NULL : dsv;
         for (k = 0; k < 8; k++)
             ID3D11DeviceContext_ClearRenderTargetView(s_ctx, rtv[k], zero);
         ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 8, rtv, pdsv);
@@ -4326,7 +4384,14 @@ static void set_vp(const struct nv2a_pb_vsh *v, const struct nv2a_pb_gpu *g,
     nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, rt->pad, &vc);
     nv2a_aspect_map(&vc, rt->w, rt->h, rt->pad, place);
     nv2a_vp_tie_fill(&vc, rt->hw, rt->hh);
-    vc.u[7] = s_ps_w ? 1u : 0u;   /* spec_ctl.w: the epilogue's W mode */
+    vc.u[7] = (uint32_t)s_wz_vs;   /* spec_ctl.w: the epilogue's W mode */
+    if (s_wz_vs == 2) {
+        /* RECOMP_W_EARLYZ's E = B - B w / zmax: B and B / zmax in the two
+         * spare lanes, vp_scale.w and fog_param.w */
+        float b = nv2a_w_earlyz_b();
+        vc.c[3] = b;
+        vc.c[11] = b / nv2a_zmax(g->format);
+    }
     memcpy(vp, vc.c, sizeof vc.c);
     memcpy(vp + sizeof vc.c, vc.u, sizeof vc.u);
     if (memo_on() && vp_ok && !memcmp(vp_shadow, vp, sizeof vp)) {
@@ -4370,7 +4435,7 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
     RenderTarget *rt;
     VsEntry *vs;
     ID3D11RasterizerState *rs;
-    int cull_all, w_on;
+    int cull_all, w_on, wz_fast = 0;
     uint8_t fmts[16];
     uint32_t lo = 0xFFFF, hi = 0, count, nidx, i, k;
     void *p;
@@ -4403,6 +4468,8 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
     }
     nidx = convert_indices(d, lo, idx, &topo);
     w_on = nv2a_w_depth_on(v, d->program != 0, v->rc_set && (v->rc_ctl & 0xFF));
+    /* RECOMP_W_EARLYZ's decision waits for the depth buffer, below */
+    s_wz_ez = s_wz_vs = 0;
     /* For cull_all; the state drawn with is chosen once the pixel shader
      * is known (setup_pixel's s_ps_w). */
     rasterizer_state(d, w_on, &cull_all);
@@ -4661,7 +4728,32 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
                 if ((v->depth_enable && v->depth_mask) || (use_s && (v->stencil_wmask & 0xFFu)))
                     zw = dt;
                 dsv = dt->dsv;
-                dss = depth_state(v->depth_enable, use_s);
+                /* RECOMP_W_EARLYZ: the batch's one decision. A buffer in the
+                 * mode reverses every depth test; a W batch on it takes the
+                 * fast path (vertex E, stock pixel shader, depth clip on)
+                 * when nv2a_w_earlyz_fast says so, else the W variant
+                 * writing E. A plain-z depth batch there has no fix this
+                 * frame: the mode goes off from the next depth clear. */
+                if (v->depth_enable && dt->earlyz) {
+                    s_wz_ez = 1;
+                    if (w_on) {
+                        wz_fast = nv2a_w_earlyz_fast(v, d->prim);
+                        nv2a_w_earlyz_note(nv2a_zmax(g->format));
+                        if (wz_fast) {
+                            s_dz_wfast++;
+                        } else if (!s_dz_wslow++) {
+                            /* why the first one is off the fast path */
+                            fprintf(stderr, LOGP "w_earlyz: first W batch off the fast path"
+                                    " (offset %d, clip_set %d, clip %.9g..%.9g, zminmax 0x%X)\n",
+                                    nv2a_poly_offset_on(v, d->prim), v->clip_set,
+                                    (double)v->clip_min, (double)v->clip_max,
+                                    (unsigned)v->zminmax_ctl);
+                        }
+                    } else {
+                        nv2a_w_earlyz_latch();
+                    }
+                }
+                dss = depth_state(v->depth_enable, use_s, s_wz_ez);
                 s_draws_z++;
                 if (v->depth_enable) {
                     if (w_on) { s_dz_w++; s_dz_wfuncs |= 1u << (nv2a_cmp_from_gl(v->depth_func) & 7u); }
@@ -4732,12 +4824,16 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
             if (skip_post < 0)
                 skip_post = recomp_env(RENV_D3D11_DEBUG_PS_SKIP_POST) != NULL;
             s_dbg_post = skip_post && !v->depth_enable && d->idx_count <= 8;
-            ps = setup_pixel(&hp, d, w_on);
+            /* The fast path draws with the stock shader: no SV_Depth */
+            ps = setup_pixel(&hp, d, w_on && !wz_fast);
             /* setup_pixel may have compiled (and evicted) a shader */
             if (!sc_on() || s_sc.ps != ps) {
                 ID3D11DeviceContext_PSSetShader(s_ctx, ps, NULL, 0);
                 s_sc.ps = ps;
             }
+            /* A W batch on a buffer in the mode stores E whichever shader
+             * it got: the W variant's own, or the vertex z's. */
+            s_wz_vs = s_ps_w ? 1 : (s_wz_ez && w_on) ? 2 : 0;
             rs = rasterizer_state(d, s_ps_w, &cull_all);
             if (!sc_on() || s_sc.rs != rs) {
                 ID3D11DeviceContext_RSSetState(s_ctx, rs);
@@ -6550,6 +6646,9 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
     if ((s_presents % 300) == 0 && recomp_env_on(RENV_PRESENT_STATS))
         fprintf(stderr, LOGP "depth draws: %llu W path, %llu Z_PERSPECTIVE off the W path, %llu plain z; W funcs mask 0x%02X\n",
                 (unsigned long long)s_dz_w, (unsigned long long)s_dz_zp, (unsigned long long)s_dz_z, s_dz_wfuncs);
+    if ((s_presents % 300) == 0 && (s_dz_wfast || s_dz_wslow) && recomp_env_on(RENV_PRESENT_STATS))
+        fprintf(stderr, LOGP "w_earlyz: %llu W batches on the fast path, %llu off it\n",
+                (unsigned long long)s_dz_wfast, (unsigned long long)s_dz_wslow);
     if (s_zt_binds && (s_presents % 300) == 0)
         fprintf(stderr, LOGP "depth surfaces as textures: %llu binds, %llu conversions\n",
                 (unsigned long long)s_zt_binds, (unsigned long long)s_zt_converts);

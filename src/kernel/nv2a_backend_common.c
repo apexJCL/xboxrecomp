@@ -4,6 +4,7 @@
  */
 #include "nv2a_backend_common.h"
 #include "nv2a_tex_pack.h"
+#include "recomp_env.h"
 
 #include <math.h>
 #include <stdatomic.h>
@@ -558,6 +559,64 @@ void nv2a_wdepth_consts_fill(const struct nv2a_pb_vsh *v, uint32_t prim,
                     (double)zmax);
         }
     }
+}
+
+int nv2a_w_earlyz_requested(void)
+{
+    static int on = -1;
+    if (on < 0)
+        on = recomp_env_on(RENV_W_EARLYZ);
+    return on;
+}
+
+float nv2a_w_earlyz_b(void)
+{
+    static float b = -1.0f;
+    if (b < 0.0f) {
+        double d = recomp_env_double(RENV_W_EARLYZ_B, 0.0009765625);
+        /* at or under 0, NaN or absurd: the default */
+        b = d > 0.0 && d < 1.0e30 ? (float)d : 0.0009765625f;
+    }
+    return b;
+}
+
+static atomic_int s_earlyz_latched_off;
+
+int nv2a_w_earlyz_want(void)
+{
+    return nv2a_w_earlyz_requested() && !atomic_load(&s_earlyz_latched_off);
+}
+
+void nv2a_w_earlyz_latch(void)
+{
+    if (!atomic_exchange(&s_earlyz_latched_off, 1))
+        fprintf(stderr, "[GPU] w_earlyz: a plain-z depth draw on a W target;"
+                " off from the next depth clear\n");
+}
+
+void nv2a_w_earlyz_note(float zmax)
+{
+    static atomic_int said;
+    if (!atomic_exchange(&said, 1))
+        fprintf(stderr, "[GPU] w_earlyz: on (B %g, zmax %g)\n",
+                (double)nv2a_w_earlyz_b(), (double)zmax);
+}
+
+int nv2a_w_earlyz_fast(const struct nv2a_pb_vsh *v, uint32_t prim)
+{
+    return nv2a_w_earlyz_requested() && !nv2a_poly_offset_on(v, prim)
+           && (!(v->clip_set & 1) || v->clip_min == 0.0f)
+           && (!(v->clip_set & 2) || v->clip_max == 16777215.0f)
+           && ((v->zminmax_ctl >> 4) & 0xFu) == 0u;
+}
+
+float nv2a_w_earlyz_clear(float c, float zmax, float B)
+{
+    float e;
+    if (!(c > 0.0f))
+        return 1.0f;
+    e = B / (c * zmax) - B / zmax;
+    return e < 0.0f ? 0.0f : e > 1.0f ? 1.0f : e;
 }
 
 void nv2a_report_write(uint8_t *mem, uint32_t va, uint32_t count)

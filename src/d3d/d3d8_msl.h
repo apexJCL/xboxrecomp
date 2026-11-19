@@ -40,7 +40,8 @@ extern "C" {
 
 /* The combiners' W variant (NV2ACombinerState.w_depth): its constants
  * (struct nv2a_wdepth_consts: w0 = bias, factor x render scale, clip min,
- * clip max; w1 = 1/zmax, cull) and its output, colour and depth. */
+ * clip max; w1 = 1/zmax, cull, B, 1 in RECOMP_W_EARLYZ's mode) and its
+ * output, colour and depth. */
 #define D3D8_MSL_WDEPTH \
     "struct WDepth { float4 w0; float4 w1; };\n" \
     "struct FOut { float4 c [[color(0)]]; float d [[depth(any)]]; };\n"
@@ -52,7 +53,9 @@ extern "C" {
  * NaN by its bits, as fast math may fold isnan away (d3d8_vsh_hlsl.c's fog
  * does the same). BEGIN runs first, in uniform control flow for dfdx/dfdy;
  * END kills, then
- * writes depth as w / zmax, the target's z / zmax units. */
+ * writes depth as w / zmax, the target's z / zmax units; with w1.w 1 (the
+ * buffer in RECOMP_W_EARLYZ's mode) as E = B / w - B / zmax, B in w1.z,
+ * what the fast batches' vertex z gives (d3d8_hlsl.h's WDEPTH). */
 #define D3D8_MSL_WDEPTH_BEGIN \
     "    float zv = i.zw;\n" \
     "    float zs = max(abs(dfdx(i.zw)), abs(dfdy(i.zw)));\n" \
@@ -66,7 +69,8 @@ extern "C" {
     "    if (wkill) discard_fragment();\n" \
     "    FOut o;\n" \
     "    o.c = res;\n" \
-    "    o.d = saturate(zv * wd.w1.x);\n" \
+    "    o.d = wd.w1.w != 0.0 ? saturate(wd.w1.z / zv - wd.w1.z * wd.w1.x)\n" \
+    "                         : saturate(zv * wd.w1.x);\n" \
     "    return o;\n"
 
 #define D3D8_MSL_VOUT_MEMBERS \

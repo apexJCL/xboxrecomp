@@ -295,7 +295,9 @@ int d3d8_vsh_generate_msl(const NV2AVshProgram *program, unsigned flags,
         "    float4 fog_param;   /* SET_FOG_PARAMS[0], [1] */\n"
         "    uint4  fog_ctl;     /* enable, 0 linear/1 exp/2 exp2, abs, inf/NaN result */\n"
         /* spec_ctl.z: depth test off, so no far-plane clip; .w: W-buffered
-         * depth (epilogue below). */
+         * depth, 1 written by the W variant, 2 as RECOMP_W_EARLYZ's E
+         * (epilogue below), with B in vp_scale.w and B / zmax in
+         * fog_param.w. */
         "    uint4  spec_ctl;    /* x: specular on, y: alpha from material */\n"
         "};\n"
         D3D8_MSL_VOUT_W
@@ -364,6 +366,12 @@ int d3d8_vsh_generate_msl(const NV2AVshProgram *program, unsigned flags,
              * firing on z; w <= 0 is still clipped. */
             "    o.zw = pw;\n"
             "    if (vp.spec_ctl.w != 0u) o.pos.z = 0.5 * o.pos.w;\n"
+            /* RECOMP_W_EARLYZ's fast path, as the HLSL: z/w is E = B / w -
+             * B / zmax (B in vp_scale.w, B / zmax in fog_param.w), no depth
+             * written by the fragment, early-Z kept. One explicit fma, so
+             * every program gives the same E for the same w (the library
+             * builds without fast math, metal_compile.m). */
+            "    if (vp.spec_ctl.w == 2u) o.pos.z = fma(pw, -vp.fog_param.w, vp.vp_scale.w);\n"
             "    {\n"
             "        float fd = oFog.x, ff = 1.0;\n"
             "        if (vp.fog_ctl.x != 0u) {\n"

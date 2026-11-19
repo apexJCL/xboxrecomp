@@ -352,7 +352,9 @@ int d3d8_vsh_generate_hlsl_ex(const NV2AVshProgram *program, unsigned flags,
             "    float4 fog_param;   /* SET_FOG_PARAMS[0], [1] */\n"
             "    uint4  fog_ctl;     /* enable, 0 linear/1 exp/2 exp2, abs, inf/NaN result */\n"
             /* spec_ctl.z: depth test off, so no far-plane clip; .w: W-buffered
-             * depth (epilogue below). */
+             * depth, 1 written by the W variant, 2 as RECOMP_W_EARLYZ's E
+             * (epilogue below), with B in vp_scale.w and B / zmax in
+             * fog_param.w, both 0 otherwise. */
             "    uint4  spec_ctl;    /* x: specular on, y: alpha from material */\n"
             "};\n"
             "\n");
@@ -480,7 +482,18 @@ int d3d8_vsh_generate_hlsl_ex(const NV2AVshProgram *program, unsigned flags,
              * the pixel shader and culls on the clip range there; z/w 0.5
              * keeps the rasteriser's depth clip from firing on z. */
             "    o.oZW = pw;\n"
-            "    if (spec_ctl.w != 0u) o.oPos.z = 0.5 * o.oPos.w;\n");
+            "    if (spec_ctl.w != 0u) o.oPos.z = 0.5 * o.oPos.w;\n"
+            /* RECOMP_W_EARLYZ's fast path (nv2a_w_earlyz_fast): z = B - B w
+             * / zmax with w kept, so z/w is E = B / w - B / zmax, exact per
+             * pixel, the pixel shader writes no depth and early-Z stays on.
+             * One mad on precise, and B / zmax from the CPU: two passes of
+             * one surface, even from two programs, store the same E, or the
+             * second's EQUAL or LEQUAL test fails at random. The MSL does
+             * the same with fma. */
+            "    if (spec_ctl.w == 2u) {\n"
+            "        precise float ez = mad(pw, -fog_param.w, vp_scale.w);\n"
+            "        o.oPos.z = ez;\n"
+            "    }\n");
     } else {
         sb_append(&sb, "    o.oPos = oPos;\n    o.oZW = oPos.w;\n");
     }

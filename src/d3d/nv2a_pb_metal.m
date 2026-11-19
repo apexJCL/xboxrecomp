@@ -232,6 +232,10 @@ typedef struct {
     uint64_t       zconv;      /* wseq ztex holds, 0 none */
     id<MTLTexture> zst;        /* tex's stencil (X32_Stencil8 view) */
     id<MTLTexture> ztex;       /* RGBA8: the Z24S8 bytes as A8R8G8B8 */
+    /* RECOMP_W_EARLYZ: the depth stored as E = B (1/w - 1/zmax), tests
+     * reversed (nv2a_w_earlyz_fast's comment). Set when made and at each
+     * depth clear, from nv2a_w_earlyz_want(), as D3D11's. */
+    int            earlyz;
 } DepthTarget;
 
 /* A post-process chain can draw more than 8 targets a frame (a glow chain
@@ -435,7 +439,9 @@ static void begin_pass(RenderTarget *rt, int clear, const double c[4],
         rp.depthAttachment.texture = dt->tex;
         rp.depthAttachment.storeAction = MTLStoreActionStore;
         rp.depthAttachment.loadAction = zc ? MTLLoadActionClear : MTLLoadActionLoad;
-        rp.depthAttachment.clearDepth = (zmask & 1u) ? z : 1.0;
+        /* a fresh buffer's far plane: 1, or E's far end, 0, in
+         * RECOMP_W_EARLYZ's mode (metal_on_zclear passes z encoded) */
+        rp.depthAttachment.clearDepth = (zmask & 1u) ? z : dt->earlyz ? 0.0 : 1.0;
         rp.stencilAttachment.texture = dt->tex;
         rp.stencilAttachment.storeAction = MTLStoreActionStore;
         rp.stencilAttachment.loadAction = sc ? MTLLoadActionClear : MTLLoadActionLoad;
@@ -698,12 +704,29 @@ static DepthTarget *depth_target(uint32_t w, uint32_t h)
     e->zfmt = (g->format >> 4) & 0xF;
     e->wseq = ++s_zseq;
     e->fresh = 1;
+    e->earlyz = nv2a_w_earlyz_want();   /* begin_pass's fresh clear reads it */
     if (e->hw != w)
         fprintf(stderr, LOGP "zeta 0x%08X: %ux%u depth buffer (%ux%u host)\n",
                 zeta, w, h, e->hw, e->hh);
     else
         fprintf(stderr, LOGP "zeta 0x%08X: %ux%u depth buffer\n", zeta, w, h);
     return e;
+}
+
+/* The earlyz of the depth buffer depth_target(w, h) will give, without
+ * making or evicting one: metal_on_draw picks its fragment function before
+ * it attaches the buffer, and RECOMP_W_EARLYZ's fast path draws with the
+ * stock one. A buffer not made yet will take nv2a_w_earlyz_want(). */
+static int dt_earlyz_peek(uint32_t w, uint32_t h)
+{
+    uint32_t zeta = nv2a_pb_vsh_state()->zeta_offset;
+    int i;
+    for (i = 0; i < DT_MAX; i++) {
+        const DepthTarget *d = &s_dt[i];
+        if (d->tex && d->zeta == zeta && d->w == w && d->h == h)
+            return d->earlyz;
+    }
+    return nv2a_w_earlyz_want();
 }
 
 /* A BGRA8 colour texture of hw x hh host pixels, as every target is made. */
@@ -945,7 +968,7 @@ static RenderTarget *surface(void)
     return free_rt;
 }
 
-static id<MTLDepthStencilState> depth_state(int depth, int stencil);
+static id<MTLDepthStencilState> depth_state(int depth, int stencil, int ez);
 
 /* The partial-clear pipeline for a pass with (dt) or without a depth
  * attachment, made on first use; nil if it cannot be made. */
@@ -1027,7 +1050,7 @@ static void metal_on_clear(uint32_t param)
             sr.height = hb[3] - hb[1];
             [s_enc setRenderPipelineState:pso];
             if (s_enc_dt)
-                [s_enc setDepthStencilState:depth_state(0, 0)];
+                [s_enc setDepthStencilState:depth_state(0, 0, 0)];
             [s_enc setCullMode:MTLCullModeNone];
             [s_enc setViewport:vp];
             [s_enc setScissorRect:sr];
@@ -1059,6 +1082,7 @@ static void metal_on_zclear(uint32_t param)
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
     RenderTarget *rt;
     DepthTarget *dt;
+    float z;
 
     if (!(param & 3u) || !init())
         return;
@@ -1070,8 +1094,15 @@ static void metal_on_zclear(uint32_t param)
         if (!dt)
             return;
         rt->dt = dt;
-        begin_pass(rt, 0, NULL, param & 3u, nv2a_zclear_depth(g->format, v->zclear),
-                   v->zclear & 0xFFu);
+        z = nv2a_zclear_depth(g->format, v->zclear);
+        /* RECOMP_W_EARLYZ, as D3D11's d3d11_on_zclear: each depth clear
+         * decides the buffer's encoding (a stencil-only one keeps it), and
+         * stores E of the clear depth in that mode. */
+        if (param & 1u)
+            dt->earlyz = nv2a_w_earlyz_want();
+        if (dt->earlyz)
+            z = nv2a_w_earlyz_clear(z, nv2a_zmax(g->format), nv2a_w_earlyz_b());
+        begin_pass(rt, 0, NULL, param & 3u, z, v->zclear & 0xFFu);
         if (param & 1u)
             s_zclears++;
     }
@@ -2168,8 +2199,10 @@ static id<MTLFunction> fs_basic(void)
 static int s_fs_comb;
 
 /* fs_select returned the combiners' W variant (nv2a_w_depth_on): the
- * vertex side's W mode (vc.u[7]) and the WDepth buffer go with it, and with
- * nothing else, so a fallback to fs_basic keeps the stock z. */
+ * vertex side's W mode 1 (vc.u[7]) and the WDepth buffer go with it, and with
+ * nothing else, so a fallback to fs_basic keeps the stock z -- or, on a
+ * buffer in RECOMP_W_EARLYZ's mode, takes the vertex E (metal_on_draw's
+ * wz_vs 2). */
 static int s_fs_w;
 
 /* RECOMP_TRACE=tex_mag (nv2a_tex_dump.h): this batch's combiners take the
@@ -2273,15 +2306,18 @@ static id<MTLFunction> fs_select_body(const struct nv2a_pb_vsh *v, int w)
  * As the D3D11 backend's depth_state: SET_DEPTH_FUNC and SET_STENCIL_FUNC
  * are GL compare codes in MTLCompareFunction's order (nv2a_cmp_from_gl), the
  * stencil ops in MTLStencilOperation's (nv2a_stencil_op_from_gl). Depth and
- * stencil each only when enabled; one state per distinct key. */
+ * stencil each only when enabled; one state per distinct key. ez: the
+ * buffer stores RECOMP_W_EARLYZ's E, the test reversed (nv2a_cmp_reverse),
+ * the key holding the reversed code. */
 #define DSS_MAX 64
 static struct { uint64_t key; id<MTLDepthStencilState> dss; } s_dss[DSS_MAX];
 static int s_dss_n;
 
-static id<MTLDepthStencilState> depth_state(int depth, int stencil)
+static id<MTLDepthStencilState> depth_state(int depth, int stencil, int ez)
 {
     const struct nv2a_pb_vsh *v = nv2a_pb_vsh_state();
-    uint32_t f = nv2a_cmp_from_gl(v->depth_func);
+    uint32_t f = ez ? nv2a_cmp_reverse(nv2a_cmp_from_gl(v->depth_func))
+                    : nv2a_cmp_from_gl(v->depth_func);
     uint64_t key = 0;
     MTLDepthStencilDescriptor *dd;
     id<MTLDepthStencilState> st;
@@ -2365,7 +2401,12 @@ static int aspect_trace(void);
  * texture format, a texture starting inside the surface, or a buffer no
  * pass has cleared yet fall back to the guest bytes, said once.
  * RECOMP_METAL_ZTEX=0: off (A/B; depth buffers are then made without
- * ShaderRead, as before). */
+ * ShaderRead, as before).
+ *
+ * A buffer in RECOMP_W_EARLYZ's mode holds E = B (1/w - 1/zmax) instead,
+ * decoded first as D3D11's: w = B / (E + B / zmax), the guest's value
+ * w / zmax. zk = (mode, B, B / zmax, 1 / zmax) at buffer 0, from the
+ * buffer's own earlyz. */
 static RenderTarget s_zt_view[DT_MAX];   /* s_dt[i].ztex as rt_texture serves it */
 static id<MTLComputePipelineState> s_zt_pso;
 static int      s_zt_bad;                /* no compute pipeline: never again */
@@ -2377,11 +2418,14 @@ static const char s_zt_msl[] =
     "kernel void nv2a_zt(depth2d<float, access::read> zd [[texture(0)]],\n"
     "                    texture2d<uint, access::read> zs [[texture(1)]],\n"
     "                    texture2d<float, access::write> o [[texture(2)]],\n"
+    "                    constant float4 &zk [[buffer(0)]],\n"
     "                    uint2 id [[thread_position_in_grid]]) {\n"
     "    if (id.x >= o.get_width() || id.y >= o.get_height()) return;\n"
+    "    float e = saturate(zd.read(id));\n"
+    "    if (zk.x != 0.0f) e = saturate(zk.y / (e + zk.z) * zk.w);\n"
     /* min: 1.0 (the clear) * 16777215 rounds to 2^24 in float, which would
      * carry into a ninth bit and zero the low bytes */
-    "    uint z = min((uint)round(saturate(zd.read(id)) * 16777215.0f), 16777215u);\n"
+    "    uint z = min((uint)round(e * 16777215.0f), 16777215u);\n"
     "    uint s = zs.read(id).r & 255u;\n"
     "    o.write(float4(float((z >> 8) & 255u), float(z & 255u), float(s),\n"
     "                   float(z >> 16)) / 255.0f, id);\n"
@@ -2526,6 +2570,8 @@ static RenderTarget *zt_texture(DepthTarget *d, const Stage *t)
         return NULL;
     if (d->zconv != d->wseq) {
         id<MTLComputeCommandEncoder> c;
+        float zmax = nv2a_zmax(d->zfmt << 4), b = nv2a_w_earlyz_b();
+        float zk[4] = { d->earlyz ? 1.0f : 0.0f, b, b / zmax, 1.0f / zmax };
         end_encoder();
         ensure_cmd();
         c = [s_cmd computeCommandEncoder];
@@ -2533,6 +2579,7 @@ static RenderTarget *zt_texture(DepthTarget *d, const Stage *t)
         [c setTexture:d->tex atIndex:0];
         [c setTexture:d->zst atIndex:1];
         [c setTexture:d->ztex atIndex:2];
+        [c setBytes:zk length:sizeof zk atIndex:0];
         [c dispatchThreadgroups:MTLSizeMake((d->hw + 7u) / 8u, (d->hh + 7u) / 8u, 1)
           threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
         [c endEncoding];
@@ -2798,6 +2845,7 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
     int padded_rt = 0;
     int lift = 0, wide = 0;
     int vary_z = 0;     /* a program's 2D batch off one oPos.z (nv2a_aspect_gate) */
+    int w_on = 0, wz_ez = 0, wz_fast = 0, wz_vs = 0;   /* RECOMP_W_EARLYZ (below) */
     int scan;
     int place = NV2A_PLACE_CENTRE;
     float lo_x = 0, hi_x = 0;   /* hor+: a 2D batch's x range, surface pixels */
@@ -2869,8 +2917,19 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         }
         /* The variant declares the buffer: no buffer, no variant. */
         s_fs_mag = nv2a_tex_mag_on() && d->program && mag_init();
-        ffn = fs_select(v, nv2a_w_depth_on(v, d->program != 0,
-                                           v->rc_set && (v->rc_ctl & 0xFF)));
+        /* RECOMP_W_EARLYZ: the batch's one decision, as d3d11_on_draw's. A
+         * buffer in the mode reverses every depth test; a W batch on it
+         * takes the fast path (vertex E, stock fragment function, depth
+         * clip on) when nv2a_w_earlyz_fast says so, else the W variant
+         * writing E. */
+        w_on = nv2a_w_depth_on(v, d->program != 0, v->rc_set && (v->rc_ctl & 0xFF));
+        wz_ez = v->depth_enable && dt_earlyz_peek(rt->w, rt->h);
+        wz_fast = wz_ez && w_on && nv2a_w_earlyz_fast(v, d->prim);
+        ffn = fs_select(v, w_on && !wz_fast);
+        /* spec_ctl.w: 1 the W variant writes the depth; 2 the vertex z is
+         * E, on the fast path or for a W batch on such a buffer whose W
+         * variant fell back to fs_basic (it still has to store E) */
+        wz_vs = s_fs_w ? 1 : (wz_ez && w_on) ? 2 : 0;
         for (i = 0; i < d->idx_count; i++) {
             if (d->idx[i] < lo) lo = d->idx[i];
             if (d->idx[i] > hi) hi = d->idx[i];
@@ -2992,6 +3051,15 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 rt->dt = dt;
                 if (s_enc_rt == rt)
                     end_encoder();
+            }
+            /* A plain-z depth batch on a buffer in RECOMP_W_EARLYZ's mode
+             * has no fix this frame: the mode goes off from the next depth
+             * clear. */
+            if (dt && wz_ez) {
+                if (w_on)
+                    nv2a_w_earlyz_note(nv2a_zmax(g->format));
+                else
+                    nv2a_w_earlyz_latch();
             }
         }
         /* Textures before the pass: a self copy is a blit between passes. */
@@ -3137,7 +3205,14 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         nv2a_vp_consts_fill(v, g->format, rt->w, rt->h, rt->pad, &vc);
         nv2a_aspect_map(&vc, rt->w, rt->h, rt->pad, place);
         nv2a_vp_tie_fill(&vc, rt->hw, rt->hh);
-        vc.u[7] = s_fs_w ? 1u : 0u;   /* spec_ctl.w: the epilogue's W mode */
+        vc.u[7] = (uint32_t)wz_vs;   /* spec_ctl.w: the epilogue's W mode */
+        if (wz_vs == 2) {
+            /* RECOMP_W_EARLYZ's E = B - B w / zmax: B and B / zmax in the
+             * two spare lanes, vp_scale.w and fog_param.w */
+            float b = nv2a_w_earlyz_b();
+            vc.c[3] = b;
+            vc.c[11] = b / nv2a_zmax(g->format);
+        }
 
         if (!s_enc || s_enc_rt != rt)
             begin_encoder(rt, 0, NULL);
@@ -3148,8 +3223,8 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         }
         [s_enc setRenderPipelineState:pso];
         if (s_enc_dt) {
-            id<MTLDepthStencilState> dss = use_z ? depth_state(v->depth_enable, use_s)
-                                                 : depth_state(0, 0);
+            id<MTLDepthStencilState> dss = use_z ? depth_state(v->depth_enable, use_s, wz_ez)
+                                                 : depth_state(0, 0, 0);
             [s_enc setDepthStencilState:dss];
             [s_enc setStencilReferenceValue:use_s ? (v->stencil_ref & 0xFFu) : 0u];
             if (use_z)
@@ -3193,7 +3268,9 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
                 const char *e = getenv("RECOMP_METAL_W_ZCLIP");
                 keep = e && e[0] == '1';
             }
-            clamp = s_fs_w && !keep;
+            /* RECOMP_W_EARLYZ's vertex E (wz_vs 2) keeps the clip: E outside
+             * [0, 1] is w past zmax or nearer than about B. */
+            clamp = wz_vs == 1 && !keep;
             if (clip_enc != s_enc_serial) {
                 clip_enc = s_enc_serial;
                 clip_set = 0;
@@ -3207,11 +3284,13 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             /* Polygon offset (nv2a_depth_bias); a W batch takes it in its
              * shader instead, the hardware bias not reaching a written
              * depth. A new encoder starts at 0, so a batch without offset
-             * sets nothing. */
+             * sets nothing. Nor does RECOMP_W_EARLYZ's vertex E (wz_vs 2):
+             * the fast path has no offset, and a fallback W batch's is in w
+             * units, which a bias on E cannot give. */
             static uint64_t bias_enc;
             static float bias_set[2];
             float zb = 0.0f, zs = 0.0f;
-            if (!s_fs_w)
+            if (wz_vs == 0)
                 nv2a_depth_bias(v, d->prim, g->format, nv2a_host_render_scale(), &zb, &zs);
             if (bias_enc != s_enc_serial) {
                 bias_enc = s_enc_serial;
@@ -3253,6 +3332,11 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         if (s_fs_w) {
             struct nv2a_wdepth_consts wc;
             nv2a_wdepth_consts_fill(v, d->prim, g->format, nv2a_host_render_scale(), &wc);
+            if (wz_ez) {
+                /* RECOMP_W_EARLYZ, off the fast path: the same E (d3d8_msl.h) */
+                wc.w1[2] = nv2a_w_earlyz_b();
+                wc.w1[3] = 1.0f;
+            }
             [s_enc setFragmentBytes:&wc length:sizeof wc atIndex:1];
         }
         for (k = 0; k < 4; k++) {
