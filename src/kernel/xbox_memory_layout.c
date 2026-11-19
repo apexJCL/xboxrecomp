@@ -897,13 +897,19 @@ static int mmio_fault_va(uintptr_t fault, uint32_t *va)
  * under exactly the conditions in which the same access would fault and be
  * serviced; otherwise (audio off, the model not up yet, an offset the trap
  * does not cover) this is the plain access the generated code made before,
- * at the same width, faulting just as it did. */
+ * at the same width, faulting just as it did.
+ *
+ * The OHCI windows go to the controller model the same way
+ * (xbox_OhciMmioRead/Write): a title's post-generation patch can route a
+ * register-base mov here when it knows the base is a controller's. */
 uint32_t xbox_MmioRead(uint32_t va, int size)
 {
-    uint32_t off = va - MMIO_APU_BASE;
+    uint32_t off = va - MMIO_APU_BASE, v;
 
     if (g_apu_mmio_trapped && off < APU_TRAP_BYTES && g_apu_state)
         return apu_hook_direct_rd(off, size);
+    if (xbox_OhciMmioRead(va, size, &v))
+        return v;
     switch (size) {
     case 1:  return *(volatile uint8_t *)((uintptr_t)va + g_memory_offset);
     case 2:  return *(volatile uint16_t *)((uintptr_t)va + g_memory_offset);
@@ -919,6 +925,8 @@ void xbox_MmioWrite(uint32_t va, uint32_t value, int size)
         apu_hook_direct_wr(off, value, size);
         return;
     }
+    if (xbox_OhciMmioWrite(va, value, size))
+        return;
     switch (size) {
     case 1:  *(volatile uint8_t *)((uintptr_t)va + g_memory_offset) = (uint8_t)value; break;
     case 2:  *(volatile uint16_t *)((uintptr_t)va + g_memory_offset) = (uint16_t)value; break;
