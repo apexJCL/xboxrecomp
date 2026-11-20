@@ -979,6 +979,12 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/kernel/nv2a_backend_common.c | nv2a_batch_filter_ask | memo | local_static | reset | renderer.common | memo keyed by prog_dwords/start, not content; unreachable local |
 | src/kernel/nv2a_backend_common.c | nv2a_depth_bias | logged | local_static | keep | - | log-once guard |
 | src/kernel/nv2a_backend_common.c | nv2a_wdepth_consts_fill | logged | local_static | keep | - | log-once guard |
+| src/kernel/nv2a_backend_common.c | nv2a_w_earlyz_requested | on | local_static | keep | - | env cache (RECOMP_W_EARLYZ) |
+| src/kernel/nv2a_backend_common.c | nv2a_w_earlyz_b | b | local_static | keep | - | env cache (RECOMP_W_EARLYZ_B) |
+| src/kernel/nv2a_backend_common.c | - | s_earlyz_latched_off | file_static | reset | renderer.common | latched off by a plain-z depth draw of this boot |
+| src/kernel/nv2a_backend_common.c | - | s_earlyz_flips | file_static | keep | - | debug flip counter (w_earlyz_alt) |
+| src/kernel/nv2a_backend_common.c | nv2a_w_earlyz_want | alt | local_static | keep | - | env cache (w_earlyz_alt) |
+| src/kernel/nv2a_backend_common.c | nv2a_w_earlyz_note | said | local_static | keep | - | log-once guard |
 
 ### src/kernel/nv2a_backend_common.h
 
@@ -1937,6 +1943,15 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | zt_say | said | local_static | keep | - | log-once guard |
 | src/d3d/nv2a_pb_d3d11.c | zt_on | on | local_static | keep | - | env cache (RECOMP_D3D11_ZTEX) |
 | src/d3d/nv2a_pb_d3d11.c | zt_find | said | local_static | keep | - | log-once guard |
+| src/d3d/nv2a_pb_d3d11.c | - | s_dz_w | file_static | keep | - | stats counter (present_stats) |
+| src/d3d/nv2a_pb_d3d11.c | - | s_dz_zp | file_static | keep | - | stats counter (present_stats) |
+| src/d3d/nv2a_pb_d3d11.c | - | s_dz_z | file_static | keep | - | stats counter (present_stats) |
+| src/d3d/nv2a_pb_d3d11.c | - | s_dz_wfuncs | file_static | keep | - | stats mask (present_stats) |
+| src/d3d/nv2a_pb_d3d11.c | - | s_wz_ez | file_static | keep | - | per-batch W_EARLYZ decision, set at every draw |
+| src/d3d/nv2a_pb_d3d11.c | - | s_wz_vs | file_static | keep | - | per-batch W_EARLYZ decision, set at every draw |
+| src/d3d/nv2a_pb_d3d11.c | - | s_dz_wfast | file_static | keep | - | stats counter (present_stats) |
+| src/d3d/nv2a_pb_d3d11.c | - | s_dz_wslow | file_static | keep | - | stats counter (present_stats) |
+| src/d3d/nv2a_pb_d3d11.c | - | s_zt_cb | file_static | keep | - | depth-as-texture constant buffer object |
 
 ### src/d3d/nv2a_pb_metal.m
 
@@ -2157,6 +2172,9 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_metal.m | metal_on_draw | keep | local_static | keep | - | env cache (RECOMP_METAL_W_ZCLIP) |
 | src/d3d/nv2a_pb_metal.m | metal_on_draw | clip_enc | local_static | keep | - | encoder serial of the last setDepthClipMode; s_enc_serial is monotonic |
 | src/d3d/nv2a_pb_metal.m | metal_on_draw | clip_set | local_static | keep | - | depth clip mode set on clip_enc's encoder |
+| src/d3d/nv2a_pb_metal.m | - | s_prof_ez | file_static | keep | - | profiler: the encoding the profiled flip was cleared in |
+| src/d3d/nv2a_pb_metal.m | - | s_pa_ez_gpu | file_static | keep | - | profiler totals |
+| src/d3d/nv2a_pb_metal.m | - | s_pa_ez_n | file_static | keep | - | profiler totals |
 
 ## Devices: APU, DSP, audio, input, USB, video, platform
 
