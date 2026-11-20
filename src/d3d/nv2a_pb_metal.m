@@ -299,6 +299,11 @@ static int s_prof_ncmd;
 static struct {
     uint64_t n, flip, wait, gpu, hostrb, wb, winrb, winpush, blit, ncmd, hash;
 } s_pa;
+/* RECOMP_W_EARLYZ_ALT's in-run comparison: the GPU time of each flip summed
+ * by the encoding its depth buffer was cleared in (s_prof_ez, set at each
+ * depth clear), so old and new frames of one fight compare at one heat. */
+static int s_prof_ez;
+static uint64_t s_pa_ez_gpu[2], s_pa_ez_n[2];
 
 /* The last committed command buffer: a sync between flips waits for it when
  * nothing is open (a GET_REPORT commit may still be running). */
@@ -1100,6 +1105,7 @@ static void metal_on_zclear(uint32_t param)
          * stores E of the clear depth in that mode. */
         if (param & 1u)
             dt->earlyz = nv2a_w_earlyz_want();
+        s_prof_ez = dt->earlyz;   /* metal_prof: the mode this frame draws in */
         if (dt->earlyz)
             z = nv2a_w_earlyz_clear(z, nv2a_zmax(g->format), nv2a_w_earlyz_b());
         begin_pass(rt, 0, NULL, param & 3u, z, v->zclear & 0xFFu);
@@ -4224,8 +4230,10 @@ static void prof_flip_end(uint64_t t_flip0)
 {
     static uint64_t p_wb, p_ds, p_pa;
     int i;
+    uint64_t g0;
     if (!prof_on())
         return;
+    g0 = s_pa.gpu;
     for (i = 0; i < s_prof_ncmd; i++) {
         id<MTLCommandBuffer> c = s_prof_cmd[i];
         if ([c status] == MTLCommandBufferStatusCompleted) {
@@ -4235,6 +4243,8 @@ static void prof_flip_end(uint64_t t_flip0)
         }
         [c release];
     }
+    s_pa_ez_gpu[s_prof_ez ? 1 : 0] += s_pa.gpu - g0;
+    s_pa_ez_n[s_prof_ez ? 1 : 0]++;
     s_pa.ncmd += (uint64_t)s_prof_ncmd;
     s_prof_ncmd = 0;
     s_pa.flip += prof_now() - t_flip0;
@@ -4251,6 +4261,12 @@ static void prof_flip_end(uint64_t t_flip0)
                 (unsigned long long)(s_writebacks - p_wb),
                 (unsigned long long)(s_decode_syncs - p_ds),
                 (unsigned long long)(s_pitch_alias_binds - p_pa), s_pa.hash / n / 1e6);
+        if (s_pa_ez_n[0] && s_pa_ez_n[1])
+            fprintf(stderr, LOGP "prof w_earlyz: gpu %.3f ms old (%llu flips), %.3f ms early-Z (%llu flips)\n",
+                    s_pa_ez_gpu[0] / (double)s_pa_ez_n[0] / 1e6, (unsigned long long)s_pa_ez_n[0],
+                    s_pa_ez_gpu[1] / (double)s_pa_ez_n[1] / 1e6, (unsigned long long)s_pa_ez_n[1]);
+        memset(s_pa_ez_gpu, 0, sizeof s_pa_ez_gpu);
+        memset(s_pa_ez_n, 0, sizeof s_pa_ez_n);
         p_wb = s_writebacks;
         p_ds = s_decode_syncs;
         p_pa = s_pitch_alias_binds;
