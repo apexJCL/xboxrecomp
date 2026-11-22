@@ -125,6 +125,11 @@ int d3d8_vsh_generate_hlsl_ex(const NV2AVshProgram *program, unsigned flags,
  * clip w (oZW), with polygon offset and the clip range, written as w / zmax.
  * The constants are struct nv2a_wdepth_consts at b1. NaN by its bits, as
  * vkd3d's compiler has no isnan (the vertex fog's test does the same).
+ * wd1.w 1: the buffer is in RECOMP_W_EARLYZ's mode (nv2a_w_earlyz_fast's
+ * comment), and a batch off its fast path writes the same E the fast
+ * batches' vertex z gives, B / w - B / zmax with B in wd1.z, so the two
+ * never mix encodings in one buffer. A uniform branch on a constant: one
+ * text, and one cache entry, serves both modes.
  */
 #define D3D8_HLSL_WDEPTH \
     "cbuffer WDepthCB : register(b1) { float4 wd0; float4 wd1; };\n" \
@@ -143,7 +148,8 @@ int d3d8_vsh_generate_hlsl_ex(const NV2AVshProgram *program, unsigned flags,
     "    if (wkill) discard;\n" \
     "    PS_OUT o;\n" \
     "    o.c = res;\n" \
-    "    o.d = saturate(zv * wd1.x);\n" \
+    "    o.d = wd1.w != 0.0 ? saturate(wd1.z / zv - wd1.z * wd1.x)\n" \
+    "                       : saturate(zv * wd1.x);\n" \
     "    return o;\n"
 
 /**

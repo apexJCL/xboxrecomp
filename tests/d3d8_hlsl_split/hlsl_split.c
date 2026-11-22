@@ -26,8 +26,8 @@
 #define NPROG 400
 #define NCOMB 400
 #define NCASE (2 * NPROG + NCOMB)
-#define EXPECTED_HASH 0x18fe4c08u      /* all cases, one FNV-1a */
-#define EXPECTED_CHARS 7517712u        /* re-recorded: the vertex zw output */
+#define EXPECTED_HASH 0x27d54b89u      /* all cases, one FNV-1a */
+#define EXPECTED_CHARS 7565312u        /* re-recorded: RECOMP_W_EARLYZ's vertex z */
 
 #include "expected.h"   /* s_expect[NCASE], or HLSL_NO_EXPECT */
 #include "dot_cases.h"  /* k_dot_cases, also compiled by d3dcompile_smoke */

@@ -1458,7 +1458,8 @@ void nv2a_depth_bias(const struct nv2a_pb_vsh *v, uint32_t prim, uint32_t surfac
  * w0 = (bias, factor * render scale, clip min, clip max), the bias and
  * factor 0 unless polygon offset applies; w1 = (1 / zmax, 1 to cull outside
  * the clip range or 0 to clamp to it (SET_ZMIN_MAX_CONTROL ZCLAMP_EN), 0,
- * 0). The clip range is [0, zmax] until the title sets one; a title that
+ * 0); a backend sets w1.z = B, w1.w = 1 after the fill on a buffer in
+ * RECOMP_W_EARLYZ's mode (nv2a_w_earlyz_fast's comment). The clip range is [0, zmax] until the title sets one; a title that
  * sets only one end keeps the other's default. */
 struct nv2a_wdepth_consts {
     float w0[4];
@@ -1468,6 +1469,68 @@ struct nv2a_wdepth_consts {
 void nv2a_wdepth_consts_fill(const struct nv2a_pb_vsh *v, uint32_t prim,
                              uint32_t surface_format, unsigned scale,
                              struct nv2a_wdepth_consts *o);
+
+/* RECOMP_W_EARLYZ=1: the W-buffer with early-Z kept on. The W variant's
+ * SV_Depth / [[depth(any)]] turns the host's early-Z and HiZ off for every
+ * W batch: ~10 % of the frame on a Vega 8 at 4K in Kung Fu Chaos, whose
+ * depth draws are all W-buffered. A rasteriser interpolates exactly only
+ * a + b/w in screen space, so the buffer stores
+ *     E(w) = B * (1/w - 1/zmax)
+ * instead of w / zmax: the vertex stage writes z = B - B * w / zmax with
+ * w kept (z/w is E), and the pixel shader is the stock one. E falls as w
+ * grows, so every depth test of a buffer in the mode is reversed
+ * (nv2a_cmp_reverse), its clears store E of the clear depth
+ * (nv2a_w_earlyz_clear), and the GPU's depth clip stays on: w > zmax is
+ * E < 0, and E > 1 is w under B / (1 + B / zmax), about B, where the stock
+ * W path culls w <= 0. With B = 2^-10 the steps of a D32F buffer are finer
+ * than the console's 24-bit W-buffer's over all of [0, zmax].
+ *
+ * The mode is per depth buffer (the backends' DepthTarget.earlyz), set at
+ * each depth clear from nv2a_w_earlyz_want(). A W batch that cannot take the
+ * fast path (polygon offset, a clip range, clamp mode) keeps the W variant,
+ * which writes the same E from its own w (WDepthCB w1.z = B, w1.w = 1). A
+ * plain-z depth batch on a buffer in the mode cannot be fixed for that frame
+ * (it draws with the reversed test): nv2a_w_earlyz_latch turns the mode off
+ * from the next depth clear on, for good. */
+int   nv2a_w_earlyz_requested(void);   /* RECOMP_W_EARLYZ on, W depth allowed */
+float nv2a_w_earlyz_b(void);           /* B: RECOMP_W_EARLYZ_B, default 2^-10 */
+/* What a depth buffer cleared (or made) now takes: requested, not latched. */
+int   nv2a_w_earlyz_want(void);
+/* Each backend's flip: RECOMP_DEBUG=w_earlyz_alt=1 takes the mode on even flips only. */
+void  nv2a_w_earlyz_flip(void);
+/* A plain-z depth batch on a buffer in the mode: off from the next depth
+ * clear, one log line. */
+void  nv2a_w_earlyz_latch(void);
+/* The first batch drawn in the mode: one log line. */
+void  nv2a_w_earlyz_note(float zmax);
+
+/* The fast path's state half: the mode is requested, and the batch has no
+ * polygon offset, the default clip range and ZCLAMP_EN cull, so the GPU's
+ * own clip of E to [0, 1] is the W shader's cull at [0, zmax]. The one
+ * decision a backend takes per batch is this && nv2a_w_depth_on(...) && its
+ * depth buffer's earlyz; that decision alone picks the vertex z, the depth
+ * clip, the pixel shader and the test. A title-set clip max counts as the
+ * default only at 16777215 (Z24's zmax): this has no surface format, and a
+ * Z16 title's 65535 then takes the W variant, which is exact, only slower. */
+int nv2a_w_earlyz_fast(const struct nv2a_pb_vsh *v, uint32_t prim);
+
+/* A depth compare code (nv2a_cmp_from_gl: 0 NEVER .. 7 ALWAYS) for a buffer
+ * that stores E: LESS <-> GREATER, LEQUAL <-> GEQUAL; NEVER, EQUAL,
+ * NOTEQUAL and ALWAYS keep. */
+static inline uint32_t nv2a_cmp_reverse(uint32_t f)
+{
+    switch (f & 7u) {
+    case 1u: return 4u;
+    case 4u: return 1u;
+    case 3u: return 6u;
+    case 6u: return 3u;
+    default: return f & 7u;
+    }
+}
+
+/* A depth clear's value in a buffer in the mode: E(c * zmax), c the
+ * normalised clear depth (nv2a_zclear_depth). c <= 0 is the near end, 1. */
+float nv2a_w_earlyz_clear(float c, float zmax, float B);
 
 /* ------------------------------------------------------------------------ */
 /* Visibility-test reports (GET_REPORT)                                      */

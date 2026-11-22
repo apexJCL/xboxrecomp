@@ -135,6 +135,8 @@ extern "C" {
     X(FILE_APC_DEFER,    CONFIG, "RECOMP_FILE_APC_DEFER",    NULL, "1: run a file I/O APC at the issuing thread's next alertable wait, as the kernel does; 0: inside the request (inline); default inline unless the title calls xbox_SetDeferredIoApc") \
     X(GUEST_LOCK,        CONFIG, "RECOMP_GUEST_LOCK",        NULL, "1: one guest thread runs guest code at a time, released in kernel calls (upstream, default off)") \
     X(DISPATCH_GATE,     CONFIG, "RECOMP_DISPATCH_GATE",     NULL, "1: the one-CPU DISPATCH gate: device interrupts are posted to the holder and run at its safe points, and queued DPCs run on the guest thread at its raise and release (default off)") \
+    X(W_EARLYZ,          CONFIG, "RECOMP_W_EARLYZ",          NULL, "=1: W-buffer stored as B(1/w - 1/zmax) with reversed depth tests, so early-Z stays on; for titles whose depth draws are all W-buffered (D3D11 and Metal; default off)") \
+    X(W_EARLYZ_B,        CONFIG, "RECOMP_W_EARLYZ_B",        NULL, "=float: RECOMP_W_EARLYZ's scale B; a W draw nearer than about w = B is clipped (default 2^-10 = 0.0009765625)") \
     X(FLIP_PACING,       CONFIG, "RECOMP_FLIP_PACING",       NULL, "1: the walker and the KickOff ack hold after a flip until the guest vblank reaches the swap's interval, and a frame counter the title moves itself is left to it; edge: D3D's rule, a late frame waits for the next vblank; 0 off; unset is off (a FLIP_STALL completes at once and registered frame counters are bumped on every flip), except in the deterministic mode (RECOMP_DETERMINISTIC), where it is on") \
     X(GUEST_CPUS,        CONFIG, "RECOMP_GUEST_CPUS",        NULL, "one: the title's threads on one host core, as on the console; n: that core; unset or all: every core (default)") \
     X(CPUID_NO_SIMD,     CONFIG, "RECOMP_CPUID_NO_SIMD",     NULL, "1: cpuid hides MMX, FXSR and SSE, for a title whose SIMD paths do not lift correctly (default: reported, as on the console's P3)") \
@@ -239,6 +241,7 @@ extern "C" {
     X(PB_MLOG,           DEBUG, "pb_mlog",         NULL,                       "=flip: every method of that flip (subchannel, method, parameter) to stderr as [MLOG]") \
     X(PB_MERGE,          DEBUG, "pb_merge",        NULL,                       "=0: draw every guest batch on its own, no merging of back-to-back triangle batches on a GPU backend") \
     X(FAST_KICK,         DEBUG, "fast_kick",       "RECOMP_FAST_KICK",         "=0: ack loop ticks at Sleep(1)") \
+    X(W_EARLYZ_ALT,      DEBUG, "w_earlyz_alt",    "RECOMP_W_EARLYZ_ALT",      "=1: RECOMP_W_EARLYZ on every other flip (taken at each depth clear), for an in-run parity test on a still scene") \
     X(KICK_EVENT,        DEBUG, "kick_event",      NULL,                       "=1: the ack loop sleeps until the guest pokes it instead of polling the KickOff every ~50 us (default off)") \
     X(RUN_AHEAD,         DEBUG, "run_ahead",       NULL,                       "=N: the walker publishes GET as it walks and acks the KickOff flush with up to N segments (1 for any other value but 0) submitted past its walk; D3D's notify NOPs raise the PGRAPH interrupt (default off; docs/env.md)") \
     X(KICK_NAP,          DEBUG, "kick_nap",        NULL,                       "=hybrid|timer|delay|spin: how the ack loop naps between its ~50 us polls (docs/env.md)") \
