@@ -1928,6 +1928,15 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_d3d11.c | - | s_mag_state | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
 | src/d3d/nv2a_pb_d3d11.c | - | s_mag_hash | file_static | keep | - | the tex_mag trace and the dump's facts, debug figures keyed by content hash |
 | src/d3d/nv2a_pb_d3d11.c | - | s_mag_scale | file_static | keep | - | the tex_mag trace, a debug figure keyed by content hash |
+| src/d3d/nv2a_pb_d3d11.c | - | s_rs_wd | file_static | keep | - | rasterizer states without depth clip, for W batches |
+| src/d3d/nv2a_pb_d3d11.c | rasterizer_state | keep | local_static | keep | - | env cache (RECOMP_D3D11_W_ZCLIP) |
+| src/d3d/nv2a_pb_d3d11.c | - | s_zt_cs | file_static | keep | - | depth-as-texture compute shader object |
+| src/d3d/nv2a_pb_d3d11.c | - | s_zt_bad | file_static | keep | - | depth-as-texture shader failed to build, host |
+| src/d3d/nv2a_pb_d3d11.c | - | s_zt_converts | file_static | keep | - | stats counter |
+| src/d3d/nv2a_pb_d3d11.c | - | s_zt_binds | file_static | keep | - | stats counter |
+| src/d3d/nv2a_pb_d3d11.c | zt_say | said | local_static | keep | - | log-once guard |
+| src/d3d/nv2a_pb_d3d11.c | zt_on | on | local_static | keep | - | env cache (RECOMP_D3D11_ZTEX) |
+| src/d3d/nv2a_pb_d3d11.c | zt_find | said | local_static | keep | - | log-once guard |
 
 ### src/d3d/nv2a_pb_metal.m
 
@@ -2135,6 +2144,19 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/d3d/nv2a_pb_metal.m | - | s_tex_last | file_static | keep | - | the entry tex_bind just bound, set again on each bind |
 | src/d3d/nv2a_pb_metal.m | - | s_stage_pack | file_static | keep | - | the entry each stage just bound, set again on each draw |
 | src/d3d/nv2a_pb_metal.m | - | s_stage_hash | file_static | keep | - | the entry each stage just bound, set again on each draw |
+| src/d3d/nv2a_pb_metal.m | - | s_zseq | file_static | keep | - | monotonic colour/depth write order; only compared between live targets |
+| src/d3d/nv2a_pb_metal.m | - | s_zt_view | file_static | reset | renderer.metal | views of s_dt's depth textures; drop with s_dt |
+| src/d3d/nv2a_pb_metal.m | - | s_zt_pso | file_static | keep | - | depth-as-texture compute pipeline |
+| src/d3d/nv2a_pb_metal.m | - | s_zt_bad | file_static | keep | - | depth-as-texture pipeline failed to build, host |
+| src/d3d/nv2a_pb_metal.m | - | s_zt_converts | file_static | keep | - | stats counter |
+| src/d3d/nv2a_pb_metal.m | - | s_zt_binds | file_static | keep | - | stats counter |
+| src/d3d/nv2a_pb_metal.m | zt_on | on | local_static | keep | - | env cache (RECOMP_METAL_ZTEX) |
+| src/d3d/nv2a_pb_metal.m | zt_say | said | local_static | keep | - | log-once guard |
+| src/d3d/nv2a_pb_metal.m | zt_find | said | local_static | keep | - | log-once guard |
+| src/d3d/nv2a_pb_metal.m | zt_make | said | local_static | keep | - | log-once guard |
+| src/d3d/nv2a_pb_metal.m | metal_on_draw | keep | local_static | keep | - | env cache (RECOMP_METAL_W_ZCLIP) |
+| src/d3d/nv2a_pb_metal.m | metal_on_draw | clip_enc | local_static | keep | - | encoder serial of the last setDepthClipMode; s_enc_serial is monotonic |
+| src/d3d/nv2a_pb_metal.m | metal_on_draw | clip_set | local_static | keep | - | depth clip mode set on clip_enc's encoder |
 
 ## Devices: APU, DSP, audio, input, USB, video, platform
 

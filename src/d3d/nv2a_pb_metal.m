@@ -221,6 +221,17 @@ typedef struct {
     id<MTLTexture> tex;
     uint64_t       last_use;
     int            fresh;      /* contents undefined: the next pass clears */
+    /* Sampled as a texture (zt_texture): where it lies, how it was drawn,
+     * and its depth as the guest's bytes, converted on the GPU. */
+    uint32_t       addr;       /* zeta resolved to a guest address */
+    uint32_t       cpitch;     /* the colour pitch it was drawn with */
+    uint32_t       zfmt;       /* SET_SURFACE_FORMAT zeta field: 1 Z16, 2 Z24S8 */
+    uint32_t       use_flip;   /* s_presents at its last use */
+    uint64_t       wseq;       /* s_zseq at its last depth or stencil write */
+    uint64_t       mseq;       /* s_zseq of the last other write over its memory */
+    uint64_t       zconv;      /* wseq ztex holds, 0 none */
+    id<MTLTexture> zst;        /* tex's stencil (X32_Stencil8 view) */
+    id<MTLTexture> ztex;       /* RGBA8: the Z24S8 bytes as A8R8G8B8 */
 } DepthTarget;
 
 /* A post-process chain can draw more than 8 targets a frame (a glow chain
@@ -247,8 +258,12 @@ typedef struct {
     uint32_t       bar_flip[2]; /* hor+ band bars per third (nv2a_aspect_bar_mark) */
     int            copy;       /* made by a 2D blit (metal_on_blit), not drawn since */
     uint32_t       copy_flip;  /* the flip of the blit that last filled it */
+    uint64_t       zseq;       /* s_zseq at its last pass, draw or blit fill (zt_find) */
 } RenderTarget;
 
+/* The order of colour and depth writes, for a depth surface sampled as a
+ * texture (zt_find): whichever wrote its memory last is what it holds. */
+static uint64_t      s_zseq;
 static RenderTarget  s_rt[RT_MAX];
 static RenderTarget *s_enc_rt;   /* the target s_enc draws into */
 static DepthTarget  *s_enc_dt;   /* and its depth attachment, or NULL */
@@ -412,8 +427,11 @@ static void begin_pass(RenderTarget *rt, int clear, const double c[4],
     } else {
         rp.colorAttachments[0].loadAction = MTLLoadActionLoad;
     }
+    rt->zseq = ++s_zseq;
     if (dt) {
         int zc = (zmask & 1u) || dt->fresh, sc = (zmask & 2u) || dt->fresh;
+        if (zc || sc)
+            dt->wseq = ++s_zseq;   /* cleared: see zt_texture */
         rp.depthAttachment.texture = dt->tex;
         rp.depthAttachment.storeAction = MTLStoreActionStore;
         rp.depthAttachment.loadAction = zc ? MTLLoadActionClear : MTLLoadActionLoad;
@@ -601,8 +619,33 @@ static void rt_free(RenderTarget *rt)
 
 /* The depth buffer for the zeta surface now set, at w x h; made on first
  * use (fresh), the least recently used one giving way when all are taken. */
+static int zt_on(void);   /* depth surfaces as textures, below rt_texture */
+
+/* A depth buffer's textures released, its slot zeroed. */
+static void dt_free(DepthTarget *d)
+{
+    [d->ztex release];
+    [d->zst release];
+    [d->tex release];
+    memset(d, 0, sizeof *d);
+}
+
+/* Another write over guest memory at [addr, addr + bytes), at seq: a depth
+ * surface there no longer holds what the memory reads (zt_find), unless it
+ * is written again after it. */
+static void dt_mem_written(uint32_t addr, uint32_t bytes, uint64_t seq)
+{
+    int i;
+    for (i = 0; i < DT_MAX; i++) {
+        DepthTarget *d = &s_dt[i];
+        if (d->tex && seq > d->mseq && nv2a_rt_overlap(d->addr, d->cpitch * d->h, addr, bytes))
+            d->mseq = seq;
+    }
+}
+
 static DepthTarget *depth_target(uint32_t w, uint32_t h)
 {
+    const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     uint32_t zeta = nv2a_pb_vsh_state()->zeta_offset;
     DepthTarget *e = NULL, *lru = &s_dt[0];
     MTLTextureDescriptor *td;
@@ -612,6 +655,9 @@ static DepthTarget *depth_target(uint32_t w, uint32_t h)
         DepthTarget *d = &s_dt[i];
         if (d->tex && d->zeta == zeta && d->w == w && d->h == h) {
             d->last_use = s_tick;
+            d->use_flip = (uint32_t)s_presents;
+            d->cpitch = g->pitch;
+            d->zfmt = (g->format >> 4) & 0xF;
             return d;
         }
         if (!d->tex && !e)
@@ -626,8 +672,7 @@ static DepthTarget *depth_target(uint32_t w, uint32_t h)
         for (i = 0; i < RT_MAX; i++)
             if (s_rt[i].dt == e)
                 s_rt[i].dt = NULL;
-        [e->tex release];
-        memset(e, 0, sizeof *e);
+        dt_free(e);
     }
     e->pad = nv2a_host_pad(w, h);
     e->n = nv2a_host_size(w + 2u * e->pad, h, nv2a_host_render_scale(), METAL_MAX_DIM,
@@ -635,14 +680,23 @@ static DepthTarget *depth_target(uint32_t w, uint32_t h)
     td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float_Stencil8
                                                             width:e->hw height:e->hh mipmapped:NO];
     td.usage = MTLTextureUsageRenderTarget;
+    /* Read by zt_texture's compute pass: the depth as it is, the stencil
+     * through an X32_Stencil8 view. */
+    if (zt_on())
+        td.usage |= MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
     td.storageMode = MTLStorageModePrivate;
     e->tex = [s_dev newTextureWithDescriptor:td];
     if (!e->tex)
         return NULL;
     e->zeta = zeta;
+    e->addr = nv2a_pb_dma_resolve(zeta);
     e->w = w;
     e->h = h;
     e->last_use = s_tick;
+    e->use_flip = (uint32_t)s_presents;
+    e->cpitch = g->pitch;
+    e->zfmt = (g->format >> 4) & 0xF;
+    e->wseq = ++s_zseq;
     e->fresh = 1;
     if (e->hw != w)
         fprintf(stderr, LOGP "zeta 0x%08X: %ux%u depth buffer (%ux%u host)\n",
@@ -991,6 +1045,7 @@ static void metal_on_clear(uint32_t param)
             if (s_occ_slot >= 0)
                 end_encoder();
         }
+        rt->zseq = ++s_zseq;   /* zt_find */
         s_partial_clears++;
     }
 }
@@ -2287,16 +2342,243 @@ static RenderTarget s_self;   /* tex, w, h: the copy; offset: whose */
 
 static int aspect_trace(void);
 
+/* ---- depth surfaces as textures ---------------------------------------------
+ *
+ * A stage whose texture lies where a depth surface this backend draws into
+ * starts reads that surface's depth, as the console's memory holds it, as
+ * the D3D11 backend's zt_texture. Kung Fu Chaos's sci-fi stage draws its
+ * ground haze twice: once with depth func ALWAYS and colour writes off (the
+ * haze's own depth into the W-buffer), then again sampling the zeta surface
+ * as a 640x480 A8R8G8B8 rect texture, the Z24S8 bytes taken as colour, to
+ * fade the haze by the distance between the two. The depth lives only in the
+ * Depth32Float_Stencil8 buffer here, the guest bytes are never written, and
+ * the haze came out opaque over the street. A compute pass between passes
+ * (textures are bound before the batch's pass, as the self copy's blit)
+ * writes the guest's bytes into an RGBA8 texture the size of the depth's
+ * host buffer, render.scale and hor+ pads included, served as a colour
+ * target is. Converted again only after a write.
+ *
+ * The depth holds the NV2A's 24-bit value over 0xFFFFFF in both modes (the
+ * W-buffer's w / zmax, the z-buffer's normalised z), and Z24S8 is the dword
+ * (z << 8) | stencil: read as A8R8G8B8, B is the stencil, G z's low byte, R
+ * its middle one, A its top one. Z16, a float zeta, a swizzled or another
+ * texture format, a texture starting inside the surface, or a buffer no
+ * pass has cleared yet fall back to the guest bytes, said once.
+ * RECOMP_METAL_ZTEX=0: off (A/B; depth buffers are then made without
+ * ShaderRead, as before). */
+static RenderTarget s_zt_view[DT_MAX];   /* s_dt[i].ztex as rt_texture serves it */
+static id<MTLComputePipelineState> s_zt_pso;
+static int      s_zt_bad;                /* no compute pipeline: never again */
+static uint64_t s_zt_converts, s_zt_binds;
+
+static const char s_zt_msl[] =
+    "#include <metal_stdlib>\n"
+    "using namespace metal;\n"
+    "kernel void nv2a_zt(depth2d<float, access::read> zd [[texture(0)]],\n"
+    "                    texture2d<uint, access::read> zs [[texture(1)]],\n"
+    "                    texture2d<float, access::write> o [[texture(2)]],\n"
+    "                    uint2 id [[thread_position_in_grid]]) {\n"
+    "    if (id.x >= o.get_width() || id.y >= o.get_height()) return;\n"
+    /* min: 1.0 (the clear) * 16777215 rounds to 2^24 in float, which would
+     * carry into a ninth bit and zero the low bytes */
+    "    uint z = min((uint)round(saturate(zd.read(id)) * 16777215.0f), 16777215u);\n"
+    "    uint s = zs.read(id).r & 255u;\n"
+    "    o.write(float4(float((z >> 8) & 255u), float(z & 255u), float(s),\n"
+    "                   float(z >> 16)) / 255.0f, id);\n"
+    "}\n";
+
+static int zt_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_METAL_ZTEX");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+static void zt_say(const DepthTarget *d, const Stage *t, const char *why)
+{
+    static int said;
+    if (said++ < 6)
+        fprintf(stderr, LOGP "zeta 0x%08X sampled as a texture (format 0x%02X, %ux%u, pitch %u):"
+                " %s; it reads guest memory\n", d->zeta, nv2a_tex_linear_twin(t->color),
+                t->width, t->height, t->pitch, why);
+}
+
+/* The depth surface a texture reads, if its bytes are the depth's: one in
+ * use within the last 2 flips (a surface left in s_dt after the title moved
+ * on is not what the memory holds), written since anything else wrote over
+ * its memory (a 2D blit in guest memory, a target written back there), and
+ * since any colour target at its address was drawn or filled by a blit --
+ * the title's match copies frames to its menus' background address, which
+ * is also a zeta surface; whichever wrote last is the memory's. */
+static DepthTarget *zt_find(const Stage *t)
+{
+    int i, k;
+    if (!zt_on() || s_zt_bad || !t->offset)
+        return NULL;
+    for (i = 0; i < DT_MAX; i++) {
+        DepthTarget *d = &s_dt[i];
+        if (!d->tex || s_presents - d->use_flip > 2
+                || !nv2a_rt_overlap(d->addr, d->cpitch * d->h, t->offset, 1))
+            continue;
+        if (d->mseq > d->wseq)
+            continue;   /* written over in memory after its last depth write */
+        /* Only a texture at its first byte (as D3D11's zt_find). */
+        if ((d->addr ^ t->offset) & 0x07FFFFFFu) {
+            uint32_t lin = nv2a_tex_linear_twin(t->color);
+            if ((lin == 0x12 || lin == 0x1E) && !d3d8_format_is_swizzled(t->color))
+                zt_say(d, t, "the texture starts inside the surface");
+            continue;
+        }
+        for (k = 0; k < RT_MAX; k++) {
+            const RenderTarget *rt = &s_rt[k];
+            if (!rt->tex || ((rt->addr ^ d->addr) & 0x07FFFFFFu) || rt->zseq <= d->wseq)
+                continue;
+            {
+                static int said;
+                if (said++ < 4)
+                    fprintf(stderr, LOGP "texture 0x%08X: surface 0x%08X (seq %llu) and zeta"
+                            " 0x%08X (seq %llu) both there, the colour target wins"
+                            " (flip %llu)\n", t->offset, rt->offset,
+                            (unsigned long long)rt->zseq, d->zeta,
+                            (unsigned long long)d->wseq, (unsigned long long)s_presents);
+            }
+            break;
+        }
+        if (k < RT_MAX)
+            continue;
+        return d;
+    }
+    return NULL;
+}
+
+static int zt_make(DepthTarget *d)
+{
+    MTLTextureDescriptor *td;
+
+    if (!s_zt_pso) {
+        NSError *err = nil;
+        id<MTLLibrary> lib = metal_compile_library(s_dev, [NSString stringWithUTF8String:s_zt_msl],
+                                                   "nv2a_zt", &err);
+        id<MTLFunction> fn = lib ? [lib newFunctionWithName:@"nv2a_zt"] : nil;
+        if (fn)
+            s_zt_pso = [s_dev newComputePipelineStateWithFunction:fn error:&err];
+        [fn release];
+        [lib release];
+        if (!s_zt_pso) {
+            s_zt_bad = 1;
+            fprintf(stderr, LOGP "no compute pipeline for depth surfaces (%s): one sampled"
+                    " as a texture reads guest memory\n",
+                    err ? [[err localizedDescription] UTF8String] : "?");
+            return 0;
+        }
+    }
+    if (!d->zst) {
+        /* The stencil half: a view of the same texture (ShaderRead and
+         * PixelFormatView were asked for at depth_target). */
+        d->zst = [d->tex newTextureViewWithPixelFormat:MTLPixelFormatX32_Stencil8];
+        if (!d->zst) {
+            static int said;
+            if (!said++)
+                fprintf(stderr, LOGP "zeta 0x%08X: no stencil view of its depth buffer: a depth"
+                        " surface sampled as a texture reads guest memory\n", d->zeta);
+            return 0;
+        }
+    }
+    if (d->ztex)
+        return 1;
+    td = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                            width:d->hw height:d->hh mipmapped:NO];
+    td.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+    td.storageMode = MTLStorageModePrivate;
+    d->ztex = [s_dev newTextureWithDescriptor:td];
+    return d->ztex != nil;
+}
+
+/* d's depth, as it stands before the batch being set up draws, as the
+ * texture t reads it; NULL to decode guest memory as before. Ends the open
+ * pass when it converts: the draw opens a new one (Load). */
+static RenderTarget *zt_texture(DepthTarget *d, const Stage *t)
+{
+    uint32_t lin = nv2a_tex_linear_twin(t->color);
+    RenderTarget *r = &s_zt_view[d - s_dt];
+
+    if (d->zfmt != 2) {
+        zt_say(d, t, "a Z16 surface (not converted)");
+        return NULL;
+    }
+    if (nv2a_pb_vsh_state()->control0 & 0x1000u) {
+        zt_say(d, t, "a float depth format (not converted)");
+        return NULL;
+    }
+    if ((lin != 0x12 && lin != 0x1E) || d3d8_format_is_swizzled(t->color)
+            || t->pitch != d->cpitch || t->width > d->w || t->height > d->h) {
+        zt_say(d, t, "not a linear 32-bit colour texture of its layout");
+        return NULL;
+    }
+    if (d->fresh) {
+        zt_say(d, t, "no pass has cleared the buffer yet");
+        return NULL;
+    }
+    if (!zt_make(d))
+        return NULL;
+    if (d->zconv != d->wseq) {
+        id<MTLComputeCommandEncoder> c;
+        end_encoder();
+        ensure_cmd();
+        c = [s_cmd computeCommandEncoder];
+        [c setComputePipelineState:s_zt_pso];
+        [c setTexture:d->tex atIndex:0];
+        [c setTexture:d->zst atIndex:1];
+        [c setTexture:d->ztex atIndex:2];
+        [c dispatchThreadgroups:MTLSizeMake((d->hw + 7u) / 8u, (d->hh + 7u) / 8u, 1)
+          threadsPerThreadgroup:MTLSizeMake(8, 8, 1)];
+        [c endEncoding];
+        d->zconv = d->wseq;
+        if (s_zt_converts++ == 0)
+            fprintf(stderr, LOGP "zeta 0x%08X sampled as a texture (format 0x%02X, %ux%u):"
+                    " its depth converted on the GPU (flip %llu)\n", d->zeta, lin,
+                    t->width, t->height, (unsigned long long)s_presents);
+    }
+    /* What the draw, the hor+ placement and the trace read of a render
+     * target. Never written back, freed or drawn into: it is no s_rt. */
+    memset(r, 0, sizeof *r);
+    r->offset = d->zeta;
+    r->addr = d->addr;
+    r->w = d->w;
+    r->h = d->h;
+    r->hw = d->hw;
+    r->hh = d->hh;
+    r->pad = d->pad;
+    r->n = d->n;
+    r->tex = d->ztex;
+    r->pitch = d->cpitch;
+    r->last_use = s_tick;
+    s_zt_binds++;
+    return r;
+}
+
 static RenderTarget *rt_texture(const Stage *t, RenderTarget *cur)
 {
     static int off = -1;
     RenderTarget *self = NULL;
+    DepthTarget *zd;
     int i;
 
     if (off < 0)
         off = recomp_env(RENV_METAL_NO_RTT) != NULL;
     if (off || !t->offset)
         return NULL;
+    /* The depth first: a colour target at its address drawn later wins
+     * there (zt_find), else the depth is what the memory holds. */
+    zd = zt_find(t);
+    if (zd) {
+        RenderTarget *z = zt_texture(zd, t);
+        if (z)
+            return z;
+    }
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
         if (!rt->tex || ((rt->addr ^ t->offset) & 0x07FFFFFFu))
@@ -2895,6 +3177,33 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
         [s_enc setCullMode:cull == 1 ? MTLCullModeBack
                          : cull == 2 ? MTLCullModeFront : MTLCullModeNone];
         {
+            /* A W batch: the depth tested and stored is the pixel's w (the W
+             * variant writes it), so the program's z means nothing here, and
+             * clipping on it threw away whatever it put past 1 (Kung Fu
+             * Chaos's street under the flying saucer, as on D3D11). xemu
+             * turns the GPU's depth clipping off and clips or clamps the
+             * depth per pixel instead; the W shader's clip range is that.
+             * Clamp rather than clip, per encoder as the bias (a new one
+             * starts at clip). RECOMP_METAL_W_ZCLIP=1: clip as before (A/B). */
+            static int keep = -1;
+            static uint64_t clip_enc;
+            static int clip_set;
+            int clamp;
+            if (keep < 0) {
+                const char *e = getenv("RECOMP_METAL_W_ZCLIP");
+                keep = e && e[0] == '1';
+            }
+            clamp = s_fs_w && !keep;
+            if (clip_enc != s_enc_serial) {
+                clip_enc = s_enc_serial;
+                clip_set = 0;
+            }
+            if (clamp != clip_set) {
+                [s_enc setDepthClipMode:clamp ? MTLDepthClipModeClamp : MTLDepthClipModeClip];
+                clip_set = clamp;
+            }
+        }
+        {
             /* Polygon offset (nv2a_depth_bias); a W batch takes it in its
              * shader instead, the hardware bias not reaching a written
              * depth. A new encoder starts at 0, so a batch without offset
@@ -2967,6 +3276,12 @@ static void metal_on_draw(const struct nv2a_pb_draw *d)
             mag_pretransformed(vf, nf4, slot, idx, nidx);
         [s_enc drawIndexedPrimitives:ptype indexCount:nidx indexType:MTLIndexTypeUInt32
                          indexBuffer:s_ib indexBufferOffset:ib_off];
+        /* After the draw: a later batch sampling this depth converts again,
+         * this one converted what came before it (zt_texture). */
+        rt->zseq = ++s_zseq;
+        if (s_enc_dt && ((v->depth_enable && v->depth_mask)
+                         || (use_s && (v->stencil_wmask & 0xFFu))))
+            s_enc_dt->wseq = ++s_zseq;
         s_draws += d->batches;
     }
 }
@@ -3201,6 +3516,8 @@ static void rt_sync(RenderTarget *rt, uint32_t pitch)
             write_back(rt, rt->addr, pitch);
         else if ((px = host_readback(rt)) != NULL)
             write_back_scaled(rt, px, rt->addr, pitch);
+        /* The memory holds these pixels now, as of their last write. */
+        dt_mem_written(rt->addr, pitch * rt->h, rt->zseq);
         rt->dirty = 0;
         rt_own_reset(rt);
     }
@@ -4176,6 +4493,9 @@ static void metal_flip(uint32_t surface_offset, uint32_t pitch)
         fprintf(stderr, LOGP "present #%llu: 2D blits %llu target copies, %llu in guest"
                 " memory\n", (unsigned long long)s_presents, (unsigned long long)s_blits_gpu,
                 (unsigned long long)s_blits_guest);
+    if (s_zt_binds && (s_presents % 300) == 0)
+        fprintf(stderr, LOGP "depth surfaces as textures: %llu binds, %llu conversions\n",
+                (unsigned long long)s_zt_binds, (unsigned long long)s_zt_converts);
     if (!always && rt && addr && pitch)
         guard_flip(addr, pitch * rt->h);
     if (!pitch || !addr || layer) {
@@ -4260,8 +4580,7 @@ static void scale_drop(void)
                 continue;
             if (s_enc_dt == d)
                 end_encoder();
-            [d->tex release];
-            memset(d, 0, sizeof *d);
+            dt_free(d);
         }
     }
     /* Queries issued at the old scale are read at it: a count taken at 2x
@@ -4409,6 +4728,8 @@ static int blit_gpu(const struct nv2a_pb_blit *b, RenderTarget *src)
     s_tick++;
     dst->last_use = s_tick;
     dst->dirty = 1;   /* the copy is on the GPU only: an eviction writes it back */
+    dst->zseq = ++s_zseq;
+    dt_mem_written(dst->addr, dst->pitch * dst->h, dst->zseq);   /* zt_find */
     dst->copy = 1;
     dst->copy_flip = (uint32_t)s_presents;
     rt_own_reset(dst);
@@ -4446,6 +4767,7 @@ static void metal_on_blit(const struct nv2a_pb_blit *b)
         }
         nv2a_pb_blit_guest(b);
         tex_cache_stale(b->dst, (uint32_t)span);
+        dt_mem_written(b->dst, (uint32_t)span, ++s_zseq);   /* zt_find */
         s_blits_guest++;
         {
             static int said;
