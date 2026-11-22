@@ -193,6 +193,9 @@ static UINT                    s_ib_size, s_ib_pos;
  * s_rs_sc are the same with the scissor on: every draw's, whose scissor is
  * the surface clip (nv2a_draw_box). */
 static ID3D11RasterizerState  *s_rs[3][2], *s_rs_sc[3][2];
+/* The same with the scissor on and depth clipping off, for W-buffered
+ * batches: see rasterizer_state(). */
+static ID3D11RasterizerState  *s_rs_wd[3][2];
 static ID3D11DepthStencilState *s_ds_off;
 static ID3D11PixelShader      *s_ps;
 
@@ -226,6 +229,8 @@ _Static_assert(sizeof(PsConsts) == sizeof(NV2APSConstants),
 
 /* PS_CB_DECL (nv2a_basic_hlsl.h) is that layout in HLSL. */
 static uint64_t s_presents, s_clears, s_draws, s_draws_skipped;
+/* Draws RECOMP_DOF_SKIP dropped: a depth-of-field repaint (d3d11_on_draw). */
+static uint64_t s_dof_skipped;
 /* Draws dropped because CULL_FACE was FRONT_AND_BACK (D3D11 has no such
  * mode); counted apart from s_draws_skipped, which means "could not draw". */
 static uint64_t s_draws_culled;
@@ -727,6 +732,9 @@ static int init(void)
                 ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs[c][f]);
                 rd.ScissorEnable = TRUE;
                 ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs_sc[c][f]);
+                rd.DepthClipEnable = FALSE;
+                ID3D11Device_CreateRasterizerState(s_dev, &rd, &s_rs_wd[c][f]);
+                rd.DepthClipEnable = TRUE;
             }
     }
     {
@@ -767,6 +775,8 @@ static int init(void)
  * (rt_texture) differently: a target made, grown, released or given another
  * format. setup_pixel's stage memo keys on it. */
 static uint32_t s_rt_gen;
+
+static int blit_write_back(RenderTarget *rt, uint32_t x, uint32_t y, uint32_t w, uint32_t h);
 
 static void rt_release(RenderTarget *rt)
 {
@@ -975,12 +985,19 @@ static RenderTarget *surface(void)
     }
     if (!free_rt) {
         free_rt = lru;
-        /* Nothing is written back: a target drawn into loses its pixels. */
-        if (free_rt->last_draw && s_evict_lost++ < 20)
+        /* What was drawn goes to guest memory first, as Metal's eviction: a
+         * later pass that samples this surface decodes it from there. Kung Fu
+         * Chaos renders small textures (64x64 to 256x256) and samples them for
+         * the rest of the scene; dropped, a floor went flat mid-match. A
+         * target the title rewrote is dropped instead (its bytes win). */
+        if (free_rt->last_draw && !rt_drop_if_stale(free_rt, "evict")
+                && !blit_write_back(free_rt, 0, 0, free_rt->w, free_rt->h)
+                && s_evict_lost++ < 20)
             fprintf(stderr, LOGP "surface 0x%08X: %ux%u render target evicted for"
-                    " 0x%08X, its pixels lost (RT_MAX %d full)\n", free_rt->offset,
-                    free_rt->w, free_rt->h, g->color_offset, RT_MAX);
-        rt_release(free_rt);
+                    " 0x%08X with no write-back, its pixels lost (RT_MAX %d full)\n",
+                    free_rt->offset, free_rt->w, free_rt->h, g->color_offset, RT_MAX);
+        if (free_rt->tex)
+            rt_release(free_rt);
     }
     free_rt->pad = nv2a_host_pad(w, h);
     free_rt->n = nv2a_host_size(w + 2u * free_rt->pad, h, nv2a_host_render_scale(),
@@ -1041,9 +1058,55 @@ typedef struct {
     ID3D11Texture2D        *tex;
     ID3D11DepthStencilView *dsv;
     uint64_t                last_use;
+    /* Sampled as a texture (zt_texture): where it lies, how it was drawn,
+     * and its depth as the guest's bytes, converted on the GPU. */
+    uint32_t                addr;       /* zeta resolved to a guest address */
+    uint32_t                cpitch;     /* the colour pitch it was drawn with */
+    uint32_t                zfmt;       /* SET_SURFACE_FORMAT zeta field: 1 Z16, 2 Z24S8 */
+    UINT                    pad;        /* hor+ padding, as its colour target's */
+    unsigned                n;          /* the render.scale factor used */
+    uint32_t                use_flip;   /* s_presents at its last use */
+    uint64_t                wseq;       /* s_seq at its last depth or stencil write */
+    uint64_t                mseq;       /* s_seq of the last other write over its memory */
+    uint64_t                zconv;      /* wseq the converted texture holds, 0 none */
+    ID3D11Texture2D        *zcopy;      /* R32G8X24_TYPELESS copy of tex */
+    ID3D11ShaderResourceView *zd_srv, *zs_srv;   /* its depth and stencil halves */
+    ID3D11Texture2D        *ztex;       /* R8G8B8A8: the Z24S8 bytes as A8R8G8B8 */
+    ID3D11ShaderResourceView *zsrv;
+    ID3D11UnorderedAccessView *zuav;
+    RenderTarget            view;       /* ztex as rt_texture serves it */
 } DepthTarget;
 
 static DepthTarget s_dt[DT_MAX];
+
+#define DT_REL(p, T) do { if (p) { T##_Release(p); (p) = NULL; } } while (0)
+static void dt_release(DepthTarget *d)
+{
+    DT_REL(d->zuav, ID3D11UnorderedAccessView);
+    DT_REL(d->zsrv, ID3D11ShaderResourceView);
+    DT_REL(d->ztex, ID3D11Texture2D);
+    DT_REL(d->zd_srv, ID3D11ShaderResourceView);
+    DT_REL(d->zs_srv, ID3D11ShaderResourceView);
+    DT_REL(d->zcopy, ID3D11Texture2D);
+    DT_REL(d->dsv, ID3D11DepthStencilView);
+    DT_REL(d->tex, ID3D11Texture2D);
+    memset(d, 0, sizeof *d);
+    s_rt_gen++;   /* setup_pixel's stage memo: a depth surface's texture went */
+}
+#undef DT_REL
+
+/* Another write over guest memory at [addr, addr + bytes), at seq: a depth
+ * surface there no longer holds what the memory reads (zt_find), unless it
+ * is written again after it. */
+static void dt_mem_written(uint32_t addr, uint32_t bytes, uint64_t seq)
+{
+    int i;
+    for (i = 0; i < DT_MAX; i++) {
+        DepthTarget *d = &s_dt[i];
+        if (d->tex && seq > d->mseq && nv2a_rt_overlap(d->addr, d->cpitch * d->h, addr, bytes))
+            d->mseq = seq;
+    }
+}
 #define DSS_MAX 64
 static struct { uint64_t key; ID3D11DepthStencilState *dss; } s_dss[DSS_MAX];
 static int s_dss_count;
@@ -1051,6 +1114,7 @@ static uint64_t s_zclears, s_draws_z;
 
 static DepthTarget *depth_target(UINT w, UINT h)
 {
+    const struct nv2a_pb_gpu *g = nv2a_pb_gpu_state();
     uint32_t zeta = nv2a_pb_vsh_state()->zeta_offset;
     DepthTarget *e = NULL, *lru = &s_dt[0];
     D3D11_TEXTURE2D_DESC td;
@@ -1060,6 +1124,9 @@ static DepthTarget *depth_target(UINT w, UINT h)
         DepthTarget *d = &s_dt[i];
         if (d->tex && d->zeta == zeta && d->w == w && d->h == h) {
             d->last_use = s_tick;
+            d->use_flip = (uint32_t)s_presents;
+            d->cpitch = g->pitch;
+            d->zfmt = (g->format >> 4) & 0xF;
             return d;
         }
         if (!d->tex && !e)
@@ -1069,12 +1136,11 @@ static DepthTarget *depth_target(UINT w, UINT h)
     }
     if (!e) {
         e = lru;
-        ID3D11DepthStencilView_Release(e->dsv);
-        ID3D11Texture2D_Release(e->tex);
-        memset(e, 0, sizeof *e);
+        dt_release(e);
     }
-    nv2a_host_size(w + 2u * nv2a_host_pad(w, h), h, nv2a_host_render_scale(), D3D11_MAX_DIM,
-                   &e->hw, &e->hh);
+    e->pad = nv2a_host_pad(w, h);
+    e->n = nv2a_host_size(w + 2u * e->pad, h, nv2a_host_render_scale(), D3D11_MAX_DIM,
+                          &e->hw, &e->hh);
     memset(&td, 0, sizeof td);
     td.Width = e->hw;
     td.Height = e->hh;
@@ -1097,9 +1163,15 @@ static DepthTarget *depth_target(UINT w, UINT h)
                                               D3D11_CLEAR_DEPTH | D3D11_CLEAR_STENCIL,
                                               1.0f, 0);
     e->zeta = zeta;
+    e->addr = nv2a_pb_dma_resolve(zeta);
     e->w = w;
     e->h = h;
     e->last_use = s_tick;
+    e->use_flip = (uint32_t)s_presents;
+    e->cpitch = g->pitch;
+    e->zfmt = (g->format >> 4) & 0xF;
+    e->wseq = ++s_seq;   /* the clear above */
+    s_rt_gen++;          /* setup_pixel's stage memo: rt_texture may serve it now */
     fprintf(stderr, LOGP "zeta 0x%08X: %ux%u depth buffer\n", zeta, w, h);
     return e;
 }
@@ -1182,6 +1254,7 @@ static void d3d11_on_zclear(uint32_t param)
     ID3D11DeviceContext_ClearDepthStencilView(s_ctx, dt->dsv,
         ((param & 1u) ? D3D11_CLEAR_DEPTH : 0u) | ((param & 2u) ? D3D11_CLEAR_STENCIL : 0u),
         z, (UINT8)(v->zclear & 0xFFu));
+    dt->wseq = ++s_seq;   /* its bytes changed: see zt_texture */
     if (param & 1u)
         s_zclears++;
 }
@@ -1590,6 +1663,23 @@ static ID3D11RasterizerState *rasterizer_state(const struct nv2a_pb_draw *d, int
         if (v->cull_face == 0x405)      c = 1;
         else if (v->cull_face == 0x404) c = 2;
         else if (v->cull_face == 0x408) *all = 1;
+    }
+    /* W-buffered batch: the depth tested and stored is the pixel's w (the W
+     * variant writes it), so the program's z means nothing here, and
+     * clipping on it threw away whatever it put past 1. Kung Fu Chaos's
+     * street under the flying saucer went that way: the clear colour showed
+     * through. xemu turns the GPU's depth clipping off for every batch and
+     * clips or clamps the depth per pixel instead; the W shader's clip range
+     * is that. Its polygon offset is in the shader too, so no bias state.
+     * RECOMP_D3D11_W_ZCLIP=1: clip as before (A/B). */
+    if (w) {
+        static int keep = -1;
+        if (keep < 0) {
+            const char *e = getenv("RECOMP_D3D11_W_ZCLIP");
+            keep = e && e[0] == '1';
+        }
+        if (!keep && s_rs_wd[c][f])
+            return s_rs_wd[c][f];
     }
     if (!w)
         nv2a_depth_bias(v, d->prim, nv2a_pb_gpu_state()->format, nv2a_host_render_scale(),
@@ -2653,16 +2743,294 @@ static RenderTarget *rt_self_copy(RenderTarget *rt)
 
 static int aspect_trace(void);
 
+/* ---- depth surfaces as textures ---------------------------------------------
+ *
+ * A stage whose texture lies where a depth surface this backend draws into
+ * starts reads that surface's depth, as the console's memory holds it. Kung
+ * Fu Chaos's sci-fi stage draws its ground haze twice: once with depth func
+ * ALWAYS and colour writes off (the haze's own depth into the W-buffer),
+ * then again sampling the zeta surface as a 640x480 A8R8G8B8 rect texture,
+ * the Z24S8 bytes taken as colour, to fade the haze by the distance between
+ * the two. The depth lives only in the D32 buffer here, the guest bytes are
+ * never written, and the haze came out opaque over the street. xemu converts
+ * the surface on the GPU when the texture binds; so does this: the depth is
+ * copied (it is the same draw's DSV, which cannot be a shader resource too)
+ * and a compute pass writes the guest's bytes into an RGBA8 texture the size
+ * of the depth's host buffer, render.scale and hor+ pads included, which
+ * rt_texture then serves as it serves a colour target. A compute pass, not a
+ * full-screen draw: this runs inside setup_pixel, with the batch's targets,
+ * viewport and shaders already bound, and the compute slots are the only
+ * ones it touches. Converted again only after a write.
+ *
+ * The D32 holds the NV2A's 24-bit value over 0xFFFFFF in both modes (the
+ * W-buffer's w / zmax, the z-buffer's normalised z), and Z24S8 is the dword
+ * (z << 8) | stencil: read as A8R8G8B8, B is the stencil, G z's low byte, R
+ * its middle one, A its top one. Z16, a float zeta, a swizzled or another
+ * texture format, or a texture starting inside the surface fall back to the
+ * guest bytes, said once. RECOMP_D3D11_ZTEX=0: off (A/B). */
+static ID3D11ComputeShader *s_zt_cs;
+static int                  s_zt_bad;      /* no compute shader: never again */
+static uint64_t             s_zt_converts, s_zt_binds;
+
+static const char s_zt_cs_src[] =
+    "Texture2D<float> zd : register(t0);\n"
+    "Texture2D<uint2> zs : register(t1);\n"
+    "RWTexture2D<unorm float4> o : register(u0);\n"
+    "[numthreads(8, 8, 1)]\n"
+    "void main(uint3 id : SV_DispatchThreadID) {\n"
+    "    uint w, h;\n"
+    "    o.GetDimensions(w, h);\n"
+    "    if (id.x >= w || id.y >= h) return;\n"
+    /* min: 1.0 (the clear) * 16777215 rounds to 2^24 in float, which would
+     * carry into a ninth bit and zero the low bytes */
+    "    uint z = min((uint)round(saturate(zd.Load(int3(id.xy, 0))) * 16777215.0), 16777215u);\n"
+    "    uint s = zs.Load(int3(id.xy, 0)).g & 255u;\n"
+    "    o[id.xy] = float4((z >> 8) & 255u, z & 255u, s, z >> 16) / 255.0;\n"
+    "}\n";
+
+static void zt_say(const DepthTarget *d, const Stage *t, const char *why)
+{
+    static int said;
+    if (said++ < 6)
+        fprintf(stderr, LOGP "zeta 0x%08X sampled as a texture (format 0x%02X, %ux%u, pitch %u):"
+                " %s; it reads guest memory\n", d->zeta, nv2a_tex_linear_twin(t->color),
+                t->width, t->height, t->pitch, why);
+}
+
+static int zt_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("RECOMP_D3D11_ZTEX");
+        on = !(e && e[0] == '0');
+    }
+    return on;
+}
+
+/* Whether a live depth surface lies at a (setup_pixel's stage memo keeps no
+ * batch that samples one: its bytes change with every depth write). */
+static int zt_at(uint32_t a)
+{
+    int i;
+    if (!zt_on() || !a)
+        return 0;
+    for (i = 0; i < DT_MAX; i++)
+        if (s_dt[i].tex && nv2a_rt_overlap(s_dt[i].addr, s_dt[i].cpitch * s_dt[i].h, a, 1))
+            return 1;
+    return 0;
+}
+
+/* The depth surface a texture reads, if its bytes are the depth's: one in
+ * use within the last 2 flips (a surface left in s_dt after the title moved
+ * on is not what the memory holds), written since anything else wrote over
+ * its memory (a 2D blit in guest memory, a target written back there), and
+ * since any colour target at its address was drawn or filled by a blit --
+ * the title's match copies frames to its menus' background address, which
+ * is also a zeta surface; whichever wrote last is the memory's. */
+static DepthTarget *zt_find(const Stage *t)
+{
+    int i, k;
+    if (!zt_on() || s_zt_bad || !t->offset)
+        return NULL;
+    for (i = 0; i < DT_MAX; i++) {
+        DepthTarget *d = &s_dt[i];
+        if (!d->tex || s_presents - d->use_flip > 2
+                || !nv2a_rt_overlap(d->addr, d->cpitch * d->h, t->offset, 1))
+            continue;
+        if (d->mseq > d->wseq)
+            continue;   /* written over in memory after its last depth write */
+        /* Only a texture at its first byte is taken. One further in is
+         * either a texture the title keeps in memory the surface does not
+         * use (Kung Fu Chaos has DXT textures inside a 640x480 zeta's
+         * extent at the colour pitch), or a sub-rectangle: said once if
+         * it is a colour layout that could be the latter. */
+        if ((d->addr ^ t->offset) & 0x07FFFFFFu) {
+            uint32_t lin = nv2a_tex_linear_twin(t->color);
+            if ((lin == 0x12 || lin == 0x1E) && !d3d8_format_is_swizzled(t->color))
+                zt_say(d, t, "the texture starts inside the surface");
+            continue;
+        }
+        for (k = 0; k < RT_MAX; k++) {
+            const RenderTarget *rt = &s_rt[k];
+            uint64_t at;
+            if (!rt->tex || ((rt->addr ^ d->addr) & 0x07FFFFFFu))
+                continue;
+            at = rt->last_draw > rt->last_clear ? rt->last_draw : rt->last_clear;
+            if (at > d->wseq) {
+                static int said;
+                if (said++ < 4)
+                    fprintf(stderr, LOGP "texture 0x%08X: surface 0x%08X (seq %llu) and zeta"
+                            " 0x%08X (seq %llu) both there, the colour target wins"
+                            " (flip %llu)\n", t->offset, rt->offset, (unsigned long long)at,
+                            d->zeta, (unsigned long long)d->wseq,
+                            (unsigned long long)s_presents);
+                break;
+            }
+        }
+        if (k < RT_MAX)
+            continue;
+        return d;
+    }
+    return NULL;
+}
+
+static int zt_make(DepthTarget *d)
+{
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_SHADER_RESOURCE_VIEW_DESC sd;
+
+    if (!s_zt_cs) {
+        ID3DBlob *code = NULL;
+        if (ID3D11Device_GetFeatureLevel(s_dev) < D3D_FEATURE_LEVEL_11_0
+                || !compile("nv2a_zt_cs", s_zt_cs_src, "cs_5_0", &code)
+                || FAILED(ID3D11Device_CreateComputeShader(s_dev, ID3D10Blob_GetBufferPointer(code),
+                                                           ID3D10Blob_GetBufferSize(code), NULL,
+                                                           &s_zt_cs))) {
+            if (code) ID3D10Blob_Release(code);
+            s_zt_cs = NULL;
+            s_zt_bad = 1;
+            fprintf(stderr, LOGP "no compute shader (feature level 0x%X): a depth surface sampled"
+                    " as a texture reads guest memory\n",
+                    (unsigned)ID3D11Device_GetFeatureLevel(s_dev));
+            return 0;
+        }
+        ID3D10Blob_Release(code);
+    }
+    if (d->ztex)
+        return 1;
+    memset(&td, 0, sizeof td);
+    td.Width = d->hw;
+    td.Height = d->hh;
+    td.MipLevels = 1;
+    td.ArraySize = 1;
+    td.Format = DXGI_FORMAT_R32G8X24_TYPELESS;   /* CopyResource's group for D32_FLOAT_S8X24 */
+    td.SampleDesc.Count = 1;
+    td.Usage = D3D11_USAGE_DEFAULT;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+    memset(&sd, 0, sizeof sd);
+    sd.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sd.Texture2D.MipLevels = 1;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &d->zcopy)))
+        goto fail;
+    sd.Format = DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
+    if (FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)d->zcopy, &sd,
+                                                     &d->zd_srv)))
+        goto fail;
+    sd.Format = DXGI_FORMAT_X32_TYPELESS_G8X24_UINT;
+    if (FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)d->zcopy, &sd,
+                                                     &d->zs_srv)))
+        goto fail;
+    /* RGBA, not the colour targets' BGRA: typed UAV stores to it are core
+     * at feature level 11_0. Sampled, its channels mean what a BGRA target's
+     * do. */
+    td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_UNORDERED_ACCESS;
+    if (FAILED(ID3D11Device_CreateTexture2D(s_dev, &td, NULL, &d->ztex))
+            || FAILED(ID3D11Device_CreateShaderResourceView(s_dev, (ID3D11Resource *)d->ztex,
+                                                            NULL, &d->zsrv))
+            || FAILED(ID3D11Device_CreateUnorderedAccessView(s_dev, (ID3D11Resource *)d->ztex,
+                                                             NULL, &d->zuav)))
+        goto fail;
+    return 1;
+fail:
+    if (d->zuav) { ID3D11UnorderedAccessView_Release(d->zuav); d->zuav = NULL; }
+    if (d->zsrv) { ID3D11ShaderResourceView_Release(d->zsrv); d->zsrv = NULL; }
+    if (d->ztex) { ID3D11Texture2D_Release(d->ztex); d->ztex = NULL; }
+    if (d->zs_srv) { ID3D11ShaderResourceView_Release(d->zs_srv); d->zs_srv = NULL; }
+    if (d->zd_srv) { ID3D11ShaderResourceView_Release(d->zd_srv); d->zd_srv = NULL; }
+    if (d->zcopy) { ID3D11Texture2D_Release(d->zcopy); d->zcopy = NULL; }
+    return 0;
+}
+
+/* d's depth, as it stands before the batch being set up draws, as the
+ * texture t reads it; NULL to decode guest memory as before. */
+static RenderTarget *zt_texture(DepthTarget *d, const Stage *t)
+{
+    uint32_t lin = nv2a_tex_linear_twin(t->color);
+    RenderTarget *r = &d->view;
+
+    if (d->zfmt != 2) {
+        zt_say(d, t, "a Z16 surface (not converted)");
+        return NULL;
+    }
+    if (nv2a_pb_vsh_state()->control0 & 0x1000u) {
+        zt_say(d, t, "a float depth format (not converted)");
+        return NULL;
+    }
+    if ((lin != 0x12 && lin != 0x1E) || d3d8_format_is_swizzled(t->color)
+            || t->pitch != d->cpitch || t->width > d->w || t->height > d->h) {
+        zt_say(d, t, "not a linear 32-bit colour texture of its layout");
+        return NULL;
+    }
+    if (!zt_make(d))
+        return NULL;
+    if (d->zconv != d->wseq) {
+        ID3D11ShaderResourceView *srv[2] = { d->zd_srv, d->zs_srv }, *none[2] = { NULL, NULL };
+        ID3D11UnorderedAccessView *nouav = NULL;
+        ID3D11DeviceContext_CopyResource(s_ctx, (ID3D11Resource *)d->zcopy,
+                                         (ID3D11Resource *)d->tex);
+        ID3D11DeviceContext_CSSetShader(s_ctx, s_zt_cs, NULL, 0);
+        ID3D11DeviceContext_CSSetShaderResources(s_ctx, 0, 2, srv);
+        ID3D11DeviceContext_CSSetUnorderedAccessViews(s_ctx, 0, 1, &d->zuav, NULL);
+        ID3D11DeviceContext_Dispatch(s_ctx, (d->hw + 7u) / 8u, (d->hh + 7u) / 8u, 1);
+        /* Unbound, or the pixel stage's view of ztex is nulled as a hazard. */
+        ID3D11DeviceContext_CSSetUnorderedAccessViews(s_ctx, 0, 1, &nouav, NULL);
+        ID3D11DeviceContext_CSSetShaderResources(s_ctx, 0, 2, none);
+        d->zconv = d->wseq;
+        if (s_zt_converts++ == 0)
+            fprintf(stderr, LOGP "zeta 0x%08X sampled as a texture (format 0x%02X, %ux%u):"
+                    " its depth converted on the GPU (flip %llu)\n", d->zeta, lin,
+                    t->width, t->height, (unsigned long long)s_presents);
+    }
+    /* What setup_pixel, the hor+ placement and the trace read of a render
+     * target. Never written back, released or drawn into: it is no s_rt. */
+    memset(r, 0, sizeof *r);
+    r->offset = d->zeta;
+    r->addr = d->addr;
+    r->w = d->w;
+    r->h = d->h;
+    r->hw = d->hw;
+    r->hh = d->hh;
+    r->pad = d->pad;
+    r->n = d->n;
+    r->tex = d->ztex;
+    r->srv = d->zsrv;
+    r->pitch = d->cpitch;
+    r->fmt = 0;
+    r->last_draw = d->wseq;
+    r->last_use = s_tick;
+    s_zt_binds++;
+    return r;
+}
+
+static int zt_is_view(const RenderTarget *rt)
+{
+    int i;
+    for (i = 0; i < DT_MAX; i++)
+        if (rt == &s_dt[i].view)
+            return 1;
+    return 0;
+}
+
 static RenderTarget *rt_texture(const Stage *t)
 {
     static int off = -1;
     RenderTarget *self = NULL;
+    DepthTarget *zd;
     int i;
 
     if (off < 0)
         off = recomp_env(RENV_D3D11_NO_RTT) != NULL;   /* A/B: decode memory */
     if (off || !t->offset)
         return NULL;
+    /* The depth first: a colour target at its address drawn later wins
+     * there (zt_find), else the depth is what the memory holds. */
+    zd = zt_find(t);
+    if (zd) {
+        RenderTarget *z = zt_texture(zd, t);
+        if (z)
+            return z;
+    }
     for (i = 0; i < RT_MAX; i++) {
         RenderTarget *rt = &s_rt[i];
         /* Low 27 bits: the same memory through either window. A 16-bit
@@ -3014,7 +3382,7 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
         s_stage_src[n] = !t->mode ? "none" : t->mode == 4 ? "passthru" : "cache";
         if (src) {
             s_stage_src[n] = src == &s_self ? "render-target(self copy)"
-                                            : "render-target";
+                           : zt_is_view(src) ? "depth-surface" : "render-target";
             nv2a_ps_consts_rt(&pc, n, t, src->w, src->h);
             if (nv2a_rt_no_alpha(nv2a_tex_linear_twin(t->color)))
                 pc.alpha_only[n] = 2;
@@ -3065,6 +3433,11 @@ static ID3D11PixelShader *setup_pixel(struct aspect_batch *hp, const struct nv2a
          * a cube shader the remembered 2D view would not match. */
         if (s_rt_gen != rt_gen0)
             lm.ok = 0;
+        /* Nor one sampling where a depth surface lies: whether rt_texture
+         * serves the depth there changes with its writes (zt_find). */
+        for (n = 0; n < 4 && lm.ok; n++)
+            if (s_stage[n].mode && s_stage[n].mode != 4 && zt_at(s_stage[n].offset))
+                lm.ok = 0;
         lm.stage_gen = s_stage_gen;
         lm.rt_gen = s_rt_gen;
         lm.tc_gen = s_tc_gen;
@@ -3740,10 +4113,15 @@ static void px_probe(const struct nv2a_pb_draw *d, VsEntry *vs, RenderTarget *rt
     }
 
     for (pass = 0; pass < 2; pass++) {
+        /* The probe's shaders write no depth, so against a W-buffered
+         * batch's (the pixel's w) their rasterised z fails at random: those
+         * are probed without the depth test rather than reported as not
+         * covering. The batch's own view is bound again below. */
+        ID3D11DepthStencilView *pdsv = s_ps_w ? NULL : dsv;
         for (k = 0; k < 8; k++)
             ID3D11DeviceContext_ClearRenderTargetView(s_ctx, rtv[k], zero);
-        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 8, rtv, dsv);
-        ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, dsv ? dss_le : s_ds_off, 0);
+        ID3D11DeviceContext_OMSetRenderTargets(s_ctx, 8, rtv, pdsv);
+        ID3D11DeviceContext_OMSetDepthStencilState(s_ctx, pdsv ? dss_le : s_ds_off, 0);
         ID3D11DeviceContext_OMSetBlendState(s_ctx, NULL, NULL, 0xFFFFFFFF);
         ID3D11DeviceContext_PSSetShader(s_ctx, px_shader(pass), NULL, 0);
         ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
@@ -4272,11 +4650,14 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         cbs[2] = s_cb_vp;
         ID3D11DepthStencilView *dsv = NULL;
         ID3D11DepthStencilState *dss = s_ds_off;
+        DepthTarget *zw = NULL;   /* the depth surface this draw writes, for zt_texture */
         /* Stencil only on a Z24S8 zeta surface, as on the CPU. */
         int use_s = v->stencil_enable && ((g->format >> 4) & 0xF) == 2;
         if (v->depth_enable || use_s) {
             DepthTarget *dt = depth_target(rt->w, rt->h);
             if (dt) {
+                if ((v->depth_enable && v->depth_mask) || (use_s && (v->stencil_wmask & 0xFFu)))
+                    zw = dt;
                 dsv = dt->dsv;
                 dss = depth_state(v->depth_enable, use_s);
                 s_draws_z++;
@@ -4356,6 +4737,27 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
                 s_sc.rs = rs;
             }
         }
+        /* RECOMP_DOF_SKIP: Kung Fu Chaos blurs a 320x240 copy of the scene and
+         * repaints it over the 640x480 screen with the depth test on and depth
+         * writes off, so the blur lands on what lies behind the fighters. A
+         * draw into a larger target that samples such a copy (a render
+         * target stage, never a depth view or the self copy) under that
+         * state is that repaint: dropped, the far scene stays sharp. The
+         * full-screen passes that read the same copies with the depth test
+         * off (tint, brightness) are not touched. All the state is set, so
+         * the next draw starts clean. */
+        if (v->depth_enable && !v->depth_mask && !nv2a_dof_skip_size(rt->w, rt->h)) {
+            int dof = 0, n;
+            for (n = 0; n < 4; n++)
+                if (s_stage_rt[n] && s_stage_rt[n] != &s_self && !zt_is_view(s_stage_rt[n])
+                    && nv2a_dof_skip_size(s_stage_rt[n]->w, s_stage_rt[n]->h))
+                    dof = 1;
+            if (dof) {
+                s_dof_skipped++;
+                s_cur = NULL;
+                return;
+            }
+        }
         if (hp.place != NV2A_PLACE_CENTRE)
             s_draws_stretch++;
         if (hp.two_d && !have_x) {
@@ -4421,6 +4823,10 @@ static void d3d11_on_draw(const struct nv2a_pb_draw *d)
         } else {
             ID3D11DeviceContext_DrawIndexed(s_ctx, nidx, 0, 0);
         }
+        /* After the draw: a later batch sampling this depth converts again,
+         * this one converted what came before it. */
+        if (zw)
+            zw->wseq = ++s_seq;
     }
     rt->last_draw = ++s_seq;
     s_cur = NULL;
@@ -6155,6 +6561,11 @@ static void d3d11_flip(uint32_t surface_offset, uint32_t pitch)
                 (unsigned long long)s_rtt_binds, (unsigned long long)s_stale_drops,
                 (unsigned long long)s_evict_lost, (unsigned long long)s_grows,
                 (unsigned long long)s_partial_clears);
+    if ((s_presents % 300) == 0 && s_dof_skipped && recomp_env_on(RENV_PRESENT_STATS))
+        fprintf(stderr, LOGP "dof_skip: %llu draws skipped\n", (unsigned long long)s_dof_skipped);
+    if (s_zt_binds && (s_presents % 300) == 0)
+        fprintf(stderr, LOGP "depth surfaces as textures: %llu binds, %llu conversions\n",
+                (unsigned long long)s_zt_binds, (unsigned long long)s_zt_converts);
     if (s_presents == 1 || (s_presents % 300) == 0)
         fprintf(stderr, LOGP "shaders: %u compiled (%.1f ms), %u from the cache (%.1f ms),"
                 " %u cache misses, %u damaged entries, %u failed stores\n",
@@ -6195,9 +6606,7 @@ static void scale_drop(void)
         DepthTarget *d = &s_dt[i];
         if (!d->tex)
             continue;
-        ID3D11DepthStencilView_Release(d->dsv);
-        ID3D11Texture2D_Release(d->tex);
-        memset(d, 0, sizeof *d);
+        dt_release(d);
     }
     /* Both point into s_rt, now zeroed; the stage list is only rebuilt by
      * the next textured batch, and the white-draw log reads it. */
@@ -6616,6 +7025,9 @@ static int blit_write_back(RenderTarget *rt, uint32_t x, uint32_t y, uint32_t w,
     if (!ok)
         return 0;
     blit_tex_stale(rt->addr + y * rt->pitch, rt->pitch * h);
+    /* The memory holds these pixels now, as of their last draw. */
+    dt_mem_written(rt->addr + y * rt->pitch, rt->pitch * h,
+                   rt->last_draw > rt->last_clear ? rt->last_draw : rt->last_clear);
     if (alias_check_on())
         nv2a_rt_own_reset(&rt->own, (const uint8_t *)xbox_GetMemoryOffset(), rt->addr,
                           rt->pitch, rt->h, (uint32_t)s_presents);
@@ -6737,6 +7149,7 @@ static int blit_gpu(const struct nv2a_pb_blit *b, RenderTarget *src)
     s_tick++;
     dst->last_use = s_tick;
     dst->last_draw = ++s_seq;
+    dt_mem_written(dst->addr, dst->pitch * dst->h, dst->last_draw);   /* zt_find */
     dst->copy = 1;
     dst->copy_flip = (uint32_t)s_presents;
     /* Not marked drawn: the twin owns its guest bytes as of now, and a title
@@ -6783,6 +7196,7 @@ static void d3d11_on_blit(const struct nv2a_pb_blit *b)
     }
     nv2a_pb_blit_guest(b);
     blit_tex_stale(b->dst, (uint32_t)span);
+    dt_mem_written(b->dst, (uint32_t)span, ++s_seq);   /* zt_find */
     s_blits_guest++;
     {
         static int said;
