@@ -445,9 +445,11 @@ static unsigned long long dll_file_version(HMODULE dll)
 }
 
 /* Opens the cache, after D3DCompile is found. The key's compiler identity is
- * "<path>|<size>|<write time>|<file version>" of the d3dcompiler_47.dll in
- * use; when that cannot be asked the cache stays off, since a key without
- * the compiler could hand one compiler's output to another. */
+ * "<size>|<file version>" of the d3dcompiler_47.dll in use; when that cannot
+ * be asked the cache stays off, since a key without the compiler could hand
+ * one compiler's output to another. Not its path or write time: those change
+ * when a game folder with a warm cache (and its own d3dcompiler_47.dll) is
+ * copied to another PC, and the same file version is the same build. */
 static void shader_cache_setup(HMODULE dll)
 {
     const char *e = recomp_env(RENV_DXBC_CACHE);
@@ -473,10 +475,10 @@ static void shader_cache_setup(HMODULE dll)
         fprintf(stderr, LOGP "shader cache: off (no compiler identity)\n");
         return;
     }
-    snprintf(s_shc_compiler, sizeof s_shc_compiler, "%s|%08lx%08lx|%08lx%08lx|%016llx",
-             path, (unsigned long)fa.nFileSizeHigh, (unsigned long)fa.nFileSizeLow,
-             (unsigned long)fa.ftLastWriteTime.dwHighDateTime,
-             (unsigned long)fa.ftLastWriteTime.dwLowDateTime, dll_file_version(dll));
+    snprintf(s_shc_compiler, sizeof s_shc_compiler, "%08lx%08lx|%016llx",
+             (unsigned long)fa.nFileSizeHigh, (unsigned long)fa.nFileSizeLow,
+             dll_file_version(dll));
+    fprintf(stderr, LOGP "shader cache: compiler %s (%s)\n", path, s_shc_compiler);
     if (kind == SHADER_CACHE_ENV_DIR) {
         snprintf(dir, sizeof dir, "%s", e);
     } else if (xbox_path_shader_cache(dir, sizeof dir - 8)) {
