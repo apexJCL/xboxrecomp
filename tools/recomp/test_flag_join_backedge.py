@@ -74,12 +74,14 @@ def test_disagreeing_predecessors_keep_the_fallback():
     # flags come from a different operand. The join must not inherit either:
     # each edge sets the join's own variable from its own result.
     #   +0  sub eax, ecx
-    #   +2  jmp +3            -> the jz at +5
+    #   +2  jb +1             -> the jz at +5 (taken: sub's flags)
     #   +4  inc edx           (falls through to the jz, different flag source)
     #   +5 L: jz +1
     #   +7  ret
+    # A branch, not a `jmp`, to +5: after a jmp nothing reaches the inc, and
+    # an unreachable block is not lifted (translator._live_blocks).
     image = (b"\x29\xC8"          # sub eax, ecx
-             b"\xEB\x01"          # jmp +1 -> +5
+             b"\x72\x01"          # jb +1 -> +5
              b"\x42"              # inc edx
              b"\x74\x00"          # jz +0 -> +7
              b"\xC3")             # ret
