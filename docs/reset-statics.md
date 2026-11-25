@@ -391,6 +391,10 @@ The key of a row is `file | scope | name`; line numbers are not part of it.
 | src/kernel/kernel_hal.c | - | s_irq_post_ns | file_static | reset | kernel | pending device IRQ lines and post times |
 | src/kernel/kernel_hal.c | - | t_in_isr | tls | reset | kernel | thread is inside an ISR or DPC |
 | src/kernel/kernel_hal.c | - | s_irq_post_hook | file_static | constant | - | host IRQ handler function pointers set at init |
+| src/kernel/kernel_hal.c | - | t_cli | tls | reset | kernel | cli/sti: the guest's interrupt flag on this thread |
+| src/kernel/kernel_hal.c | - | t_cli_counted | tls | reset | kernel | cli/sti: whether cli moved the raised count |
+| src/kernel/kernel_hal.c | - | t_cli_gate | tls | reset | kernel | cli/sti: whether cli entered the dispatch gate |
+| src/kernel/kernel_hal.c | - | s_guest_gdt | file_static | reset | kernel | guest address of the flat GDT sgdt reports, allocated in guest memory |
 | src/kernel/kernel_hal.c | - | s_irq_release_hook | file_static | constant | - | host IRQ handler function pointers set at init |
 | src/kernel/kernel_hal.c | - | s_irq_mode | file_static | keep | - | IRQ config from env |
 | src/kernel/kernel_hal.c | - | s_irq_force | file_static | keep | - | IRQ config from env |
@@ -2251,6 +2255,7 @@ Band 9 re-runs these after the memory clear (band 7) and the XBE reload (band 8)
 | src/apu/apu_sdl.c | - | g_audio_opened | file_static | keep | - | host audio device and stream stay |
 | src/apu/apu_sdl.c | - | g_frames_written | file_static | keep | - | host audio device and stream stay |
 | src/apu/apu_sdl.c | - | g_samples_queued | file_static | keep | - | host audio device and stream stay |
+| src/apu/apu_sdl.c | - | g_primed | file_static | keep | - | host audio device and stream stay: the device plays once the queue first reached the low mark |
 | src/apu/apu_sdl.c | - | g_underruns | file_static | keep | - | host audio device and stream stay |
 | src/apu/apu_sdl.c | - | g_dry | file_static | keep | - | host audio device and stream stay |
 | src/apu/apu_sdl.c | - | g_underrun_logged_ms | file_static | keep | - | host audio device and stream stay |
