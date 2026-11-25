@@ -2549,7 +2549,61 @@ class FunctionTranslator:
                         and block.last_insn.mnemonic == "int3"
                         and block.last_insn.address not in debug_slide_int3s):
                     block.successors = []
+        blocks = self._live_blocks(
+            blocks, start, debug_slide_int3s, debug_slide_bypasses,
+            set(switch_leaders or ()) | set(imm_refs or ()))
         return instructions, blocks
+
+    @staticmethod
+    def _live_blocks(blocks, start, debug_slide_int3s, debug_slide_bypasses,
+                     entries):
+        """The blocks control can reach, in address order.
+
+        Every branch is a leader at its end, so the bytes after a `jmp` or a
+        `ret` start a block even when they are data: a jump table, a byte
+        index table, padding. Lifted, that garbage is dead C (no label, no
+        fallthrough into it), but its own jumps still name targets: Burnout
+        3's XONLINE switch at 0x00320C01 decoded as `aam 7; hlt; ... jns`,
+        and the jns became a stub for an address in the next function; bytes
+        after a tail jmp in sub_0006E950 jumped to 0xE9DAEA40, outside the
+        image. Each was an unresolved stub that nothing could ever call.
+
+        Roots: the entry, every leader something outside the edge list can
+        enter (switch arms, code addresses taken as immediates, forced entry
+        stubs, debug-slide bypasses). Edges: the same ones the flag pass
+        reads as predecessors. A block reachable by neither is not emitted.
+        """
+        by_start = {bb.start: bb for bb in blocks}
+        roots = {start} | set(entries) | set(debug_slide_bypasses.values())
+        live, todo = set(), [a for a in roots if a in by_start]
+        index = {bb.start: i for i, bb in enumerate(blocks)}
+        while todo:
+            a = todo.pop()
+            if a in live:
+                continue
+            live.add(a)
+            bb = by_start[a]
+            last = bb.instructions[-1] if bb.instructions else None
+            nxt = []
+            if last is not None:
+                bypass = debug_slide_bypasses.get(last.address)
+                if bypass is not None:
+                    nxt.append(bypass)
+                nxt.extend(bb.successors)
+                if last.jump_target is not None:
+                    nxt.append(last.jump_target)
+                leaves = (last.is_ret or last.mnemonic in (
+                    "jmp", "ud2", "hlt", "iret", "iretd")
+                          or (last.mnemonic == "int3"
+                              and last.address not in debug_slide_int3s))
+                if bypass is None and not leaves and index[a] + 1 < len(blocks):
+                    nxt.append(blocks[index[a] + 1].start)
+            elif index[a] + 1 < len(blocks):
+                nxt.append(blocks[index[a] + 1].start)
+            todo.extend(t for t in nxt if t in by_start and t not in live)
+        if len(live) == len(blocks):
+            return blocks
+        return [bb for bb in blocks if bb.start in live]
 
     def entry_stub(self, addr, name):
         """C for a call/jump target in the middle of another function.
@@ -3760,7 +3814,18 @@ class BatchTranslator:
                 print(f"  Wrote {c_path} ({len(chunk)} functions)",
                       file=sys.stderr)
 
-        # Emit the stub bodies for call targets with no definition.
+        # Emit the stub bodies for call targets with no definition. With none
+        # left, a stub file from an earlier run goes, as a stale chunk does:
+        # globbed into the build, it would keep defining sub_ names for
+        # addresses that are now someone's real function (a redefinition) or
+        # nothing at all.
+        if not unresolved:
+            stale_stubs = os.path.join(output_dir,
+                                       f"{prefix}_stubs_unresolved.c")
+            if os.path.exists(stale_stubs):
+                os.remove(stale_stubs)
+                if verbose:
+                    print(f"  removed stale {os.path.basename(stale_stubs)}")
         if unresolved:
             stub_path = os.path.join(output_dir, f"{prefix}_stubs_unresolved.c")
             stub_lines = [
