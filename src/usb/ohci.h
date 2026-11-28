@@ -41,6 +41,11 @@ void xbox_OhciInit(void);
 /* 1 if the address is inside a controller this model owns. */
 int  xbox_OhciOwnsAddress(uint32_t xbox_va);
 
+/* A register access without the fault (xbox_MmioRead/xbox_MmioWrite call
+ * these). Return 0, doing nothing, when the address is not a controller's. */
+int  xbox_OhciMmioRead(uint32_t xbox_va, int size, uint32_t *out);
+int  xbox_OhciMmioWrite(uint32_t xbox_va, uint32_t value, int size);
+
 /* Service a trapped access. Returns 1 if the faulting instruction was decoded
  * and stepped over. `ctx` is the fault's thread state: the PCONTEXT from a
  * Win32 VEH, or the ucontext_t * a POSIX SA_SIGINFO handler receives (its

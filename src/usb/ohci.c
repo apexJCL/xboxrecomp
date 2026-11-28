@@ -1901,6 +1901,33 @@ int xbox_OhciOwnsAddress(uint32_t xbox_va)
     return hc_for(xbox_va) != NULL;
 }
 
+/* A plain mov through a register base into a controller's window, called
+ * from generated code (xbox_MmioRead/xbox_MmioWrite) instead of faulting. The
+ * same ohci_read/ohci_write the fault decoders call, with the same side
+ * effects (write-1-to-clear, the done-queue retire, the read count behind
+ * HcFmNumber), one call per access as the decoder makes. On macOS each fault
+ * is a signal: Kung Fu Chaos's OHCI ISR and DPC spent ~4% of a core each in
+ * _sigtramp. Returns 0, doing nothing, when va is not a controller's. */
+int xbox_OhciMmioRead(uint32_t xbox_va, int size, uint32_t *out)
+{
+    OhciController *hc = hc_for(xbox_va);
+
+    if (!hc)
+        return 0;
+    *out = (uint32_t)ohci_read(hc, xbox_va - hc->base, size);
+    return 1;
+}
+
+int xbox_OhciMmioWrite(uint32_t xbox_va, uint32_t value, int size)
+{
+    OhciController *hc = hc_for(xbox_va);
+
+    if (!hc)
+        return 0;
+    ohci_write(hc, xbox_va - hc->base, value, size);
+    return 1;
+}
+
 #if defined(OHCI_TRAP_POSIX_A64) || defined(OHCI_TRAP_X64)
 /* Both decoders hand over 8-byte accesses whole (ldr/str x or a d register
  * on A64, a REX.W mov on x86-64); the registers are 32-bit, so an 8-byte
